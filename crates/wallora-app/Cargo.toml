@@ -1,0 +1,22 @@
+[package]
+name = "wallora-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Wallora — An unofficial native Wallhaven client for Windows"
+
+[lints]
+workspace = true
+
+[dependencies]
+iced.workspace = true
+tracing.workspace = true
+tracing-appender.workspace = true
+tracing-subscriber.workspace = true
+wallora-core = { path = "../wallora-core" }
+wallora-windows = { path = "../wallora-windows" }
+
+[build-dependencies]
+winresource.workspace = true

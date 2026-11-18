@@ -1,0 +1,16 @@
+[package]
+name = "wallora-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Core domain, provider, storage, and services for Wallora"
+
+[lints]
+workspace = true
+
+[dependencies]
+directories.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

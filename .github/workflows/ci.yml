@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main, feat/*]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: Build, Lint, Test & Package (Windows)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked --workspace --all-targets
+
+      - name: Install cargo-deny
+        run: cargo install --locked cargo-deny --version 0.21.0
+
+      - name: Run cargo-deny
+        run: cargo deny --locked check
+
+      - name: Build release
+        run: cargo build --locked --release
+
+      - name: Install cargo-wix
+        run: cargo install --locked cargo-wix --version 0.3.9
+
+      - name: Build MSI installer
+        run: cargo wix --package wallora-app --no-build --nocapture
+
+      - name: Upload MSI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wallora-msi
+          path: target/wix/*.msi
