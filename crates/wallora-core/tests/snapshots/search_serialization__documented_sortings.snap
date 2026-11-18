@@ -1,0 +1,10 @@
+---
+source: crates/wallora-core/tests/search_serialization.rs
+expression: sortings
+---
+sorting=date_added
+sorting=relevance
+sorting=random
+sorting=views
+sorting=favorites
+sorting=toplist

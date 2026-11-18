@@ -27,4 +27,5 @@ dotenvy.workspace = true
 insta.workspace = true
 proptest.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber.workspace = true
 wiremock.workspace = true
