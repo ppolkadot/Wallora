@@ -12,3 +12,4 @@ workspace = true
 iced.workspace = true
 image.workspace = true
 tokio.workspace = true
+wallora-windows = { path = "../../crates/wallora-windows" }

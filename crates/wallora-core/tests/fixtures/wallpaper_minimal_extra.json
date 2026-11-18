@@ -1,0 +1,26 @@
+{
+  "data": {
+    "id": "min001",
+    "url": "https://wallhaven.cc/w/min001",
+    "purity": "sfw",
+    "category": "general",
+    "dimension_x": 1920,
+    "dimension_y": 1080,
+    "resolution": "1920x1080",
+    "ratio": "1.78",
+    "file_size": 102400,
+    "file_type": "image/jpeg",
+    "created_at": "2026-03-01 00:00:00",
+    "colors": [],
+    "path": "https://w.wallhaven.cc/full/mi/wallhaven-min001.jpg",
+    "thumbs": {
+      "large": "https://th.wallhaven.cc/lg/mi/min001.jpg",
+      "original": "https://th.wallhaven.cc/orig/mi/min001.jpg",
+      "small": "https://th.wallhaven.cc/small/mi/min001.jpg"
+    },
+    "unknown_future_field": {
+      "nested": true
+    }
+  },
+  "extra_root_field": "ignored"
+}
