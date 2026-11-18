@@ -18,6 +18,9 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.99.0'
+          components: 'rustfmt, clippy'
 
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
@@ -43,11 +46,79 @@ jobs:
       - name: Install cargo-wix
         run: cargo install --locked cargo-wix --version 0.3.9
 
+      - name: Provision WiX v3.14.1 binaries
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = Join-Path $env:RUNNER_TEMP 'wix314-binaries.zip'
+          $dest = Join-Path $env:RUNNER_TEMP 'wix314'
+          Invoke-WebRequest -Uri 'https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip' -OutFile $zip
+          if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
+          Expand-Archive -Path $zip -DestinationPath $dest -Force
+          $candles = @(Get-ChildItem -Path $dest -Recurse -File -Filter 'candle.exe')
+          if ($candles.Count -ne 1) {
+            throw "Expected exactly one candle.exe under $dest, found $($candles.Count)"
+          }
+          $bin = $candles[0].Directory.FullName
+          foreach ($required in @('light.exe', 'WixUIExtension.dll')) {
+            if (-not (Test-Path (Join-Path $bin $required))) {
+              throw "Missing $required next to $bin"
+            }
+          }
+          "WALLORA_WIX_BIN=$bin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Build MSI installer
-        run: cargo wix --package wallora-app --no-build --nocapture
+        shell: pwsh
+        run: cargo wix --package wallora-app --no-build --nocapture --bin-path "$env:WALLORA_WIX_BIN"
+
+      - name: Verify MSI artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msis = @(Get-ChildItem -Path 'target/wix' -Filter '*.msi' -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Length -gt 0 })
+          if ($msis.Count -lt 1) {
+            throw 'No non-empty MSI was produced under target/wix'
+          }
+          $installer = New-Object -ComObject WindowsInstaller.Installer
+          foreach ($msi in $msis) {
+            $db = $installer.GetType().InvokeMember(
+              'OpenDatabase', 'InvokeMethod', $null, $installer, @($msi.FullName, 0))
+            $fileView = $db.GetType().InvokeMember(
+              'OpenView', 'InvokeMethod', $null, $db, @('SELECT `File` FROM `File`'))
+            $fileView.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $fileView, $null) | Out-Null
+            $fileIds = @()
+            while ($true) {
+              $record = $fileView.GetType().InvokeMember('Fetch', 'InvokeMethod', $null, $fileView, $null)
+              if ($null -eq $record) { break }
+              $fileIds += [string]$record.GetType().InvokeMember(
+                'StringData', 'GetProperty', $null, $record, @(1))
+            }
+            $fileView.GetType().InvokeMember('Close', 'InvokeMethod', $null, $fileView, $null) | Out-Null
+            if ($fileIds -notcontains 'exe0') {
+              throw "$($msi.Name) File table has no exe0 row"
+            }
+            $tableView = $db.GetType().InvokeMember(
+              'OpenView', 'InvokeMethod', $null, $db, @('SELECT `Name` FROM `_Tables`'))
+            $tableView.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $tableView, $null) | Out-Null
+            $tables = @()
+            while ($true) {
+              $record = $tableView.GetType().InvokeMember('Fetch', 'InvokeMethod', $null, $tableView, $null)
+              if ($null -eq $record) { break }
+              $tables += [string]$record.GetType().InvokeMember(
+                'StringData', 'GetProperty', $null, $record, @(1))
+            }
+            $tableView.GetType().InvokeMember('Close', 'InvokeMethod', $null, $tableView, $null) | Out-Null
+            $db.GetType().InvokeMember('Commit', 'InvokeMethod', $null, $db, $null) | Out-Null
+            if ($tables -contains 'Environment') {
+              throw "$($msi.Name) installs an Environment table (PATH modification)"
+            }
+            Write-Host "Verified $($msi.Name): exe0 present, no Environment table"
+          }
 
       - name: Upload MSI artifact
         uses: actions/upload-artifact@v4
         with:
           name: wallora-msi
           path: target/wix/*.msi
+          if-no-files-found: error
