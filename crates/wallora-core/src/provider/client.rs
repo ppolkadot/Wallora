@@ -106,6 +106,7 @@ impl WallhavenClient {
         let api_client = reqwest::Client::builder()
             .user_agent(WALLORA_USER_AGENT)
             .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .connect_timeout(config.connect_timeout)
             .timeout(config.request_timeout)
             .build()
@@ -203,28 +204,35 @@ impl WallhavenClientInner {
     }
 
     async fn execute_paced_get(
-        &self,
+        inner: Arc<WallhavenClientInner>,
         url: Url,
         scope: SessionScope,
         priority: RequestPriority,
     ) -> Result<Vec<u8>, ProviderError> {
-        if !self.config.origin_policy.is_authorized_api_url(&url) {
+        if !inner.config.origin_policy.is_authorized_api_url(&url) {
             tracing::warn!("blocked API request failing origin policy");
             return Err(ProviderError::OriginRejected);
         }
 
-        let scope_tag = match &scope.kind {
-            SessionKind::Guest => "guest".to_string(),
-            SessionKind::Account(id) => format!("acct:{}", id.as_str()),
+        let serialized = url.as_str().to_string();
+        let coalesce_key = match &scope.kind {
+            SessionKind::Guest => format!("guest:{}:{serialized}", scope.generation),
+            SessionKind::Account(id) => format!(
+                "account:{}:{}:{}:{serialized}",
+                id.as_str().len(),
+                id.as_str(),
+                scope.generation
+            ),
         };
-        let coalesce_key = format!("{scope_tag}:{}:{}", scope.generation, url.as_str());
 
-        self.pacer
-            .run(coalesce_key, priority, || {
+        let pacer = inner.pacer.clone();
+        pacer
+            .run(coalesce_key, priority, move || {
+                let inner = Arc::clone(&inner);
                 let url = url.clone();
                 let scope = scope.clone();
                 async move {
-                    let mut req = self
+                    let mut req = inner
                         .api_client
                         .get(url)
                         .build()
@@ -233,11 +241,11 @@ impl WallhavenClientInner {
                     authorize(
                         &mut req,
                         &scope,
-                        self.credentials.as_ref(),
-                        &self.config.origin_policy,
+                        inner.credentials.as_ref(),
+                        &inner.config.origin_policy,
                     )?;
 
-                    let resp = match self.api_client.execute(req).await {
+                    let resp = match inner.api_client.execute(req).await {
                         Ok(resp) => resp,
                         Err(err) => {
                             let mapped = if err.is_timeout() {
@@ -331,7 +339,8 @@ impl Provider for WallhavenClient {
                     query_mut.append_pair(k, &v);
                 }
             }
-            let bytes = inner.execute_paced_get(url, scope, q.priority).await?;
+            let bytes =
+                WallhavenClientInner::execute_paced_get(inner, url, scope, q.priority).await?;
             decode_search_response(&bytes)
         }
     }
@@ -347,9 +356,13 @@ impl Provider for WallhavenClient {
                 return Err(ProviderError::NotFound);
             }
             let url = inner.build_api_url(&["w", id.as_str()])?;
-            let bytes = inner
-                .execute_paced_get(url, scope, RequestPriority::Interactive)
-                .await?;
+            let bytes = WallhavenClientInner::execute_paced_get(
+                inner,
+                url,
+                scope,
+                RequestPriority::Interactive,
+            )
+            .await?;
             decode_wallpaper_response(&bytes)
         }
     }

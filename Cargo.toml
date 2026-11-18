@@ -28,6 +28,7 @@ all = { level = "warn", priority = -1 }
 [workspace.dependencies]
 directories = "6.0.0"
 dotenvy = "0.15.7"
+httpdate = "=1.0.3"
 iced = { version = "=0.14.0", features = ["tokio", "image"] }
 image = "0.25.10"
 insta = { version = "1.49.0", features = ["json"] }
@@ -36,7 +37,6 @@ reqwest = { version = "0.12.28", default-features = false, features = ["rustls-t
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.149"
 thiserror = "2.0.21"
-time = { version = "0.3.55", features = ["formatting", "parsing", "macros"] }
 tokio = { version = "1.54.1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "fs", "io-util"] }
 tracing = "0.1.44"
 tracing-appender = "0.2.5"

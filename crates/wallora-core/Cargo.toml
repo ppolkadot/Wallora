@@ -12,11 +12,11 @@ workspace = true
 
 [dependencies]
 directories.workspace = true
+httpdate.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-time.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 url.workspace = true
