@@ -34,6 +34,12 @@ jobs:
       - name: Run tests
         run: cargo test --locked --workspace --all-targets
 
+      - name: Run Clippy (test-util feature lane)
+        run: cargo clippy --locked --workspace --all-targets --features wallora-core/test-util -- -D warnings
+
+      - name: Run tests (test-util feature lane)
+        run: cargo test --locked --workspace --all-targets --features wallora-core/test-util
+
       - name: Install cargo-deny
         run: cargo install --locked cargo-deny --version 0.21.0
 

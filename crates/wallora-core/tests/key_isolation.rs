@@ -1,6 +1,10 @@
 use std::io::Write;
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use tokio::io::AsyncWriteExt;
 use tracing_subscriber::fmt::MakeWriter;
 use url::Url;
 use wallora_core::domain::{
@@ -8,10 +12,13 @@ use wallora_core::domain::{
     WallpaperId,
 };
 use wallora_core::provider::{
-    OriginPolicy, Provider, ProviderError, WallhavenClient, WallhavenClientConfig, authorize,
+    ImageClass, OriginPolicy, Provider, ProviderError, WallhavenClient, WallhavenClientConfig,
+    authorize,
 };
 use wiremock::matchers::{header, header_exists, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+mod support;
 
 const SECRET_KEY: &str = "wh_super_secret_test_key_do_not_leak_987654";
 const FIXTURE_WALLPAPER_SFW: &str = include_str!("fixtures/wallpaper_sfw.json");
@@ -58,6 +65,23 @@ fn store_with_secret() -> (Arc<InMemoryCredentialStore>, AccountId, SessionScope
     (creds, account, scope)
 }
 
+/// Builds a client whose API base is an unused loopback address and whose image origin is the
+/// supplied loopback server.
+fn test_client_for_image(addr: SocketAddr) -> WallhavenClient {
+    let api_base = Url::parse("http://127.0.0.1:1/api/v1").expect("valid loopback base");
+    let origin = Url::parse(&format!("http://{addr}")).expect("valid loopback origin");
+    let config = WallhavenClientConfig::for_test(api_base)
+        .expect("valid test config")
+        .with_test_image_origin(origin)
+        .expect("valid test image origin");
+    WallhavenClient::with_config(Arc::new(InMemoryCredentialStore::new()), config)
+        .expect("client build")
+}
+
+fn image_url(addr: SocketAddr, path: &str) -> Url {
+    Url::parse(&format!("http://{addr}{path}")).expect("valid image url")
+}
+
 #[test]
 fn secret_string_redacts_debug_and_display() {
     let secret = SecretString::new(SECRET_KEY);
@@ -80,12 +104,14 @@ fn origin_policy_authorizes_only_exact_https_wallhaven_443_api_v1() {
         Url::parse("https://wallhaven.cc/api/v1/search?q=nature").unwrap(),
     );
     authorize(&mut allowed, &scope, creds.as_ref(), &policy).expect("exact API origin allowed");
-    assert_eq!(
-        allowed
-            .headers()
-            .get("x-api-key")
-            .and_then(|v| v.to_str().ok()),
-        Some(SECRET_KEY)
+    let key = allowed
+        .headers()
+        .get("x-api-key")
+        .expect("keyed request carries the header");
+    assert_eq!(key.to_str().ok(), Some(SECRET_KEY));
+    assert!(
+        key.is_sensitive(),
+        "API key header must be marked sensitive"
     );
 
     // Guest scope never attaches X-API-Key even on allowed origin
@@ -241,7 +267,11 @@ async fn wiremock_key_sent_to_api_absent_on_images_and_redirects_blocked() {
 
     let (creds, _acct, scope) = store_with_secret();
     let api_base = Url::parse(&format!("{}/api/v1", api_server.uri())).unwrap();
-    let config = WallhavenClientConfig::for_test(api_base).unwrap();
+    let image_origin = Url::parse(&image_server.uri()).unwrap();
+    let config = WallhavenClientConfig::for_test(api_base)
+        .unwrap()
+        .with_test_image_origin(image_origin)
+        .unwrap();
     let client = WallhavenClient::with_config(creds, config).unwrap();
 
     // Test authenticated API call
@@ -279,7 +309,7 @@ async fn wiremock_key_sent_to_api_absent_on_images_and_redirects_blocked() {
     ))
     .unwrap();
     let bytes = client
-        .fetch_image_bytes(&img_url)
+        .fetch_image_bytes(&img_url, ImageClass::Thumbnail)
         .await
         .expect("image fetch should succeed without key");
     assert_eq!(bytes, b"IMGDATA");
@@ -287,7 +317,7 @@ async fn wiremock_key_sent_to_api_absent_on_images_and_redirects_blocked() {
     // Test image host cross-origin redirect rejected
     let cross_url = Url::parse(&format!("{}/full/ab/cross.jpg", image_server.uri())).unwrap();
     let cross_err = client
-        .fetch_image_bytes(&cross_url)
+        .fetch_image_bytes(&cross_url, ImageClass::Thumbnail)
         .await
         .expect_err("cross-origin image redirect must be rejected");
     assert_eq!(cross_err, ProviderError::OriginRejected);
@@ -295,13 +325,25 @@ async fn wiremock_key_sent_to_api_absent_on_images_and_redirects_blocked() {
     // Test image host same-origin redirect allowed
     let same_url = Url::parse(&format!("{}/full/ab/same-orig.jpg", image_server.uri())).unwrap();
     let same_bytes = client
-        .fetch_image_bytes(&same_url)
+        .fetch_image_bytes(&same_url, ImageClass::Thumbnail)
         .await
         .expect("same-origin image redirect should succeed");
     assert_eq!(same_bytes, b"SAMEORIG");
 
-    // Verify search query serialization also never embeds key
+    // Verify search query serialization also never embeds key.
     let _ = client.search(SearchQuery::default(), scope).await;
+    for req in api_server.received_requests().await.unwrap_or_default() {
+        assert!(
+            !req.url.as_str().contains(SECRET_KEY),
+            "secret key leaked into a request URL: {}",
+            req.url
+        );
+        assert!(
+            !req.url.as_str().contains("apikey"),
+            "API key must never be sent as a query parameter: {}",
+            req.url
+        );
+    }
 
     // Verify captured tracing logs NEVER contain the secret key
     let logs = log_buf.contents();
@@ -312,55 +354,230 @@ async fn wiremock_key_sent_to_api_absent_on_images_and_redirects_blocked() {
 }
 
 #[tokio::test]
-async fn image_host_enforces_in_flight_cap_of_6() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
-    use wiremock::{Request, Respond};
-
-    struct ConcurrencyProbe {
-        active: Arc<AtomicUsize>,
-        max_active: Arc<AtomicUsize>,
-    }
-
-    impl Respond for ConcurrencyProbe {
-        fn respond(&self, _request: &Request) -> ResponseTemplate {
-            let cur = self.active.fetch_add(1, Ordering::SeqCst) + 1;
-            self.max_active.fetch_max(cur, Ordering::SeqCst);
-            std::thread::sleep(Duration::from_millis(80));
-            self.active.fetch_sub(1, Ordering::SeqCst);
-            ResponseTemplate::new(200).set_body_bytes(b"OK".as_slice())
-        }
-    }
-
+async fn production_image_fetch_rejects_loopback_without_connecting() {
     let image_server = MockServer::start().await;
-    let active = Arc::new(AtomicUsize::new(0));
-    let max_active = Arc::new(AtomicUsize::new(0));
-
     Mock::given(method("GET"))
-        .respond_with(ConcurrencyProbe {
-            active: Arc::clone(&active),
-            max_active: Arc::clone(&max_active),
-        })
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"IMG".as_slice()))
+        .expect(0)
         .mount(&image_server)
         .await;
 
-    let creds = Arc::new(InMemoryCredentialStore::new());
-    let client = WallhavenClient::new(creds).unwrap();
+    let client = WallhavenClient::new(Arc::new(InMemoryCredentialStore::new())).expect("client");
+    let url = Url::parse(&format!("{}/full/ab/x.jpg", image_server.uri())).unwrap();
+    let err = client
+        .fetch_image_bytes(&url, ImageClass::Thumbnail)
+        .await
+        .expect_err("production policy must reject loopback images");
 
+    assert_eq!(err, ProviderError::OriginRejected);
+    let received = image_server.received_requests().await.unwrap_or_default();
+    assert!(
+        received.is_empty(),
+        "production client connected to loopback"
+    );
+}
+
+#[tokio::test]
+async fn image_body_limit_checks_content_length_before_read() {
+    let (listener, addr) = support::bind().await;
+    let _server = support::serve(listener, |mut stream| async move {
+        let _ = support::read_request_head(&mut stream).await;
+        let _ = support::write_head(
+            &mut stream,
+            &[
+                ("Content-Type", "application/octet-stream"),
+                ("Content-Length", "2000001"),
+                ("Connection", "close"),
+            ],
+        )
+        .await;
+        // Withhold the body entirely; the client must reject from the declared length alone.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    });
+
+    let client = test_client_for_image(addr);
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        client.fetch_image_bytes(
+            &image_url(addr, "/thumb/oversized.jpg"),
+            ImageClass::Thumbnail,
+        ),
+    )
+    .await
+    .expect("content-length rejection must not wait for the body");
+
+    assert_eq!(
+        result,
+        Err(ProviderError::ImageTooLarge { limit: 2_000_000 })
+    );
+}
+
+#[tokio::test]
+async fn image_body_limit_checks_chunked_total() {
+    let (listener, addr) = support::bind().await;
+    let _server = support::serve(listener, |mut stream| async move {
+        let head = support::read_request_head(&mut stream)
+            .await
+            .unwrap_or_default();
+        let request_line = head.lines().next().unwrap_or_default().to_string();
+        let over_by_one = request_line.contains("cross");
+        let _ = support::write_head(
+            &mut stream,
+            &[
+                ("Content-Type", "application/octet-stream"),
+                ("Transfer-Encoding", "chunked"),
+                ("Connection", "close"),
+            ],
+        )
+        .await;
+        let first = vec![1u8; 1_000_000];
+        let second = vec![2u8; 1_000_000];
+        let _ = support::write_chunk(&mut stream, &first).await;
+        let _ = support::write_chunk(&mut stream, &second).await;
+        if over_by_one {
+            let _ = support::write_chunk(&mut stream, &[3u8]).await;
+        }
+        let _ = support::finish_chunks(&mut stream).await;
+        let _ = stream.shutdown().await;
+    });
+
+    let client = test_client_for_image(addr);
+
+    // Exactly the thumbnail ceiling succeeds.
+    let exact = client
+        .fetch_image_bytes(&image_url(addr, "/exact.jpg"), ImageClass::Thumbnail)
+        .await
+        .expect("an exact-limit body must succeed");
+    assert_eq!(exact.len(), 2_000_000);
+
+    // A later chunk crossing the ceiling by one byte is rejected.
+    let over = client
+        .fetch_image_bytes(&image_url(addr, "/cross.jpg"), ImageClass::Thumbnail)
+        .await
+        .expect_err("a body one byte over the thumbnail ceiling must fail");
+    assert_eq!(over, ProviderError::ImageTooLarge { limit: 2_000_000 });
+
+    // Preview accepts a body that exceeded the thumbnail ceiling.
+    let preview = client
+        .fetch_image_bytes(&image_url(addr, "/cross.jpg"), ImageClass::Preview)
+        .await
+        .expect("preview accepts the same body");
+    assert_eq!(preview.len(), 2_000_001);
+}
+
+#[tokio::test]
+async fn image_host_enforces_in_flight_cap_of_6() {
+    let (listener, addr) = support::bind().await;
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_active = Arc::new(AtomicUsize::new(0));
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let heads: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let (arrivals_tx, mut arrivals_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+
+    let server_active = Arc::clone(&active);
+    let server_max = Arc::clone(&max_active);
+    let server_gate = Arc::clone(&gate);
+    let server_heads = Arc::clone(&heads);
+    let _server = support::serve(listener, move |mut stream| {
+        let active = Arc::clone(&server_active);
+        let max_active = Arc::clone(&server_max);
+        let gate = Arc::clone(&server_gate);
+        let heads = Arc::clone(&server_heads);
+        let arrivals_tx = arrivals_tx.clone();
+        async move {
+            let head = support::read_request_head(&mut stream)
+                .await
+                .unwrap_or_default();
+            heads.lock().expect("heads lock").push(head);
+            let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+            max_active.fetch_max(current, Ordering::SeqCst);
+            let _ = arrivals_tx.send(());
+
+            let wrote_head = support::write_head(
+                &mut stream,
+                &[
+                    ("Content-Type", "application/octet-stream"),
+                    ("Content-Length", "2"),
+                    ("Connection", "close"),
+                ],
+            )
+            .await
+            .is_ok();
+            if wrote_head && stream.write_all(b"O").await.is_ok() && stream.flush().await.is_ok() {
+                // Hold the final byte until the test releases this connection. The gate permit
+                // is forgotten so releasing one connection never releases the next waiter.
+                if let Ok(permit) = gate.acquire().await {
+                    permit.forget();
+                    // Leave the concurrency count before the client can free its semaphore slot.
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    let _ = stream.write_all(b"K").await;
+                    let _ = stream.flush().await;
+                    let _ = stream.shutdown().await;
+                } else {
+                    active.fetch_sub(1, Ordering::SeqCst);
+                }
+            } else {
+                active.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+    });
+
+    let client = Arc::new(test_client_for_image(addr));
     let mut handles = Vec::new();
     for i in 0..12 {
-        let c = client.clone();
-        let url = Url::parse(&format!("{}/img/{i}.jpg", image_server.uri())).unwrap();
-        handles.push(tokio::spawn(async move { c.fetch_image_bytes(&url).await }));
+        let c = Arc::clone(&client);
+        let url = image_url(addr, &format!("/img/{i}.jpg"));
+        handles.push(tokio::spawn(async move {
+            c.fetch_image_bytes(&url, ImageClass::Thumbnail).await
+        }));
     }
 
-    for h in handles {
-        assert_eq!(h.await.unwrap().unwrap(), b"OK");
+    for _ in 0..6 {
+        tokio::time::timeout(Duration::from_secs(5), arrivals_rx.recv())
+            .await
+            .expect("six image requests must reach the host")
+            .expect("arrival signal");
     }
-
     assert!(
-        max_active.load(Ordering::SeqCst) <= 6,
-        "image in-flight cap 6 exceeded: {}",
-        max_active.load(Ordering::SeqCst)
+        tokio::time::timeout(Duration::from_millis(400), arrivals_rx.recv())
+            .await
+            .is_err(),
+        "more than six image requests reached the host"
     );
+
+    // Release exactly one held body: exactly one replacement may reach the host.
+    gate.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), arrivals_rx.recv())
+        .await
+        .expect("exactly one replacement must reach the host")
+        .expect("arrival signal");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(400), arrivals_rx.recv())
+            .await
+            .is_err(),
+        "more than one replacement reached the host"
+    );
+
+    // Drain the rest.
+    gate.add_permits(12);
+    for handle in handles {
+        let body = tokio::time::timeout(Duration::from_secs(20), handle)
+            .await
+            .expect("image call resolves")
+            .expect("task join")
+            .expect("image call succeeds");
+        assert_eq!(body, b"OK");
+    }
+
+    assert_eq!(
+        max_active.load(Ordering::SeqCst),
+        6,
+        "image in-flight cap must be exactly 6"
+    );
+    for head in heads.lock().expect("heads lock").iter() {
+        assert!(
+            !head.to_ascii_lowercase().contains("x-api-key"),
+            "image request carried an API key header"
+        );
+    }
 }

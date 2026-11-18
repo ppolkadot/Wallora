@@ -421,6 +421,21 @@ impl ApiPacer {
         result
     }
 
+    /// Registers a wake-up before inspecting the shared cooldown and resolves only once a
+    /// cooldown is active. Gated behind `test-util`.
+    #[cfg(any(test, feature = "test-util"))]
+    pub async fn wait_for_cooldown(&self) -> Duration {
+        loop {
+            let notified = self.shared.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(remaining) = self.shared.lock_state().cooldown_remaining(Instant::now()) {
+                return remaining;
+            }
+            notified.await;
+        }
+    }
+
     fn admit<F, Fut>(
         &self,
         coalesce_key: String,

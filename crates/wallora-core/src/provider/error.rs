@@ -24,6 +24,8 @@ pub enum ProviderError {
     Decode { context: String },
     #[error("upstream returned HTTP {status}")]
     Upstream { status: u16 },
+    #[error("image payload exceeded the {limit} byte limit")]
+    ImageTooLarge { limit: usize },
     #[error("request rejected by origin policy")]
     OriginRejected,
 }
@@ -54,6 +56,9 @@ impl ProviderError {
             }
             Self::Decode { context } => format!("Received unexpected data ({context})."),
             Self::Upstream { status } => format!("Wallhaven returned an unexpected HTTP {status}."),
+            Self::ImageTooLarge { limit } => {
+                format!("This image exceeds the {limit} byte size limit.")
+            }
             Self::OriginRejected => "Blocked a request to an unauthorized origin.".to_string(),
         }
     }

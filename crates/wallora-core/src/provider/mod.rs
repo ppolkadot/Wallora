@@ -10,7 +10,10 @@ use std::future::Future;
 
 use crate::domain::{SearchPage, SearchQuery, SessionScope, Wallpaper, WallpaperId};
 
-pub use client::{WALLHAVEN_API_BASE, WALLORA_USER_AGENT, WallhavenClient, WallhavenClientConfig};
+pub use client::{
+    IMAGE_IN_FLIGHT_CAP, ImageClass, WALLHAVEN_API_BASE, WALLORA_USER_AGENT, WallhavenClient,
+    WallhavenClientConfig,
+};
 pub use error::ProviderError;
 pub use origin::{OriginPolicy, authorize, same_origin};
 pub use pacer::ApiPacer;

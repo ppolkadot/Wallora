@@ -262,10 +262,41 @@ pub enum QueryEcho {
     Tag { id: u64, tag: String },
 }
 
+/// Accepts a JSON number or a nonempty ASCII decimal string within `u32` bounds.
+///
+/// The recorded `/settings` response renders `per_page` as a string while search responses use a
+/// number; both shapes are accepted defensively. Serialization always emits a number.
+fn deserialize_per_page<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum PerPage {
+        Number(u32),
+        Text(String),
+    }
+
+    match PerPage::deserialize(deserializer)? {
+        PerPage::Number(value) => Ok(value),
+        PerPage::Text(text) => {
+            let decimal = !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+            if !decimal {
+                return Err(serde::de::Error::custom(
+                    "per_page must be a nonempty decimal string",
+                ));
+            }
+            text.parse::<u32>()
+                .map_err(|_| serde::de::Error::custom("per_page exceeds the u32 range"))
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchMeta {
     pub current_page: u32,
     pub last_page: u32,
+    #[serde(deserialize_with = "deserialize_per_page")]
     pub per_page: u32,
     pub total: u64,
     #[serde(default)]
@@ -278,4 +309,54 @@ pub struct SearchMeta {
 pub struct SearchPage {
     pub data: Vec<Wallpaper>,
     pub meta: SearchMeta,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn meta(value: serde_json::Value) -> Result<SearchMeta, serde_json::Error> {
+        serde_json::from_value(value)
+    }
+
+    fn base(per_page: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "current_page": 1,
+            "last_page": 3,
+            "per_page": per_page,
+            "total": 72,
+        })
+    }
+
+    #[test]
+    fn search_meta_rejects_invalid_per_page() {
+        let rejected = [
+            serde_json::json!({ "current_page": 1, "last_page": 3, "total": 72 }),
+            base(serde_json::Value::Null),
+            base(serde_json::json!("")),
+            base(serde_json::json!("-24")),
+            base(serde_json::json!("+24")),
+            base(serde_json::json!("24.0")),
+            base(serde_json::json!(24.0)),
+            base(serde_json::json!("two dozen")),
+            base(serde_json::json!("0x18")),
+            base(serde_json::json!(4_294_967_296u64)),
+            base(serde_json::json!("4294967296")),
+            base(serde_json::json!("99999999999999999999")),
+        ];
+        for value in rejected {
+            assert!(
+                meta(value.clone()).is_err(),
+                "per_page accepted invalid form: {value}"
+            );
+        }
+
+        // Valid numeric and string forms both decode and re-serialize as numbers.
+        for per_page in [serde_json::json!(24), serde_json::json!("24")] {
+            let decoded = meta(base(per_page)).expect("valid per_page");
+            assert_eq!(decoded.per_page, 24);
+            let encoded = serde_json::to_value(&decoded).expect("serialize meta");
+            assert_eq!(encoded["per_page"], serde_json::json!(24));
+        }
+    }
 }

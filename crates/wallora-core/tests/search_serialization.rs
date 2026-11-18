@@ -1,71 +1,153 @@
+use std::sync::Arc;
+
 use insta::assert_snapshot;
-use url::form_urlencoded;
+use url::Url;
 use wallora_core::domain::{
-    AspectRatio, CategoryMask, Dimensions, PurityMask, RequestPriority, SearchQuery, SortOrder,
-    Sorting, TopRange,
+    AspectRatio, CategoryMask, Dimensions, InMemoryCredentialStore, PurityMask, RequestPriority,
+    SearchQuery, SessionScope, SortOrder, Sorting, TopRange,
 };
+use wallora_core::provider::{Provider, WallhavenClient, WallhavenClientConfig};
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
-fn serialize_query_string(query: &SearchQuery) -> String {
-    let mut ser = form_urlencoded::Serializer::new(String::new());
-    for (k, v) in query.to_query_pairs() {
-        ser.append_pair(k, &v);
+const FIXTURE_SEARCH_PAGE: &str = include_str!("fixtures/search_page.json");
+
+/// One real search request's recorded URL.
+struct Recorded {
+    url: Url,
+}
+
+impl Recorded {
+    /// The raw query string, or the empty string when the request carried no query at all.
+    fn query(&self) -> String {
+        self.url.query().unwrap_or_default().to_string()
     }
-    ser.finish()
 }
 
-#[test]
-fn empty_query_serializes_empty() {
-    let query = SearchQuery::default();
-    assert_snapshot!("empty_query", serialize_query_string(&query));
+async fn server() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/search"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(FIXTURE_SEARCH_PAGE))
+        .mount(&server)
+        .await;
+    server
 }
 
-#[test]
-fn full_documented_filters_serialize_deterministically() {
-    let query = SearchQuery {
-        q: Some("+landscape -city @artist id:42 type:png like:abc123".to_string()),
-        categories: Some(CategoryMask {
-            general: true,
-            anime: false,
-            people: true,
-        }),
-        purity: Some(PurityMask::SFW_AND_SKETCHY),
-        sorting: Some(Sorting::Toplist),
-        order: Some(SortOrder::Asc),
-        top_range: Some(TopRange::OneMonth),
-        atleast: Some(Dimensions::new(1920, 1080)),
-        resolutions: vec![Dimensions::new(1920, 1080), Dimensions::new(2560, 1440)],
-        ratios: vec![AspectRatio::new("16x9"), AspectRatio::new("21x9")],
-        colors: Some("#F37316".to_string()),
-        page: Some(3),
-        seed: Some("seed42xyz".to_string()),
-        priority: RequestPriority::Interactive,
-    };
+/// Sends `query` through `Provider::search` with a fresh client (so its own pacer never delays
+/// the request) and returns the single request the mock received.
+async fn record_search(server: &MockServer, query: SearchQuery) -> Recorded {
+    let before = server
+        .received_requests()
+        .await
+        .map(|requests| requests.len())
+        .unwrap_or(0);
 
-    assert_snapshot!("full_documented_filters", serialize_query_string(&query));
+    let base = Url::parse(&format!("{}/api/v1", server.uri())).expect("valid mock URI");
+    let config = WallhavenClientConfig::for_test(base).expect("valid test config");
+    let client = WallhavenClient::with_config(Arc::new(InMemoryCredentialStore::new()), config)
+        .expect("client build");
+    client
+        .search(query, SessionScope::guest(1))
+        .await
+        .expect("search should succeed against the mock");
+
+    let requests = server.received_requests().await.expect("recorded requests");
+    assert_eq!(
+        requests.len(),
+        before + 1,
+        "each query must produce exactly one request"
+    );
+    let request = requests.last().expect("recorded request");
+    assert_eq!(request.method.as_str(), "GET");
+    assert_eq!(request.url.path(), "/api/v1/search");
+    assert!(
+        request
+            .url
+            .query_pairs()
+            .all(|(key, _)| !key.eq_ignore_ascii_case("apikey")),
+        "the API key must never be a query parameter: {}",
+        request.url
+    );
+    Recorded {
+        url: request.url.clone(),
+    }
 }
 
-#[test]
-fn all_documented_sortings_and_top_ranges_serialize() {
-    let sortings = [
+#[tokio::test]
+async fn empty_query_serializes_empty() {
+    let server = server().await;
+    let recorded = record_search(&server, SearchQuery::default()).await;
+
+    assert!(
+        recorded.url.query().is_none(),
+        "the default query must not add a query string: {}",
+        recorded.url
+    );
+    assert!(
+        !recorded.url.as_str().contains('?'),
+        "the default query must not emit an empty query separator: {}",
+        recorded.url
+    );
+    assert_snapshot!("empty_query", recorded.query());
+}
+
+#[tokio::test]
+async fn full_documented_filters_serialize_deterministically() {
+    let server = server().await;
+    let recorded = record_search(
+        &server,
+        SearchQuery {
+            q: Some("+landscape -city @artist id:42 type:png like:abc123".to_string()),
+            categories: Some(CategoryMask {
+                general: true,
+                anime: false,
+                people: true,
+            }),
+            purity: Some(PurityMask::SFW_AND_SKETCHY),
+            sorting: Some(Sorting::Toplist),
+            order: Some(SortOrder::Asc),
+            top_range: Some(TopRange::OneMonth),
+            atleast: Some(Dimensions::new(1920, 1080)),
+            resolutions: vec![Dimensions::new(1920, 1080), Dimensions::new(2560, 1440)],
+            ratios: vec![AspectRatio::new("16x9"), AspectRatio::new("21x9")],
+            colors: Some("#F37316".to_string()),
+            page: Some(3),
+            seed: Some("seed42xyz".to_string()),
+            priority: RequestPriority::Interactive,
+        },
+    )
+    .await;
+
+    assert_snapshot!("full_documented_filters", recorded.query());
+}
+
+#[tokio::test]
+async fn all_documented_sortings_and_top_ranges_serialize() {
+    let server = server().await;
+
+    let mut sortings = Vec::new();
+    for sorting in [
         Sorting::DateAdded,
         Sorting::Relevance,
         Sorting::Random,
         Sorting::Views,
         Sorting::Favorites,
         Sorting::Toplist,
-    ]
-    .into_iter()
-    .map(|sorting| {
-        let query = SearchQuery {
-            sorting: Some(sorting),
-            ..Default::default()
-        };
-        serialize_query_string(&query)
-    })
-    .collect::<Vec<_>>()
-    .join("\n");
+    ] {
+        let recorded = record_search(
+            &server,
+            SearchQuery {
+                sorting: Some(sorting),
+                ..Default::default()
+            },
+        )
+        .await;
+        sortings.push(recorded.query());
+    }
 
-    let top_ranges = [
+    let mut top_ranges = Vec::new();
+    for range in [
         TopRange::OneDay,
         TopRange::ThreeDays,
         TopRange::OneWeek,
@@ -73,19 +155,19 @@ fn all_documented_sortings_and_top_ranges_serialize() {
         TopRange::ThreeMonths,
         TopRange::SixMonths,
         TopRange::OneYear,
-    ]
-    .into_iter()
-    .map(|range| {
-        let query = SearchQuery {
-            sorting: Some(Sorting::Toplist),
-            top_range: Some(range),
-            ..Default::default()
-        };
-        serialize_query_string(&query)
-    })
-    .collect::<Vec<_>>()
-    .join("\n");
+    ] {
+        let recorded = record_search(
+            &server,
+            SearchQuery {
+                sorting: Some(Sorting::Toplist),
+                top_range: Some(range),
+                ..Default::default()
+            },
+        )
+        .await;
+        top_ranges.push(recorded.query());
+    }
 
-    assert_snapshot!("documented_sortings", sortings);
-    assert_snapshot!("documented_top_ranges", top_ranges);
+    assert_snapshot!("documented_sortings", sortings.join("\n"));
+    assert_snapshot!("documented_top_ranges", top_ranges.join("\n"));
 }

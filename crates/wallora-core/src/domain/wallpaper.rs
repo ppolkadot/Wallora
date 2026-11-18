@@ -82,12 +82,21 @@ pub struct Uploader {
 pub struct Tag {
     pub id: u64,
     pub name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_or_null")]
     pub alias: String,
     pub category_id: u64,
     pub category: String,
     pub purity: Purity,
     pub created_at: String,
+}
+
+/// Deserializes a string field that upstream may render as `null`, mapping `null` to empty and
+/// rejecting every other non-string type.
+fn deserialize_string_or_null<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,7 +111,7 @@ pub struct Wallpaper {
     pub views: u64,
     #[serde(default)]
     pub favorites: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_or_null")]
     pub source: String,
     pub purity: Purity,
     pub category: Category,
