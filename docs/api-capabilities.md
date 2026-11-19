@@ -23,3 +23,18 @@
 | Image hosts (`w.wallhaven.cc`, `th.wallhaven.cc`) | **confirmed** | Search and wallpaper responses provide full/thumbnail URLs on `w.wallhaven.cc` and `th.wallhaven.cc` (live CDN byte download not probed in 1b). |
 | Crop / scale | **unresolved** | Not present in `https://wallhaven.cc/help/api`; awaiting Task 1c manual website audit. |
 | Writes (favorites, collections CRUD, upload, comments, tags, forums, settings edits) | **missing** | `https://wallhaven.cc/help/api` states the API "allows for basic GET requests via URL" and documents no write endpoints. Awaiting Task 1c manual audit to confirm there are no authorized web endpoints. |
+
+
+## Targeted follow-up (2026-11-19)
+
+Read-only requests used at least 2.1 s API spacing and aborted on a 429. The local key and username were loaded without printing their values.
+
+| Area | Result |
+|---|---|
+| Key validation | Keyed `GET /settings` returned 200. |
+| Own collections | Keyed `GET /collections` returned 200 on two passes. Shape check found one collection with a private flag and a Default/Favorites candidate label. |
+| Supplied username | The unkeyed public-list route returned 404 on both passes. The combination of a 404 and an all-private keyed list does not establish why the public lookup failed. No shared ID verified identity. |
+| Public comparison | Unkeyed public list and collection-item requests returned 200 for a public account observed in the guest browser. |
+| Favorites mapping | Signed-in website label, empty state, and ID stability across a test mutation remain unverified. |
+| Guest SFW detail and similar | `GET /w/e8r2y8` returned 200. Website similar search found 8 results and the corresponding documented API query returned 403. |
+| Original CDN | Direct unauthenticated fetch returned an HTTP error for `e8r2y8`. The independent reviewer matched the detail API path to the website original for `3l5xev` and retrieved a 1,176,033-byte JPEG. Native byte equivalence remains a Task 6 check. |
