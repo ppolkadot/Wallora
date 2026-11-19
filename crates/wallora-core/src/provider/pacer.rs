@@ -1364,6 +1364,7 @@ mod tests {
             let attempts = Arc::new(AtomicUsize::new(0));
             let (release_tx, release_rx) = oneshot::channel::<()>();
             let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+            let (visible_started_tx, mut visible_started_rx) = starts_channel();
 
             let holder = {
                 let p = Arc::clone(&pacer);
@@ -1419,15 +1420,21 @@ mod tests {
             tokio::task::yield_now().await;
             let visible = {
                 let p = Arc::clone(&pacer);
+                let visible_started_tx = visible_started_tx.clone();
                 tokio::spawn(async move {
-                    p.run("visible".to_string(), RequestPriority::Visible, || async {
-                        Ok(AttemptOutcome::Success(vec![3]))
+                    p.run("visible".to_string(), RequestPriority::Visible, move || {
+                        let visible_started_tx = visible_started_tx.clone();
+                        async move {
+                            let _ = visible_started_tx.send(Instant::now());
+                            Ok(AttemptOutcome::Success(vec![3]))
+                        }
                     })
                     .await
                 })
             };
             tokio::task::yield_now().await;
 
+            let released_at = Instant::now();
             release_tx.send(()).expect("release holder");
 
             let a = tokio::time::timeout(Duration::from_secs(30), prefetch_a)
@@ -1450,6 +1457,23 @@ mod tests {
             );
 
             // Visible work stays pending until the deadline and then completes normally.
+            if retry_after > Duration::ZERO {
+                assert!(
+                    visible_started_rx.try_recv().is_err(),
+                    "a queued Visible request started during the cooldown"
+                );
+            }
+            let visible_started =
+                tokio::time::timeout(Duration::from_secs(120), visible_started_rx.recv())
+                    .await
+                    .expect("visible starts after the cooldown")
+                    .expect("start signal");
+            assert!(
+                visible_started >= released_at + retry_after,
+                "visible started before the cooldown deadline: {:?} vs {:?}",
+                visible_started.duration_since(released_at),
+                retry_after
+            );
             let visible = tokio::time::timeout(Duration::from_secs(120), visible)
                 .await
                 .expect("visible resolves after the cooldown")
@@ -1460,6 +1484,204 @@ mod tests {
                 .await
                 .expect("holder finishes");
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn prefetch_waiting_to_retry_is_drained_on_429() {
+        let pacer = Arc::new(ApiPacer::new());
+        let prefetch_attempts = Arc::new(AtomicUsize::new(0));
+
+        let prefetch = {
+            let p = Arc::clone(&pacer);
+            let attempts = Arc::clone(&prefetch_attempts);
+            tokio::spawn(async move {
+                p.run(
+                    "pref-retry".to_string(),
+                    RequestPriority::Prefetch,
+                    move || {
+                        let attempts = Arc::clone(&attempts);
+                        async move {
+                            attempts.fetch_add(1, Ordering::SeqCst);
+                            Ok(AttemptOutcome::RetryableTransient(
+                                ProviderError::Upstream { status: 503 },
+                            ))
+                        }
+                    },
+                )
+                .await
+            })
+        };
+
+        // Wait until the 5xx retry is in its backoff, still before the retry attempt starts.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let waiting = pacer
+                    .shared
+                    .lock_state()
+                    .jobs
+                    .values()
+                    .any(|job| job.key == "pref-retry" && job.phase == Phase::WaitingRetry);
+                if waiting {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the prefetch job must be waiting to retry");
+
+        let limited_attempts = Arc::new(AtomicUsize::new(0));
+        let limited_result = {
+            let p = Arc::clone(&pacer);
+            let attempts = Arc::clone(&limited_attempts);
+            p.run(
+                "limited".to_string(),
+                RequestPriority::Interactive,
+                move || {
+                    let attempts = Arc::clone(&attempts);
+                    async move {
+                        if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                            Ok(AttemptOutcome::RetryableRateLimit {
+                                retry_after: Some(Duration::from_secs(5)),
+                            })
+                        } else {
+                            Ok(AttemptOutcome::Success(vec![1]))
+                        }
+                    }
+                },
+            )
+            .await
+        };
+        assert_eq!(limited_result, Ok(vec![1]));
+
+        let prefetch_result = tokio::time::timeout(Duration::from_secs(30), prefetch)
+            .await
+            .expect("the waiting prefetch resolves")
+            .unwrap();
+        assert!(
+            matches!(
+                prefetch_result,
+                Err(ProviderError::RateLimited {
+                    retry_after: Some(_)
+                })
+            ),
+            "a prefetch waiting to retry must be dropped with RateLimited: {prefetch_result:?}"
+        );
+        assert_eq!(
+            prefetch_attempts.load(Ordering::SeqCst),
+            1,
+            "the drained prefetch job must never retry"
+        );
+        assert!(
+            !pacer
+                .shared
+                .lock_state()
+                .jobs
+                .values()
+                .any(|job| job.key == "pref-retry"),
+            "the drained prefetch job must be retired"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn prefetch_429_is_dropped_while_interactive_retries() {
+        let pacer = Arc::new(ApiPacer::new());
+        let prefetch_attempts = Arc::new(AtomicUsize::new(0));
+        let interactive_attempts = Arc::new(AtomicUsize::new(0));
+        let (interactive_started_tx, mut interactive_started_rx) = starts_channel();
+
+        let prefetch_started_at = Instant::now();
+        let prefetch = {
+            let p = Arc::clone(&pacer);
+            let attempts = Arc::clone(&prefetch_attempts);
+            tokio::spawn(async move {
+                p.run(
+                    "pref-429".to_string(),
+                    RequestPriority::Prefetch,
+                    move || {
+                        let attempts = Arc::clone(&attempts);
+                        async move {
+                            attempts.fetch_add(1, Ordering::SeqCst);
+                            Ok(AttemptOutcome::RetryableRateLimit {
+                                retry_after: Some(Duration::from_secs(5)),
+                            })
+                        }
+                    },
+                )
+                .await
+            })
+        };
+        let prefetch_result = tokio::time::timeout(Duration::from_secs(30), prefetch)
+            .await
+            .expect("the prefetch job resolves")
+            .unwrap();
+        assert!(
+            matches!(prefetch_result, Err(ProviderError::RateLimited { .. })),
+            "an effective Prefetch job must be dropped on 429: {prefetch_result:?}"
+        );
+        assert_eq!(
+            prefetch_attempts.load(Ordering::SeqCst),
+            1,
+            "an effective Prefetch job must not retry a 429"
+        );
+
+        // An Interactive job waits out the shared cooldown and does retry its own 429.
+        let interactive = {
+            let p = Arc::clone(&pacer);
+            let attempts = Arc::clone(&interactive_attempts);
+            let started_tx = interactive_started_tx.clone();
+            tokio::spawn(async move {
+                p.run(
+                    "int-429".to_string(),
+                    RequestPriority::Interactive,
+                    move || {
+                        let attempts = Arc::clone(&attempts);
+                        let started_tx = started_tx.clone();
+                        async move {
+                            let _ = started_tx.send(Instant::now());
+                            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                                Ok(AttemptOutcome::RetryableRateLimit {
+                                    retry_after: Some(Duration::from_secs(5)),
+                                })
+                            } else {
+                                Ok(AttemptOutcome::Success(vec![7]))
+                            }
+                        }
+                    },
+                )
+                .await
+            })
+        };
+        let first_start =
+            tokio::time::timeout(Duration::from_secs(30), interactive_started_rx.recv())
+                .await
+                .expect("the interactive job starts after the cooldown")
+                .expect("start signal");
+        let retry_start =
+            tokio::time::timeout(Duration::from_secs(30), interactive_started_rx.recv())
+                .await
+                .expect("the interactive job retries after the cooldown")
+                .expect("start signal");
+        assert!(
+            first_start >= prefetch_started_at + Duration::from_secs(5),
+            "the interactive job started before the shared cooldown elapsed: {:?}",
+            first_start.duration_since(prefetch_started_at)
+        );
+        assert!(
+            retry_start >= first_start + Duration::from_secs(5),
+            "the interactive retry started before its cooldown elapsed: {:?}",
+            retry_start.duration_since(first_start)
+        );
+        let interactive_result = tokio::time::timeout(Duration::from_secs(30), interactive)
+            .await
+            .expect("the interactive job resolves")
+            .unwrap();
+        assert_eq!(interactive_result, Ok(vec![7]));
+        assert_eq!(
+            interactive_attempts.load(Ordering::SeqCst),
+            2,
+            "the interactive job must retry once and then succeed"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1592,16 +1814,173 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn promoted_job_starts_before_queued_visible() {
+        let pacer = Arc::new(ApiPacer::new());
+        let (promoted_tx, mut promoted_rx) = starts_channel();
+        let (visible_tx, mut visible_rx) = starts_channel();
+        let executions = Arc::new(AtomicUsize::new(0));
+
+        // Each blocker owns its own release channel, so both really hold an in-flight slot.
+        let mut blockers = Vec::new();
+        let mut blocker_releases = Vec::new();
+        for b in 0..2 {
+            let p = Arc::clone(&pacer);
+            let (release_tx, release_rx) = oneshot::channel::<()>();
+            let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+            blocker_releases.push(release_tx);
+            blockers.push(tokio::spawn(async move {
+                p.run(
+                    format!("blocker-{b}"),
+                    RequestPriority::Interactive,
+                    move || {
+                        let release_rx = Arc::clone(&release_rx);
+                        async move {
+                            let rx = release_rx.lock().await.take();
+                            if let Some(rx) = rx {
+                                let _ = rx.await;
+                            }
+                            Ok(AttemptOutcome::Success(vec![]))
+                        }
+                    },
+                )
+                .await
+            }));
+            tokio::time::sleep(MIN_SPACING).await;
+        }
+        assert_eq!(
+            pacer.shared.lock_state().in_flight,
+            2,
+            "both blockers must hold a slot before the ordering check"
+        );
+
+        let visible = {
+            let p = Arc::clone(&pacer);
+            tokio::spawn(async move {
+                p.run("visible".to_string(), RequestPriority::Visible, move || {
+                    let visible_tx = visible_tx.clone();
+                    async move {
+                        let _ = visible_tx.send(Instant::now());
+                        Ok(AttemptOutcome::Success(vec![4]))
+                    }
+                })
+                .await
+            })
+        };
+        tokio::task::yield_now().await;
+
+        let promoted = {
+            let p = Arc::clone(&pacer);
+            let executions = Arc::clone(&executions);
+            tokio::spawn(async move {
+                p.run(
+                    "promoted".to_string(),
+                    RequestPriority::Prefetch,
+                    move || {
+                        let promoted_tx = promoted_tx.clone();
+                        let executions = Arc::clone(&executions);
+                        async move {
+                            let _ = promoted_tx.send(Instant::now());
+                            executions.fetch_add(1, Ordering::SeqCst);
+                            Ok(AttemptOutcome::Success(vec![9]))
+                        }
+                    },
+                )
+                .await
+            })
+        };
+        tokio::task::yield_now().await;
+
+        // A higher-priority duplicate promotes the queued Prefetch job before any slot opens.
+        let promoting_caller = {
+            let p = Arc::clone(&pacer);
+            tokio::spawn(async move {
+                p.run(
+                    "promoted".to_string(),
+                    RequestPriority::Interactive,
+                    || async { Ok(AttemptOutcome::Success(vec![9])) },
+                )
+                .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let promoted_priority = pacer
+                    .shared
+                    .lock_state()
+                    .jobs
+                    .values()
+                    .find(|job| job.key == "promoted")
+                    .map(|job| job.priority);
+                if promoted_priority == Some(RequestPriority::Interactive) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the interactive duplicate must promote the queued prefetch job");
+
+        for tx in blocker_releases {
+            tx.send(()).expect("release blockers");
+        }
+
+        let promoted_started = tokio::time::timeout(Duration::from_secs(30), promoted_rx.recv())
+            .await
+            .expect("the promoted job must start")
+            .expect("start signal");
+        assert!(
+            visible_rx.try_recv().is_err(),
+            "a queued Visible job started before the promoted job"
+        );
+
+        let promoted_result = tokio::time::timeout(Duration::from_secs(30), promoted)
+            .await
+            .expect("the promoted job resolves")
+            .unwrap();
+        assert_eq!(promoted_result, Ok(vec![9]));
+
+        let visible_started = tokio::time::timeout(Duration::from_secs(30), visible_rx.recv())
+            .await
+            .expect("the visible job must start once the promoted job is done")
+            .expect("start signal");
+        assert!(
+            visible_started > promoted_started,
+            "the queued Visible job must start after the promoted job: {visible_started:?} vs {promoted_started:?}"
+        );
+
+        let visible_result = tokio::time::timeout(Duration::from_secs(30), visible)
+            .await
+            .expect("the visible job resolves")
+            .unwrap();
+        assert_eq!(visible_result, Ok(vec![4]));
+        let promoting_result = tokio::time::timeout(Duration::from_secs(30), promoting_caller)
+            .await
+            .expect("the promoting caller resolves")
+            .unwrap();
+        assert_eq!(promoting_result, Ok(vec![9]));
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            1,
+            "both subscribers share the promoted job's single execution"
+        );
+        for b in blockers {
+            let _ = tokio::time::timeout(Duration::from_secs(10), b).await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn promotion_respects_destination_queue_capacity() {
         // A full Interactive queue rejects the promotion and leaves the original queued.
         {
             let pacer = Arc::new(ApiPacer::new());
-            let (release_tx, release_rx) = oneshot::channel::<()>();
-            let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+            // Each blocker owns its release channel, so both stay in flight and hold a slot.
+            let mut blocker_releases = Vec::new();
             let mut blockers = Vec::new();
             for b in 0..2 {
                 let p = Arc::clone(&pacer);
-                let release_rx = Arc::clone(&release_rx);
+                let (release_tx, release_rx) = oneshot::channel::<()>();
+                let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+                blocker_releases.push(release_tx);
                 blockers.push(tokio::spawn(async move {
                     p.run(
                         format!("blocker-{b}"),
@@ -1619,8 +1998,13 @@ mod tests {
                     )
                     .await
                 }));
-                tokio::task::yield_now().await;
+                tokio::time::sleep(MIN_SPACING).await;
             }
+            assert_eq!(
+                pacer.shared.lock_state().in_flight,
+                2,
+                "both blockers must hold a slot before the capacity check"
+            );
 
             let prefetch = {
                 let p = Arc::clone(&pacer);
@@ -1672,7 +2056,9 @@ mod tests {
                 "the original job must be left unchanged"
             );
 
-            release_tx.send(()).expect("release blockers");
+            for tx in blocker_releases {
+                tx.send(()).expect("release blockers");
+            }
             for b in blockers {
                 let _ = tokio::time::timeout(Duration::from_secs(10), b).await;
             }
@@ -1688,12 +2074,15 @@ mod tests {
         // Promoting into a full Visible queue evicts its oldest entry.
         {
             let pacer = Arc::new(ApiPacer::new());
-            let (release_tx, release_rx) = oneshot::channel::<()>();
-            let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+            let executions = Arc::new(AtomicUsize::new(0));
+            // Each blocker owns its release channel, so both stay in flight and hold a slot.
+            let mut blocker_releases = Vec::new();
             let mut blockers = Vec::new();
             for b in 0..2 {
                 let p = Arc::clone(&pacer);
-                let release_rx = Arc::clone(&release_rx);
+                let (release_tx, release_rx) = oneshot::channel::<()>();
+                let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+                blocker_releases.push(release_tx);
                 blockers.push(tokio::spawn(async move {
                     p.run(
                         format!("hold-{b}"),
@@ -1711,16 +2100,28 @@ mod tests {
                     )
                     .await
                 }));
-                tokio::task::yield_now().await;
+                tokio::time::sleep(MIN_SPACING).await;
             }
+            assert_eq!(
+                pacer.shared.lock_state().in_flight,
+                2,
+                "both blockers must hold a slot before the eviction check"
+            );
 
             let promotee = {
                 let p = Arc::clone(&pacer);
+                let executions = Arc::clone(&executions);
                 tokio::spawn(async move {
                     p.run(
                         "promotee".to_string(),
                         RequestPriority::Prefetch,
-                        || async { Ok(AttemptOutcome::Success(vec![6])) },
+                        move || {
+                            let executions = Arc::clone(&executions);
+                            async move {
+                                executions.fetch_add(1, Ordering::SeqCst);
+                                Ok(AttemptOutcome::Success(vec![6]))
+                            }
+                        },
                     )
                     .await
                 })
@@ -1741,12 +2142,50 @@ mod tests {
                 tokio::task::yield_now().await;
             }
 
-            let promoted = pacer
-                .run("promotee".to_string(), RequestPriority::Visible, || async {
-                    Ok(AttemptOutcome::Success(vec![6]))
+            // Both slots are held, so the promoting caller cannot complete until they release:
+            // spawn it, assert the admission-time promotion and eviction, then drain.
+            let promoted = {
+                let p = Arc::clone(&pacer);
+                let executions = Arc::clone(&executions);
+                tokio::spawn(async move {
+                    p.run(
+                        "promotee".to_string(),
+                        RequestPriority::Visible,
+                        move || {
+                            let executions = Arc::clone(&executions);
+                            async move {
+                                executions.fetch_add(1, Ordering::SeqCst);
+                                Ok(AttemptOutcome::Success(vec![6]))
+                            }
+                        },
+                    )
+                    .await
                 })
-                .await;
-            assert_eq!(promoted, Ok(vec![6]));
+            };
+            for _ in 0..100 {
+                let queued_priority = pacer
+                    .shared
+                    .lock_state()
+                    .jobs
+                    .values()
+                    .find(|job| job.key == "promotee")
+                    .map(|job| job.priority);
+                if queued_priority == Some(RequestPriority::Visible) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                pacer
+                    .shared
+                    .lock_state()
+                    .jobs
+                    .values()
+                    .find(|job| job.key == "promotee")
+                    .map(|job| job.priority),
+                Some(RequestPriority::Visible),
+                "the interactive duplicate must promote the queued prefetch job"
+            );
 
             let oldest = tokio::time::timeout(Duration::from_secs(60), visible.remove(0))
                 .await
@@ -1754,7 +2193,9 @@ mod tests {
                 .unwrap();
             assert_eq!(oldest, Err(ProviderError::Busy));
 
-            release_tx.send(()).expect("release blockers");
+            for tx in blocker_releases {
+                tx.send(()).expect("release blockers");
+            }
             for b in blockers {
                 let _ = tokio::time::timeout(Duration::from_secs(10), b).await;
             }
@@ -1762,6 +2203,16 @@ mod tests {
                 .await
                 .expect("promoted job resolves")
                 .unwrap();
+            let promoted_result = tokio::time::timeout(Duration::from_secs(600), promoted)
+                .await
+                .expect("the promoting caller resolves")
+                .unwrap();
+            assert_eq!(promoted_result, Ok(vec![6]));
+            assert_eq!(
+                executions.load(Ordering::SeqCst),
+                1,
+                "both subscribers share the promoted job's single execution"
+            );
             for v in visible {
                 let _ = tokio::time::timeout(Duration::from_secs(600), v).await;
             }
@@ -1859,6 +2310,8 @@ mod tests {
             let (started_tx, mut started_rx) = starts_channel();
             let (release_tx, release_rx) = oneshot::channel::<()>();
             let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+            let (attempt_release_tx, attempt_release_rx) = oneshot::channel::<()>();
+            let attempt_release_rx = Arc::new(Mutex::new(Some(attempt_release_rx)));
 
             let blocker = {
                 let p = Arc::clone(&pacer);
@@ -1887,6 +2340,7 @@ mod tests {
                 let p = Arc::clone(&pacer);
                 let started_tx = started_tx.clone();
                 let executions = Arc::clone(&executions);
+                let attempt_release_rx = Arc::clone(&attempt_release_rx);
                 tokio::spawn(async move {
                     p.run(
                         "held".to_string(),
@@ -1894,9 +2348,14 @@ mod tests {
                         move || {
                             let started_tx = started_tx.clone();
                             let executions = Arc::clone(&executions);
+                            let attempt_release_rx = Arc::clone(&attempt_release_rx);
                             async move {
                                 let _ = started_tx.send(Instant::now());
                                 executions.fetch_add(1, Ordering::SeqCst);
+                                let rx = attempt_release_rx.lock().await.take();
+                                if let Some(rx) = rx {
+                                    let _ = rx.await;
+                                }
                                 Ok(AttemptOutcome::Success(vec![5]))
                             }
                         },
@@ -1935,6 +2394,21 @@ mod tests {
             first.abort();
             let _ = first.await;
             tokio::task::yield_now().await;
+
+            // The attempt is still held open, so the surviving subscriber must keep the job.
+            assert!(
+                !survivor.is_finished(),
+                "the coalesced job must survive the first caller's cancellation"
+            );
+            assert_eq!(
+                executions.load(Ordering::SeqCst),
+                1,
+                "the held attempt must still be the only execution"
+            );
+
+            attempt_release_tx
+                .send(())
+                .expect("release the held attempt");
 
             let result = tokio::time::timeout(Duration::from_secs(30), survivor)
                 .await
@@ -2089,7 +2563,8 @@ mod tests {
             let _ = cancelled.await;
             tokio::task::yield_now().await;
 
-            drop(release_tx);
+            // The mock attempt is still held open, so only an actually cancelled attempt can
+            // return its permit here. Releasing the mock first would let it finish by itself.
             tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
                     if pacer.shared.lock_state().in_flight == 0 {
@@ -2099,7 +2574,17 @@ mod tests {
                 }
             })
             .await
-            .expect("a cancelled attempt must release its permit");
+            .expect("a cancelled attempt must release its permit before the mock is released");
+
+            assert_eq!(
+                pacer.shared.lock_state().in_flight,
+                0,
+                "the held attempt must be aborted, not completed"
+            );
+
+            // Now let the dropped attempt's mock return; it must not affect the released slot.
+            drop(release_tx);
+            tokio::task::yield_now().await;
 
             let next = pacer
                 .run("next".to_string(), RequestPriority::Interactive, || async {
