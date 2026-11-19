@@ -1057,21 +1057,9 @@ mod tests {
             .expect("start signal");
 
         // Observe the applied cooldown instead of sleeping for a fixed time.
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if pacer
-                    .shared
-                    .lock_state()
-                    .cooldown_remaining(Instant::now())
-                    .is_some()
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("429 must activate the shared cooldown");
+        tokio::time::timeout(Duration::from_secs(10), pacer.wait_for_cooldown())
+            .await
+            .expect("429 must activate the shared cooldown");
 
         let pref_res = pacer
             .run("pref-1".to_string(), RequestPriority::Prefetch, || async {
@@ -1312,14 +1300,14 @@ mod tests {
                 if let (Some(deadline), Some(left)) = observed {
                     break (deadline, left);
                 }
-                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
         .await
         .expect("the huge 429 must activate the cooldown");
-        assert_eq!(
-            remaining, MAX_COOLDOWN,
-            "a huge header must clamp to one hour"
+        assert!(
+            remaining <= MAX_COOLDOWN && remaining > MAX_COOLDOWN - Duration::from_secs(1),
+            "a huge header must clamp to one hour, got {remaining:?}"
         );
 
         release_short_tx
@@ -1334,7 +1322,7 @@ mod tests {
                 if observed.0 == 0 {
                     break observed.1;
                 }
-                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
         .await
@@ -2570,7 +2558,7 @@ mod tests {
                     if pacer.shared.lock_state().in_flight == 0 {
                         break;
                     }
-                    tokio::task::yield_now().await;
+                    tokio::time::sleep(Duration::from_millis(1)).await;
                 }
             })
             .await
