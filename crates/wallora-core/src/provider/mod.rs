@@ -59,10 +59,11 @@ pub trait Provider: Send + Sync + 'static {
 
     /// Keyed `GET /api/v1/settings` using a candidate API key during sign-in, before writing
     /// anything to `CredentialStore` or SQLite.
+    /// Only HTTP 200 succeeds. The optional defaults are decoded separately from key validity.
     fn user_settings_with_key(
         &self,
         api_key: SecretString,
-    ) -> impl Future<Output = Result<UserSettings, ProviderError>> + Send + 'static;
+    ) -> impl Future<Output = Result<Option<UserSettings>, ProviderError>> + Send + 'static;
 
     /// Keyed `GET /api/v1/collections` using a candidate API key during sign-in, before writing
     /// anything to `CredentialStore` or SQLite.

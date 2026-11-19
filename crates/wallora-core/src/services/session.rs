@@ -19,6 +19,13 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
+fn require_fresh_verification(mut account: AccountRecord) -> AccountRecord {
+    if account.verification.is_verified() {
+        account.verification = UsernameVerification::Inconclusive;
+    }
+    account
+}
+
 /// Evaluates username ownership by comparing the keyed `/collections` list against the unkeyed
 /// public `/collections/{username}` list.
 ///
@@ -72,6 +79,8 @@ pub enum SignInError {
     TemporaryFailure(String),
     #[error("failed to save API key to Windows Credential Manager")]
     CredentialStore,
+    #[error("Sign-in requires an available local SQLite database.")]
+    StorageUnavailable,
     #[error("failed to save account metadata to local storage")]
     Storage,
 }
@@ -82,7 +91,7 @@ pub struct SignInProbe {
     pub start_scope: SessionScope,
     pub username: String,
     pub api_key: SecretString,
-    pub user_settings: UserSettings,
+    pub user_settings: Option<UserSettings>,
     pub own_collections: Option<Vec<CollectionSummary>>,
     pub verification: UsernameVerification,
 }
@@ -112,6 +121,9 @@ pub async fn probe_sign_in<P: Provider>(
     let user_settings = match provider.user_settings_with_key(trimmed_key.clone()).await {
         Ok(settings) => settings,
         Err(ProviderError::Unauthorized) => return Err(SignInError::InvalidApiKey),
+        Err(ProviderError::InvalidCredential) => {
+            return Err(SignInError::InvalidInput("Enter a valid API key.".into()));
+        }
         Err(err) => return Err(SignInError::TemporaryFailure(err.user_message())),
     };
 
@@ -161,17 +173,23 @@ pub async fn fetch_account_refresh<P: Provider>(
     reverify_username: bool,
 ) -> AccountRefreshPayload {
     let user_settings = provider.user_settings(scope.clone()).await;
-    if matches!(user_settings, Err(ProviderError::Unauthorized)) {
+    if let Err(error) = &user_settings
+        && (*error == ProviderError::Unauthorized || error.is_local_credential_error())
+    {
         return AccountRefreshPayload {
             request_scope: scope,
+            own_collections: Err(error.clone()),
             user_settings,
-            own_collections: Err(ProviderError::Unauthorized),
             identity_outcome: None,
         };
     }
 
     let own_collections = provider.own_collections(scope.clone()).await;
-    if matches!(own_collections, Err(ProviderError::Unauthorized)) {
+    if matches!(own_collections, Err(ProviderError::Unauthorized))
+        || own_collections
+            .as_ref()
+            .is_err_and(ProviderError::is_local_credential_error)
+    {
         return AccountRefreshPayload {
             request_scope: scope,
             user_settings,
@@ -312,17 +330,13 @@ pub struct SessionManager {
     own_collections: Option<Vec<CollectionSummary>>,
     local_preferences: LocalPreferences,
     notice: Option<SessionNotice>,
-    /// Records accounts whose persisted Task 3 caches were purged (also serves as the seam where
-    /// Task 4's `CacheStore` purge actor will subscribe).
-    purged_accounts: Vec<AccountId>,
 }
 
 impl SessionManager {
     /// Restores saved local preferences and active session from SQLite + `CredentialStore`.
     ///
-    /// If SQLite names an active account whose credential is missing or unreadable in Credential
-    /// Manager, falls back cleanly to Guest, purges that account's persisted cache, and records a
-    /// non-secret warning notice.
+    /// Reconciles unfinished vault work before loading account metadata. Previously verified
+    /// identities require a fresh check after restart.
     pub fn restore(
         storage: Arc<dyn SessionStorage>,
         credentials: Arc<dyn CredentialStore>,
@@ -339,64 +353,72 @@ impl SessionManager {
             }
         };
 
-        let accounts = match storage.list_accounts() {
-            Ok(list) => list,
-            Err(_) => {
-                notice = Some(SessionNotice::warning(
-                    "Could not read saved accounts from local storage; starting in Guest mode.",
-                ));
-                Vec::new()
+        let mut accounts = match storage.pending_credential_cleanup() {
+            Ok(pending) => {
+                let mut cleanup_failed = false;
+                for id in pending {
+                    cleanup_failed |= !Self::clean_pending_account(&*storage, &*credentials, &id);
+                }
+                if cleanup_failed {
+                    notice = Some(Self::pending_cleanup_notice());
+                }
+                storage.list_accounts()
             }
-        };
+            Err(err) => Err(err),
+        }
+        .unwrap_or_else(|_| {
+            notice = Some(SessionNotice::warning(
+                "Could not read saved accounts from local storage; starting in Guest mode.",
+            ));
+            Vec::new()
+        });
 
         let mut scope = SessionScope::guest(1);
         let mut active_account = None;
         let mut user_settings = None;
         let mut own_collections = None;
-        let mut purged_accounts = Vec::new();
 
         if let Some(candidate) = accounts.iter().find(|a| a.is_active).cloned() {
             match credentials.load(&candidate.id) {
                 Ok(Some(secret)) if !secret.is_empty() => {
-                    // Drop and zeroize the loaded key immediately; we only verify availability.
                     drop(secret);
                     scope = SessionScope::account(candidate.id.clone(), 1);
                     if let Ok(Some(cached)) = storage.load_account_cache(&candidate.id) {
                         user_settings = cached.user_settings;
                         own_collections = cached.own_collections;
                     }
-                    active_account = Some(candidate);
+                    active_account = Some(require_fresh_verification(candidate));
                 }
                 Ok(_) => {
-                    let _ = storage.set_active_account(None, Some(&candidate.id));
-                    purged_accounts.push(candidate.id.clone());
+                    if let Err(err) = storage.set_active_account(None) {
+                        tracing::warn!(%err, "could not purge cache for missing credential");
+                    }
                     notice = Some(SessionNotice::warning(
-                        "Stored API key was missing from Windows Credential Manager. Signed out to Guest and cleared account caches; sign in again.",
+                        "Stored API key is missing from Windows Credential Manager. Sign in again.",
                     ));
                 }
                 Err(_) => {
-                    let _ = storage.purge_account_cache(&candidate.id);
-                    purged_accounts.push(candidate.id.clone());
                     notice = Some(SessionNotice::warning(
-                        "Windows Credential Manager could not be read. Continuing in Guest mode without cached account data.",
+                        "Windows Credential Manager could not be read. Try switching to the saved account again.",
                     ));
                 }
             }
         }
 
-        let refreshed_accounts = storage.list_accounts().unwrap_or(accounts);
-
+        accounts = accounts
+            .into_iter()
+            .map(require_fresh_verification)
+            .collect();
         Self {
             storage,
             credentials,
             scope,
-            accounts: refreshed_accounts,
+            accounts,
             active_account,
             user_settings,
             own_collections,
             local_preferences,
             notice,
-            purged_accounts,
         }
     }
 
@@ -432,8 +454,8 @@ impl SessionManager {
         self.notice = notice;
     }
 
-    pub fn purged_accounts(&self) -> &[AccountId] {
-        &self.purged_accounts
+    pub fn can_sign_in(&self) -> bool {
+        self.storage.is_durable()
     }
 
     /// Returns the effective browse defaults for the current session: upstream `UserSettings`
@@ -445,9 +467,8 @@ impl SessionManager {
         }
     }
 
-    /// Synchronous Phase 2 of sign-in: verifies scope/generation has not changed while the async
-    /// probe was in flight, saves the key to `CredentialStore`, stores metadata + initial cache in
-    /// SQLite (compensating with credential deletion on SQLite failure), and bumps generation.
+    /// Records a durable cleanup intent before saving the key, then commits activation and
+    /// clears that intent in the same SQLite transaction.
     pub fn commit_sign_in(
         &mut self,
         probe: SignInProbe,
@@ -461,6 +482,9 @@ impl SessionManager {
             return Ok(SignInCommitOutcome::DiscardedStale);
         }
 
+        if !self.can_sign_in() {
+            return Err(SignInError::StorageUnavailable);
+        }
         let account_id = AccountId::generate();
         let now = unix_now();
         let record = AccountRecord {
@@ -472,50 +496,57 @@ impl SessionManager {
             updated_at_unix: now,
         };
         let initial_cache = AccountCachedState {
-            user_settings: Some(probe.user_settings.clone()),
+            user_settings: probe.user_settings.clone(),
             own_collections: probe.own_collections.clone(),
             updated_at_unix: now,
         };
 
-        // Step 1: Save secret in OS Credential Manager before activating in SQLite.
+        self.storage
+            .queue_credential_cleanup(&account_id)
+            .map_err(|_| SignInError::Storage)?;
         if let Err(err) = self.credentials.save(&account_id, &probe.api_key) {
             tracing::error!(reason = %err, "failed to store credential during sign-in");
+            Self::clean_pending_account(&*self.storage, &*self.credentials, &account_id);
             return Err(SignInError::CredentialStore);
         }
 
-        // Step 2: Persist account record & initial cache in SQLite (purging any outgoing account
-        // cache). On failure, delete the just-saved credential so no orphan remains.
-        let outgoing_account = self.scope.account_id().cloned();
         if let Err(err) =
             self.storage
                 .save_and_activate_account(&record, Some(&initial_cache), true)
         {
-            tracing::error!(
-                account_id = %account_id,
-                reason = %err,
-                "SQLite save failed during sign-in; rolling back saved credential"
-            );
-            if let Err(cleanup_err) = self.credentials.delete(&account_id) {
-                tracing::warn!(
-                    account_id = %account_id,
-                    reason = %cleanup_err,
-                    "failed to roll back credential after SQLite sign-in error"
-                );
+            tracing::error!(reason = %err, "SQLite save failed during sign-in");
+            // Check the durable intent before compensating, including if SQLite reported an
+            // ambiguous commit error. A committed account no longer has an intent.
+            if self
+                .storage
+                .pending_credential_cleanup()
+                .is_ok_and(|ids| ids.contains(&account_id))
+            {
+                Self::clean_pending_account(&*self.storage, &*self.credentials, &account_id);
             }
             return Err(SignInError::Storage);
         }
 
-        if let Some(prev_id) = outgoing_account {
-            self.purged_accounts.push(prev_id);
-        }
-
-        self.scope = SessionScope::account(account_id, self.scope.generation.saturating_add(1));
+        self.scope =
+            SessionScope::account(account_id.clone(), self.scope.generation.saturating_add(1));
         self.active_account = Some(record);
-        self.user_settings = Some(probe.user_settings);
+        self.user_settings = probe.user_settings;
         self.own_collections = probe.own_collections;
         self.accounts = self
             .storage
             .list_accounts()
+            .map(|accounts| {
+                accounts
+                    .into_iter()
+                    .map(|account| {
+                        if account.id == account_id {
+                            account
+                        } else {
+                            require_fresh_verification(account)
+                        }
+                    })
+                    .collect()
+            })
             .unwrap_or_else(|_| self.active_account.clone().into_iter().collect());
         self.notice = Some(match probe.verification {
             UsernameVerification::Verified => {
@@ -531,6 +562,15 @@ impl SessionManager {
                 "Signed in with a valid API key. Username verification was inconclusive; retry later.",
             ),
         });
+
+        if self.user_settings.is_none()
+            && let Some(notice) = &mut self.notice
+        {
+            notice.level = NoticeLevel::Warning;
+            notice
+                .message
+                .push_str(" Wallhaven settings could not be read; using Guest browse defaults.");
+        }
 
         Ok(SignInCommitOutcome::Applied {
             scope: self.scope.clone(),
@@ -561,23 +601,34 @@ impl SessionManager {
         }
 
         let mut warning: Option<SessionNotice> = None;
-
-        match payload.user_settings {
-            Ok(settings) => {
-                self.user_settings = Some(settings);
+        for err in [
+            payload.user_settings.as_ref().err(),
+            payload.own_collections.as_ref().err(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if err.is_local_credential_error() {
+                let warning = SessionNotice::warning(err.user_message());
+                self.notice = Some(warning.clone());
+                return RefreshOutcome::Applied {
+                    warning: Some(warning),
+                };
             }
+        }
+
+        let user_settings = match payload.user_settings {
+            Ok(settings) => Some(settings),
             Err(err) => {
                 warning = Some(SessionNotice::warning(format!(
                     "Could not refresh upstream settings: {}",
                     err.user_message()
                 )));
+                self.user_settings.clone()
             }
-        }
-
-        match payload.own_collections {
-            Ok(collections) => {
-                self.own_collections = Some(collections);
-            }
+        };
+        let own_collections = match payload.own_collections {
+            Ok(collections) => Some(collections),
             Err(err) => {
                 if warning.is_none() {
                     warning = Some(SessionNotice::warning(format!(
@@ -585,53 +636,56 @@ impl SessionManager {
                         err.user_message()
                     )));
                 }
+                self.own_collections.clone()
             }
-        }
+        };
 
-        let now = unix_now();
-        if let Some(outcome) = payload.identity_outcome {
-            let new_verification = match outcome.into_accepted() {
-                Some(v) => v,
-                None => {
-                    warning = Some(SessionNotice::warning(
-                        "Username verification detected a mismatch with public collections; username remains unverified.",
-                    ));
-                    UsernameVerification::Inconclusive
-                }
-            };
-            if let Some(active) = &mut self.active_account {
-                active.verification = new_verification;
-                active.updated_at_unix = now;
-            }
-            if self
-                .storage
-                .update_verification(&account_id, new_verification, now)
-                .is_err()
-                && warning.is_none()
-            {
+        let verification = payload.identity_outcome.map(|outcome| {
+            outcome.into_accepted().unwrap_or_else(|| {
                 warning = Some(SessionNotice::warning(
-                    "Refreshed account in memory, but could not persist verification status.",
+                    "Username verification detected a mismatch with public collections; username remains unverified.",
                 ));
-            }
-            if let Ok(list) = self.storage.list_accounts() {
-                self.accounts = list;
-            }
-        }
-
+                UsernameVerification::Inconclusive
+            })
+        });
+        let now = unix_now();
         let cache = AccountCachedState {
-            user_settings: self.user_settings.clone(),
-            own_collections: self.own_collections.clone(),
+            user_settings,
+            own_collections,
             updated_at_unix: now,
         };
-        if self
+        let persisted = self
             .storage
-            .save_account_cache(&account_id, &cache)
-            .is_err()
-            && warning.is_none()
-        {
-            warning = Some(SessionNotice::warning(
-                "Refreshed account in memory, but could not update local cache.",
-            ));
+            .save_refresh(&account_id, verification, &cache)
+            .is_ok();
+
+        if persisted {
+            self.user_settings = cache.user_settings;
+            self.own_collections = cache.own_collections;
+        } else {
+            let detail = "Could not save the refresh to local storage.";
+            match &mut warning {
+                Some(warning) => {
+                    warning.message.push(' ');
+                    warning.message.push_str(detail);
+                }
+                None => warning = Some(SessionNotice::warning(detail)),
+            }
+        }
+        if let Some(verification) = verification {
+            let effective = if persisted || !verification.is_verified() {
+                verification
+            } else {
+                UsernameVerification::Inconclusive
+            };
+            if let Some(active) = &mut self.active_account {
+                active.verification = effective;
+                active.updated_at_unix = now;
+            }
+            if let Some(account) = self.accounts.iter_mut().find(|a| a.id == account_id) {
+                account.verification = effective;
+                account.updated_at_unix = now;
+            }
         }
 
         if let Some(w) = &warning {
@@ -673,46 +727,70 @@ impl SessionManager {
         ScopedResponse::Ready(result)
     }
 
-    fn revoke_active_account(&mut self, account_id: &AccountId) -> SessionNotice {
-        let outgoing = account_id.clone();
+    fn pending_cleanup_notice() -> SessionNotice {
+        SessionNotice::warning(
+            "Account cleanup is pending. Wallora will retry removing local data and the Windows Credential Manager entry at startup.",
+        )
+    }
+
+    fn clean_pending_account(
+        storage: &dyn SessionStorage,
+        credentials: &dyn CredentialStore,
+        account_id: &AccountId,
+    ) -> bool {
+        // Attempt both operations. The journal hides the account even if SQLite cannot yet
+        // purge its cache, or both operations fail.
+        let purge_result = storage.purge_pending_account(account_id);
+        match credentials.delete(account_id) {
+            Ok(()) => storage.finish_credential_cleanup(account_id).is_ok(),
+            Err(err) => {
+                tracing::warn!(%err, cache_purged = purge_result.is_ok(), "account cleanup remains pending");
+                false
+            }
+        }
+    }
+
+    fn clear_account_views(&mut self) {
         self.scope = SessionScope::guest(self.scope.generation.saturating_add(1));
         self.active_account = None;
         self.user_settings = None;
         self.own_collections = None;
-        self.purged_accounts.push(outgoing.clone());
+    }
 
-        let db_err = self.storage.remove_account(&outgoing).err();
-        let cred_err = self.credentials.delete(&outgoing).err();
+    fn retire_account(&mut self, account_id: &AccountId) -> Result<bool, StorageError> {
+        self.storage.queue_credential_cleanup(account_id)?;
+        self.clear_account_views();
+        self.accounts.retain(|a| &a.id != account_id);
+        Ok(Self::clean_pending_account(
+            &*self.storage,
+            &*self.credentials,
+            account_id,
+        ))
+    }
 
-        if let Ok(list) = self.storage.list_accounts() {
-            self.accounts = list;
-        } else {
-            self.accounts.retain(|a| a.id != outgoing);
-        }
-
-        let mut message = "Your API key was rejected by Wallhaven (401). You have been signed out and account caches were cleared. Sign in again with a valid API key.".to_string();
-        if db_err.is_some() || cred_err.is_some() {
-            message.push_str(
-                " Note: part of the local credential/storage cleanup encountered an error.",
-            );
-        }
-
-        tracing::warn!(
-            account_id = %outgoing,
-            new_generation = self.scope.generation,
-            db_cleanup_ok = db_err.is_none(),
-            credential_cleanup_ok = cred_err.is_none(),
-            "revoked active session after 401"
-        );
-
+    fn revoke_active_account(&mut self, account_id: &AccountId) -> SessionNotice {
+        let message = match self.retire_account(account_id) {
+            Ok(true) => "Your API key was rejected by Wallhaven (401). Signed out and cleared local account data. Sign in again with a valid API key.".into(),
+            Ok(false) => format!("Your API key was rejected by Wallhaven (401). Signed out. {}", Self::pending_cleanup_notice().message),
+            Err(_) => {
+                // There is no durable intent yet. Invalidate outstanding results and restrict
+                // the current view while retaining the account ID so sign-out can be retried.
+                self.scope.generation = self.scope.generation.saturating_add(1);
+                self.user_settings = None;
+                self.own_collections = None;
+                if let Some(active) = &mut self.active_account {
+                    active.verification = UsernameVerification::Inconclusive;
+                }
+                "Your API key was rejected by Wallhaven (401). Local storage could not record sign-out. Try signing out again.".into()
+            }
+        };
         let notice = SessionNotice::error(message);
         self.notice = Some(notice.clone());
         notice
     }
 
-    /// Logs out the active account: bumps generation, clears all in-memory account views, purges
-    /// persisted Task 3 account cache, removes the account row, and deletes its key from
-    /// `CredentialStore`. Preserves local proxy preferences, downloads, and applied wallpapers.
+    /// Signs out after the cleanup intent is durable. A failed vault delete leaves a tombstone
+    /// for startup recovery.
     pub fn logout(&mut self) -> LogoutOutcome {
         let Some(account_id) = self.scope.account_id().cloned() else {
             return LogoutOutcome {
@@ -722,41 +800,22 @@ impl SessionManager {
             };
         };
 
-        self.scope = SessionScope::guest(self.scope.generation.saturating_add(1));
-        self.active_account = None;
-        self.user_settings = None;
-        self.own_collections = None;
-        self.purged_accounts.push(account_id.clone());
-
-        let db_err = self.storage.remove_account(&account_id).err();
-        let cred_err = self.credentials.delete(&account_id).err();
-
-        if let Ok(list) = self.storage.list_accounts() {
-            self.accounts = list;
-        } else {
-            self.accounts.retain(|a| a.id != account_id);
-        }
-
-        let warning = match (db_err, cred_err) {
-            (None, None) => None,
-            (Some(_), None) => Some(SessionNotice::warning(
-                "Signed out to Guest and removed the API key, but local storage cleanup failed.",
-            )),
-            (None, Some(_)) => Some(SessionNotice::warning(
-                "Signed out to Guest and cleared account caches, but removing the entry from Windows Credential Manager failed.",
-            )),
-            (Some(_), Some(_)) => Some(SessionNotice::warning(
-                "Signed out to Guest, but local storage and Windows Credential Manager cleanup failed.",
-            )),
+        let (logged_out_account, warning) = match self.retire_account(&account_id) {
+            Ok(true) => (Some(account_id), None),
+            Ok(false) => (Some(account_id), Some(Self::pending_cleanup_notice())),
+            Err(_) => (
+                None,
+                Some(SessionNotice::error(
+                    "Could not record sign-out in local storage. Try signing out again.",
+                )),
+            ),
         };
-
         self.notice = Some(warning.clone().unwrap_or_else(|| {
             SessionNotice::info("Signed out to Guest and cleared account caches.")
         }));
-
         LogoutOutcome {
             scope: self.scope.clone(),
-            logged_out_account: Some(account_id),
+            logged_out_account,
             warning,
         }
     }
@@ -787,12 +846,8 @@ impl SessionManager {
 
         let previous_account = self.scope.account_id().cloned();
         self.storage
-            .set_active_account(Some(target_id), previous_account.as_ref())
+            .set_active_account(Some(target_id))
             .map_err(|_| SwitchError::Storage)?;
-
-        if let Some(prev) = &previous_account {
-            self.purged_accounts.push(prev.clone());
-        }
 
         self.scope =
             SessionScope::account(target_id.clone(), self.scope.generation.saturating_add(1));
@@ -806,9 +861,9 @@ impl SessionManager {
 
         let mut updated_target = target;
         updated_target.is_active = true;
-        self.active_account = Some(updated_target);
+        self.active_account = Some(require_fresh_verification(updated_target));
         if let Ok(list) = self.storage.list_accounts() {
-            self.accounts = list;
+            self.accounts = list.into_iter().map(require_fresh_verification).collect();
         }
 
         self.notice = Some(SessionNotice::info(format!(
@@ -833,39 +888,34 @@ impl SessionManager {
             return Ok(self.scope.clone());
         }
 
-        self.storage.set_active_account(None, previous.as_ref())?;
-        if let Some(prev) = previous {
-            self.purged_accounts.push(prev);
-        }
-
-        self.scope = SessionScope::guest(self.scope.generation.saturating_add(1));
-        self.active_account = None;
-        self.user_settings = None;
-        self.own_collections = None;
+        self.storage.set_active_account(None)?;
+        self.clear_account_views();
         if let Ok(list) = self.storage.list_accounts() {
-            self.accounts = list;
+            self.accounts = list.into_iter().map(require_fresh_verification).collect();
         }
         self.notice = Some(SessionNotice::info("Switched to Guest mode."));
         Ok(self.scope.clone())
     }
 
     /// Updates the local proxy preference on the single shared [`WallhavenClient`] and persists it
-    /// separately from upstream account settings. Rolls back transport changes if persistence fails.
+    /// separately from upstream account settings before publishing the transport.
     pub fn update_proxy(
         &mut self,
         client: &WallhavenClient,
         proxy: ProxyConfig,
     ) -> Result<ProxyConfig, ProxyUpdateError> {
-        let previous = self.local_preferences.proxy.clone();
-        let applied = client.set_proxy(proxy)?;
+        let candidate = client.prepare_proxy(&proxy)?;
+        let applied = candidate.proxy().clone();
         let updated_prefs = LocalPreferences {
             proxy: applied.clone(),
         };
-        if let Err(err) = self.storage.save_local_preferences(&updated_prefs) {
-            tracing::error!(reason = %err, "failed to persist proxy preference; rolling back transport");
-            let _ = client.set_proxy(previous);
-            return Err(ProxyUpdateError::Storage);
-        }
+        self.storage
+            .save_local_preferences(&updated_prefs)
+            .map_err(|err| {
+                tracing::error!(reason = %err, "failed to persist proxy preference");
+                ProxyUpdateError::Storage
+            })?;
+        client.publish_proxy(candidate);
         self.local_preferences = updated_prefs;
         self.notice = Some(SessionNotice::info("Updated local proxy preference."));
         Ok(applied)

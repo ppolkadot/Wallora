@@ -8,6 +8,12 @@ use thiserror::Error;
 pub enum ProviderError {
     #[error("authentication required or API key rejected")]
     Unauthorized,
+    #[error("local credential storage could not be read")]
+    CredentialStoreUnavailable,
+    #[error("stored API key is missing")]
+    MissingCredential,
+    #[error("API key cannot be used as a request header")]
+    InvalidCredential,
     #[error("access forbidden by upstream")]
     Forbidden,
     #[error("requested resource was not found")]
@@ -31,10 +37,28 @@ pub enum ProviderError {
 }
 
 impl ProviderError {
+    pub fn is_local_credential_error(&self) -> bool {
+        matches!(
+            self,
+            Self::CredentialStoreUnavailable | Self::MissingCredential | Self::InvalidCredential
+        )
+    }
+
     pub fn user_message(&self) -> String {
         match self {
             Self::Unauthorized => {
                 "Sign in with a valid API key to access this resource.".to_string()
+            }
+            Self::CredentialStoreUnavailable => {
+                "Could not read Windows Credential Manager. Try again.".to_string()
+            }
+            Self::MissingCredential => {
+                "The saved API key is missing from Windows Credential Manager. Sign in again."
+                    .to_string()
+            }
+            Self::InvalidCredential => {
+                "The API key is empty or contains invalid data. Enter a valid key and try again."
+                    .to_string()
             }
             Self::Forbidden => "Wallhaven denied access to this resource.".to_string(),
             Self::NotFound => "The requested wallpaper or search target was not found.".to_string(),

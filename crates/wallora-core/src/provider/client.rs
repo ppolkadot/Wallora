@@ -155,10 +155,22 @@ impl WallhavenClientConfig {
     }
 }
 
-struct HttpTransport {
+pub(crate) struct HttpTransport {
     api_client: reqwest::Client,
     image_client: reqwest::Client,
     proxy: ProxyConfig,
+}
+
+impl HttpTransport {
+    pub(crate) fn proxy(&self) -> &ProxyConfig {
+        &self.proxy
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ApiResponse {
+    Json,
+    Settings,
 }
 
 fn build_http_transport(
@@ -274,20 +286,18 @@ impl WallhavenClient {
         })
     }
 
-    /// Updates the proxy configuration on this single client instance in place without creating
-    /// a second `ApiPacer`, keeping rolling rate-limit budgets, spacing, cooldowns, and image
-    /// concurrency caps intact.
-    pub fn set_proxy(&self, proxy: ProxyConfig) -> Result<ProxyConfig, ProxyError> {
-        let new_transport = build_http_transport(&self.inner.config, &proxy)?;
-        let applied = new_transport.proxy.clone();
+    pub(crate) fn prepare_proxy(&self, proxy: &ProxyConfig) -> Result<HttpTransport, ProxyError> {
+        build_http_transport(&self.inner.config, proxy)
+    }
+
+    /// Publishes the committed transport while preserving the shared pacer and image limits.
+    pub(crate) fn publish_proxy(&self, transport: HttpTransport) {
         let mut guard = self
             .inner
             .transport
             .write()
-            .map_err(|_| ProxyError::TransportBuildFailed)?;
-        *guard = new_transport;
-        tracing::info!(mode = applied.mode_str(), "updated HTTP proxy transport");
-        Ok(applied)
+            .unwrap_or_else(|err| err.into_inner());
+        *guard = transport;
     }
 
     /// Returns the currently active proxy configuration on this client.
@@ -441,6 +451,7 @@ impl WallhavenClientInner {
         url: Url,
         auth: RequestAuth,
         priority: RequestPriority,
+        response: ApiResponse,
     ) -> Result<Vec<u8>, ProviderError> {
         if !inner.config.origin_policy.is_authorized_api_url(&url) {
             tracing::warn!("blocked API request failing origin policy");
@@ -504,8 +515,18 @@ impl WallhavenClientInner {
 
                     let status = resp.status();
                     if status.is_success() {
+                        if response == ApiResponse::Settings && status != StatusCode::OK {
+                            return Ok(AttemptOutcome::Terminal(ProviderError::Upstream {
+                                status: status.as_u16(),
+                            }));
+                        }
                         return match resp.bytes().await {
                             Ok(bytes) => Ok(AttemptOutcome::Success(bytes.to_vec())),
+                            // The status already established key validity. A failed body read
+                            // leaves Settings defaults unavailable.
+                            Err(_) if response == ApiResponse::Settings => {
+                                Ok(AttemptOutcome::Success(Vec::new()))
+                            }
                             Err(err) => {
                                 let mapped = if err.is_timeout() {
                                     ProviderError::Timeout
@@ -589,6 +610,7 @@ impl Provider for WallhavenClient {
                 url,
                 RequestAuth::Scope(scope),
                 q.priority,
+                ApiResponse::Json,
             )
             .await?;
             decode_search_response(&bytes)
@@ -611,6 +633,7 @@ impl Provider for WallhavenClient {
                 url,
                 RequestAuth::Scope(scope),
                 RequestPriority::Interactive,
+                ApiResponse::Json,
             )
             .await?;
             decode_wallpaper_response(&bytes)
@@ -629,6 +652,7 @@ impl Provider for WallhavenClient {
                 url,
                 RequestAuth::Scope(scope),
                 RequestPriority::Interactive,
+                ApiResponse::Settings,
             )
             .await?;
             decode_user_settings_response(&bytes)
@@ -647,6 +671,7 @@ impl Provider for WallhavenClient {
                 url,
                 RequestAuth::Scope(scope),
                 RequestPriority::Interactive,
+                ApiResponse::Json,
             )
             .await?;
             decode_collections_response(&bytes)
@@ -668,6 +693,7 @@ impl Provider for WallhavenClient {
                 url,
                 RequestAuth::Scope(SessionScope::guest(generation)),
                 RequestPriority::Interactive,
+                ApiResponse::Json,
             )
             .await?;
             decode_collections_response(&bytes)
@@ -677,7 +703,7 @@ impl Provider for WallhavenClient {
     fn user_settings_with_key(
         &self,
         api_key: SecretString,
-    ) -> impl Future<Output = Result<UserSettings, ProviderError>> + Send + 'static {
+    ) -> impl Future<Output = Result<Option<UserSettings>, ProviderError>> + Send + 'static {
         let inner = Arc::clone(&self.inner);
         async move {
             let url = inner.build_api_url(&["settings"])?;
@@ -690,9 +716,10 @@ impl Provider for WallhavenClient {
                     probe_id,
                 },
                 RequestPriority::Interactive,
+                ApiResponse::Settings,
             )
             .await?;
-            decode_user_settings_response(&bytes)
+            Ok(decode_user_settings_response(&bytes).ok())
         }
     }
 
@@ -712,6 +739,7 @@ impl Provider for WallhavenClient {
                     probe_id,
                 },
                 RequestPriority::Interactive,
+                ApiResponse::Json,
             )
             .await?;
             decode_collections_response(&bytes)

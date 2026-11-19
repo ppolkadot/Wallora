@@ -1,3 +1,4 @@
+use std::fs::{File, OpenOptions};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -13,8 +14,8 @@ use crate::storage::migrations;
 
 /// Non-secret persisted account cache introduced in Task 3.
 ///
-/// Purged immediately on logout, account switch, key revocation, or missing-credential startup
-/// recovery. Never stores API keys.
+/// Purged on account transitions. Pending cleanup hides this data until SQLite can delete it.
+/// Never stores API keys.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountCachedState {
     pub user_settings: Option<UserSettings>,
@@ -26,6 +27,10 @@ pub struct AccountCachedState {
 pub enum StorageError {
     #[error("failed to open SQLite database: {0}")]
     Open(String),
+    #[error("another Wallora instance owns this database")]
+    SessionOwned,
+    #[error("durable SQLite storage is required")]
+    NotDurable,
     #[error("failed to migrate SQLite database: {0}")]
     Migrate(String),
     #[error("SQLite operation failed: {0}")]
@@ -51,36 +56,33 @@ pub trait SessionStorage: Send + Sync + 'static {
         purge_outgoing_cache: bool,
     ) -> Result<(), StorageError>;
 
-    /// Atomically switches active account (or to Guest when `account_id` is `None`) and purges
-    /// `purge_account_id`'s cached rows when provided.
-    fn set_active_account(
-        &self,
-        account_id: Option<&AccountId>,
-        purge_account_id: Option<&AccountId>,
-    ) -> Result<(), StorageError>;
+    /// Atomically switches active account (or to Guest) and purges the outgoing cache.
+    fn set_active_account(&self, account_id: Option<&AccountId>) -> Result<(), StorageError>;
 
-    fn update_verification(
-        &self,
-        account_id: &AccountId,
-        verification: UsernameVerification,
-        updated_at_unix: i64,
-    ) -> Result<(), StorageError>;
+    fn is_durable(&self) -> bool;
 
-    /// Purges the account's cache and deletes the account row.
-    fn remove_account(&self, account_id: &AccountId) -> Result<(), StorageError>;
+    /// Records an intent before any vault write or delete. Existing accounts with this ID
+    /// are tombstoned immediately, even if subsequent cache or vault cleanup fails.
+    fn queue_credential_cleanup(&self, account_id: &AccountId) -> Result<(), StorageError>;
+
+    fn pending_credential_cleanup(&self) -> Result<Vec<AccountId>, StorageError>;
+
+    fn purge_pending_account(&self, account_id: &AccountId) -> Result<(), StorageError>;
+
+    /// Called only after idempotent vault deletion succeeds.
+    fn finish_credential_cleanup(&self, account_id: &AccountId) -> Result<(), StorageError>;
 
     fn load_account_cache(
         &self,
         account_id: &AccountId,
     ) -> Result<Option<AccountCachedState>, StorageError>;
 
-    fn save_account_cache(
+    fn save_refresh(
         &self,
         account_id: &AccountId,
+        verification: Option<UsernameVerification>,
         cache: &AccountCachedState,
     ) -> Result<(), StorageError>;
-
-    fn purge_account_cache(&self, account_id: &AccountId) -> Result<(), StorageError>;
 
     fn load_local_preferences(&self) -> Result<LocalPreferences, StorageError>;
 
@@ -90,6 +92,8 @@ pub trait SessionStorage: Send + Sync + 'static {
 /// SQLite-backed implementation of [`SessionStorage`].
 pub struct SqliteStore {
     conn: Mutex<Connection>,
+    // Held until after SQLite closes. Never unlink the lock file.
+    owner: Option<File>,
 }
 
 impl SqliteStore {
@@ -99,11 +103,26 @@ impl SqliteStore {
         {
             std::fs::create_dir_all(parent).map_err(|err| StorageError::Open(err.to_string()))?;
         }
+        // The app uses one fixed database path. The OS releases the lock on process exit,
+        // including crashes, so restart can reconcile outstanding vault work.
+        let owner = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path.with_extension("session.lock"))
+            .map_err(|err| StorageError::Open(err.to_string()))?;
+        match owner.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Err(StorageError::SessionOwned),
+            Err(err) => return Err(StorageError::Open(err.to_string())),
+        }
         let mut conn = Connection::open(path).map_err(|err| StorageError::Open(err.to_string()))?;
         configure_connection(&mut conn, true)?;
         migrations::migrate(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            owner: Some(owner),
         })
     }
 
@@ -114,6 +133,7 @@ impl SqliteStore {
         migrations::migrate(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            owner: None,
         })
     }
 
@@ -128,9 +148,14 @@ fn configure_connection(conn: &mut Connection, enable_wal: bool) -> Result<(), S
     conn.pragma_update(None, "busy_timeout", 5_000i64)
         .map_err(|err| StorageError::Open(err.to_string()))?;
     if enable_wal {
-        let _: String = conn
+        conn.pragma_update(None, "synchronous", "FULL")
+            .map_err(|err| StorageError::Open(err.to_string()))?;
+        let journal_mode: String = conn
             .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))
             .map_err(|err| StorageError::Open(err.to_string()))?;
+        if journal_mode != "wal" {
+            return Err(StorageError::NotDurable);
+        }
     }
     Ok(())
 }
@@ -169,6 +194,7 @@ impl SessionStorage for SqliteStore {
             .prepare(
                 "SELECT account_id, username, verification_state, is_active, created_at_unix, updated_at_unix
                  FROM accounts
+                 WHERE account_id NOT IN (SELECT account_id FROM pending_credential_cleanup)
                  ORDER BY is_active DESC, updated_at_unix DESC, account_id ASC",
             )
             .map_err(|err| StorageError::Query(err.to_string()))?;
@@ -188,6 +214,7 @@ impl SessionStorage for SqliteStore {
             "SELECT account_id, username, verification_state, is_active, created_at_unix, updated_at_unix
              FROM accounts
              WHERE is_active = 1
+               AND account_id NOT IN (SELECT account_id FROM pending_credential_cleanup)
              ORDER BY updated_at_unix DESC
              LIMIT 1",
             [],
@@ -238,57 +265,33 @@ impl SessionStorage for SqliteStore {
         .map_err(|err| StorageError::Query(err.to_string()))?;
 
         if let Some(cache) = initial_cache {
-            let settings_json = cache
-                .user_settings
-                .as_ref()
-                .map(serde_json::to_string)
-                .transpose()
-                .map_err(|err| StorageError::Serialization(err.to_string()))?;
-            let collections_json = cache
-                .own_collections
-                .as_ref()
-                .map(serde_json::to_string)
-                .transpose()
-                .map_err(|err| StorageError::Serialization(err.to_string()))?;
-            tx.execute(
-                "INSERT INTO account_cache (account_id, user_settings_json, own_collections_json, updated_at_unix)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(account_id) DO UPDATE SET
-                     user_settings_json = excluded.user_settings_json,
-                     own_collections_json = excluded.own_collections_json,
-                     updated_at_unix = excluded.updated_at_unix",
-                params![
-                    account.id.as_str(),
-                    settings_json,
-                    collections_json,
-                    cache.updated_at_unix,
-                ],
-            )
-            .map_err(|err| StorageError::Query(err.to_string()))?;
+            write_account_cache(&tx, &account.id, cache)?;
         }
+        tx.execute(
+            "DELETE FROM pending_credential_cleanup WHERE account_id = ?1",
+            [account.id.as_str()],
+        )
+        .map_err(|err| StorageError::Query(err.to_string()))?;
 
         tx.commit()
             .map_err(|err| StorageError::Query(err.to_string()))?;
         Ok(())
     }
 
-    fn set_active_account(
-        &self,
-        account_id: Option<&AccountId>,
-        purge_account_id: Option<&AccountId>,
-    ) -> Result<(), StorageError> {
+    fn set_active_account(&self, account_id: Option<&AccountId>) -> Result<(), StorageError> {
         let mut conn = self.lock_conn()?;
         let tx = conn
             .transaction()
             .map_err(|err| StorageError::Query(err.to_string()))?;
 
-        if let Some(purge_id) = purge_account_id {
-            tx.execute(
-                "DELETE FROM account_cache WHERE account_id = ?1",
-                params![purge_id.as_str()],
-            )
-            .map_err(|err| StorageError::Query(err.to_string()))?;
-        }
+        tx.execute(
+            "DELETE FROM account_cache WHERE account_id IN (
+                SELECT account_id FROM accounts WHERE is_active = 1
+                AND (?1 IS NULL OR account_id != ?1)
+            )",
+            [account_id.map(AccountId::as_str)],
+        )
+        .map_err(|err| StorageError::Query(err.to_string()))?;
 
         tx.execute("UPDATE accounts SET is_active = 0 WHERE is_active = 1", [])
             .map_err(|err| StorageError::Query(err.to_string()))?;
@@ -296,7 +299,8 @@ impl SessionStorage for SqliteStore {
         if let Some(target) = account_id {
             let updated = tx
                 .execute(
-                    "UPDATE accounts SET is_active = 1 WHERE account_id = ?1",
+                    "UPDATE accounts SET is_active = 1 WHERE account_id = ?1
+                     AND account_id NOT IN (SELECT account_id FROM pending_credential_cleanup)",
                     params![target.as_str()],
                 )
                 .map_err(|err| StorageError::Query(err.to_string()))?;
@@ -310,39 +314,72 @@ impl SessionStorage for SqliteStore {
         Ok(())
     }
 
-    fn update_verification(
-        &self,
-        account_id: &AccountId,
-        verification: UsernameVerification,
-        updated_at_unix: i64,
-    ) -> Result<(), StorageError> {
+    fn is_durable(&self) -> bool {
+        self.owner.is_some()
+    }
+
+    fn queue_credential_cleanup(&self, account_id: &AccountId) -> Result<(), StorageError> {
+        if !self.is_durable() {
+            return Err(StorageError::NotDurable);
+        }
         let conn = self.lock_conn()?;
         conn.execute(
-            "UPDATE accounts SET verification_state = ?1, updated_at_unix = ?2 WHERE account_id = ?3",
-            params![verification.as_db_str(), updated_at_unix, account_id.as_str()],
+            "INSERT OR IGNORE INTO pending_credential_cleanup (account_id) VALUES (?1)",
+            [account_id.as_str()],
         )
         .map_err(|err| StorageError::Query(err.to_string()))?;
         Ok(())
     }
 
-    fn remove_account(&self, account_id: &AccountId) -> Result<(), StorageError> {
+    fn pending_credential_cleanup(&self) -> Result<Vec<AccountId>, StorageError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare("SELECT account_id FROM pending_credential_cleanup ORDER BY account_id")
+            .map_err(|err| StorageError::Query(err.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0).map(AccountId::new))
+            .map_err(|err| StorageError::Query(err.to_string()))?;
+        rows.collect::<Result<_, _>>()
+            .map_err(|err| StorageError::Query(err.to_string()))
+    }
+
+    fn purge_pending_account(&self, account_id: &AccountId) -> Result<(), StorageError> {
         let mut conn = self.lock_conn()?;
         let tx = conn
             .transaction()
             .map_err(|err| StorageError::Query(err.to_string()))?;
         tx.execute(
-            "DELETE FROM account_cache WHERE account_id = ?1",
-            params![account_id.as_str()],
+            "UPDATE accounts SET is_active = 0 WHERE account_id = ?1",
+            [account_id.as_str()],
         )
         .map_err(|err| StorageError::Query(err.to_string()))?;
         tx.execute(
-            "DELETE FROM accounts WHERE account_id = ?1",
-            params![account_id.as_str()],
+            "DELETE FROM account_cache WHERE account_id = ?1",
+            [account_id.as_str()],
         )
         .map_err(|err| StorageError::Query(err.to_string()))?;
         tx.commit()
+            .map_err(|err| StorageError::Query(err.to_string()))
+    }
+
+    fn finish_credential_cleanup(&self, account_id: &AccountId) -> Result<(), StorageError> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn
+            .transaction()
             .map_err(|err| StorageError::Query(err.to_string()))?;
-        Ok(())
+        tx.execute(
+            "DELETE FROM accounts WHERE account_id = ?1
+               AND account_id IN (SELECT account_id FROM pending_credential_cleanup)",
+            [account_id.as_str()],
+        )
+        .map_err(|err| StorageError::Query(err.to_string()))?;
+        tx.execute(
+            "DELETE FROM pending_credential_cleanup WHERE account_id = ?1",
+            [account_id.as_str()],
+        )
+        .map_err(|err| StorageError::Query(err.to_string()))?;
+        tx.commit()
+            .map_err(|err| StorageError::Query(err.to_string()))
     }
 
     fn load_account_cache(
@@ -354,7 +391,8 @@ impl SessionStorage for SqliteStore {
             .query_row(
                 "SELECT user_settings_json, own_collections_json, updated_at_unix
                  FROM account_cache
-                 WHERE account_id = ?1",
+                 WHERE account_id = ?1
+                   AND account_id NOT IN (SELECT account_id FROM pending_credential_cleanup)",
                 params![account_id.as_str()],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
@@ -383,51 +421,37 @@ impl SessionStorage for SqliteStore {
         }))
     }
 
-    fn save_account_cache(
+    fn save_refresh(
         &self,
         account_id: &AccountId,
+        verification: Option<UsernameVerification>,
         cache: &AccountCachedState,
     ) -> Result<(), StorageError> {
-        let conn = self.lock_conn()?;
-        let settings_json = cache
-            .user_settings
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(|err| StorageError::Serialization(err.to_string()))?;
-        let collections_json = cache
-            .own_collections
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(|err| StorageError::Serialization(err.to_string()))?;
-
-        conn.execute(
-            "INSERT INTO account_cache (account_id, user_settings_json, own_collections_json, updated_at_unix)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(account_id) DO UPDATE SET
-                 user_settings_json = excluded.user_settings_json,
-                 own_collections_json = excluded.own_collections_json,
-                 updated_at_unix = excluded.updated_at_unix",
-            params![
-                account_id.as_str(),
-                settings_json,
-                collections_json,
-                cache.updated_at_unix,
-            ],
-        )
-        .map_err(|err| StorageError::Query(err.to_string()))?;
-        Ok(())
-    }
-
-    fn purge_account_cache(&self, account_id: &AccountId) -> Result<(), StorageError> {
-        let conn = self.lock_conn()?;
-        conn.execute(
-            "DELETE FROM account_cache WHERE account_id = ?1",
-            params![account_id.as_str()],
-        )
-        .map_err(|err| StorageError::Query(err.to_string()))?;
-        Ok(())
+        let mut conn = self.lock_conn()?;
+        let tx = conn
+            .transaction()
+            .map_err(|err| StorageError::Query(err.to_string()))?;
+        let updated = tx
+            .execute(
+                "UPDATE accounts SET verification_state = COALESCE(?1, verification_state),
+                                 updated_at_unix = ?2
+             WHERE account_id = ?3 AND is_active = 1
+               AND account_id NOT IN (SELECT account_id FROM pending_credential_cleanup)",
+                params![
+                    verification.map(UsernameVerification::as_db_str),
+                    cache.updated_at_unix,
+                    account_id.as_str()
+                ],
+            )
+            .map_err(|err| StorageError::Query(err.to_string()))?;
+        if updated == 0 {
+            return Err(StorageError::Query(
+                "refresh account is no longer active".into(),
+            ));
+        }
+        write_account_cache(&tx, account_id, cache)?;
+        tx.commit()
+            .map_err(|err| StorageError::Query(err.to_string()))
     }
 
     fn load_local_preferences(&self) -> Result<LocalPreferences, StorageError> {
@@ -481,6 +505,42 @@ impl SessionStorage for SqliteStore {
         .map_err(|err| StorageError::Query(err.to_string()))?;
         Ok(())
     }
+}
+
+fn write_account_cache(
+    conn: &Connection,
+    account_id: &AccountId,
+    cache: &AccountCachedState,
+) -> Result<(), StorageError> {
+    let settings_json = cache
+        .user_settings
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|err| StorageError::Serialization(err.to_string()))?;
+    let collections_json = cache
+        .own_collections
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|err| StorageError::Serialization(err.to_string()))?;
+
+    conn.execute(
+        "INSERT INTO account_cache (account_id, user_settings_json, own_collections_json, updated_at_unix)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(account_id) DO UPDATE SET
+             user_settings_json = excluded.user_settings_json,
+             own_collections_json = excluded.own_collections_json,
+             updated_at_unix = excluded.updated_at_unix",
+        params![
+            account_id.as_str(),
+            settings_json,
+            collections_json,
+            cache.updated_at_unix,
+        ],
+    )
+    .map_err(|err| StorageError::Query(err.to_string()))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -548,7 +608,17 @@ mod tests {
         assert_eq!(store.load_local_preferences().unwrap(), prefs);
 
         // Removing acct2 removes row and preserves local preferences.
-        store.remove_account(&acct2.id).expect("remove acct2");
+        store
+            .lock_conn()
+            .unwrap()
+            .execute(
+                "INSERT INTO pending_credential_cleanup VALUES (?1)",
+                [acct2.id.as_str()],
+            )
+            .unwrap();
+        store
+            .finish_credential_cleanup(&acct2.id)
+            .expect("remove acct2");
         assert!(store.active_account().unwrap().is_none());
         assert_eq!(store.load_local_preferences().unwrap(), prefs);
     }

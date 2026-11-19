@@ -1,7 +1,7 @@
 use iced::widget::{button, column, container, row, scrollable, text, text_input};
 use iced::{Alignment, Background, Border, Element, Length};
 use wallora_core::domain::SecretString;
-use wallora_core::services::{NoticeLevel, SessionManager};
+use wallora_core::services::SessionManager;
 
 use crate::message::Message;
 use crate::theme::{palette, surface_color};
@@ -23,28 +23,6 @@ pub fn view<'a>(state: AccountViewState<'a>) -> Element<'a, Message> {
     ]
     .spacing(14)
     .width(Length::Fill);
-
-    if let Some(notice) = state.session.notice() {
-        let color = match notice.level {
-            NoticeLevel::Info => palette::SUCCESS,
-            NoticeLevel::Warning => palette::WARNING,
-            NoticeLevel::Error => palette::DANGER,
-        };
-        content = content.push(
-            container(text(notice.message.clone()).size(13).color(color))
-                .padding(12)
-                .width(Length::Fill)
-                .style(move |_| container::Style {
-                    background: Some(Background::Color(surface_color())),
-                    border: Border {
-                        radius: 6.0.into(),
-                        width: 1.0,
-                        color,
-                    },
-                    ..Default::default()
-                }),
-        );
-    }
 
     // Active session card.
     if let Some(account) = state.session.active_account() {
@@ -225,6 +203,10 @@ pub fn view<'a>(state: AccountViewState<'a>) -> Element<'a, Message> {
                     ..Default::default()
                 }),
         );
+    }
+
+    if !state.session.can_sign_in() {
+        return scrollable(content).height(Length::Fill).into();
     }
 
     // Sign-in form.

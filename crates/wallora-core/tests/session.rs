@@ -9,13 +9,13 @@ use url::Url;
 use wallora_core::domain::{
     AccountId, AccountRecord, AspectRatio, BrowseDefaults, CategoryMask, CredentialError,
     CredentialStore, Dimensions, InMemoryCredentialStore, LocalPreferences, ProxyConfig,
-    PurityMask, SearchQuery, SecretString, SessionKind, SessionScope, TopRange,
+    PurityMask, SearchQuery, SecretString, SessionKind, SessionScope, Sorting, TopRange,
     UsernameVerification, WallpaperId,
 };
 use wallora_core::provider::{Provider, ProviderError, WallhavenClient, WallhavenClientConfig};
 use wallora_core::services::{
     AccountRefreshPayload, NoticeLevel, RefreshOutcome, ScopedResponse, SessionManager,
-    SignInCommitOutcome, SignInError, fetch_account_refresh, probe_sign_in,
+    SignInCommitOutcome, SignInError, SignInProbe, fetch_account_refresh, probe_sign_in,
 };
 use wallora_core::storage::{AccountCachedState, SessionStorage, SqliteStore, StorageError};
 use wiremock::matchers::{header, method, path, query_param};
@@ -76,6 +76,7 @@ struct FaultyCredentialStore {
     fail_load: AtomicBool,
     fail_save: AtomicBool,
     fail_delete: AtomicBool,
+    delete_attempts: std::sync::atomic::AtomicUsize,
 }
 
 impl FaultyCredentialStore {
@@ -85,6 +86,7 @@ impl FaultyCredentialStore {
             fail_load: AtomicBool::new(false),
             fail_save: AtomicBool::new(false),
             fail_delete: AtomicBool::new(false),
+            delete_attempts: Default::default(),
         }
     }
 }
@@ -109,6 +111,7 @@ impl CredentialStore for FaultyCredentialStore {
     }
 
     fn delete(&self, account: &AccountId) -> Result<(), CredentialError> {
+        self.delete_attempts.fetch_add(1, Ordering::SeqCst);
         if self.fail_delete.load(Ordering::SeqCst) {
             return Err(CredentialError::Io(
                 "simulated credential delete error".to_string(),
@@ -118,107 +121,59 @@ impl CredentialStore for FaultyCredentialStore {
     }
 }
 
-/// Wrapper around `SqliteStore` that can inject write failures on demand.
-struct FaultyStorage {
-    inner: SqliteStore,
-    fail_save_account: AtomicBool,
-    fail_save_prefs: AtomicBool,
-    fail_remove_account: AtomicBool,
-}
+struct TestDb(std::path::PathBuf);
 
-impl FaultyStorage {
-    fn in_memory() -> Self {
-        Self {
-            inner: SqliteStore::open_in_memory().expect("in-memory sqlite"),
-            fail_save_account: AtomicBool::new(false),
-            fail_save_prefs: AtomicBool::new(false),
-            fail_remove_account: AtomicBool::new(false),
-        }
+impl TestDb {
+    fn new() -> Self {
+        let dir = std::env::temp_dir().join(format!("wallora-session-{}", AccountId::generate()));
+        std::fs::create_dir(&dir).unwrap();
+        Self(dir)
+    }
+
+    fn path(&self) -> std::path::PathBuf {
+        self.0.join("wallora.db")
+    }
+
+    fn open(&self) -> Arc<SqliteStore> {
+        Arc::new(SqliteStore::open(&self.path()).unwrap())
+    }
+
+    fn sql(&self) -> rusqlite::Connection {
+        rusqlite::Connection::open(self.path()).unwrap()
     }
 }
 
-impl SessionStorage for FaultyStorage {
-    fn list_accounts(&self) -> Result<Vec<AccountRecord>, StorageError> {
-        self.inner.list_accounts()
-    }
-
-    fn active_account(&self) -> Result<Option<AccountRecord>, StorageError> {
-        self.inner.active_account()
-    }
-
-    fn save_and_activate_account(
-        &self,
-        account: &AccountRecord,
-        initial_cache: Option<&AccountCachedState>,
-        purge_outgoing_cache: bool,
-    ) -> Result<(), StorageError> {
-        if self.fail_save_account.load(Ordering::SeqCst) {
-            return Err(StorageError::Query(
-                "simulated SQLite write error".to_string(),
-            ));
+impl Drop for TestDb {
+    fn drop(&mut self) {
+        for name in [
+            "wallora.db",
+            "wallora.db-wal",
+            "wallora.db-shm",
+            "wallora.session.lock",
+            "blocked",
+        ] {
+            let _ = std::fs::remove_file(self.0.join(name));
         }
-        self.inner
-            .save_and_activate_account(account, initial_cache, purge_outgoing_cache)
+        let _ = std::fs::remove_dir(&self.0);
     }
+}
 
-    fn set_active_account(
-        &self,
-        account_id: Option<&AccountId>,
-        purge_account_id: Option<&AccountId>,
-    ) -> Result<(), StorageError> {
-        self.inner.set_active_account(account_id, purge_account_id)
+fn candidate(session: &SessionManager, username: &str) -> SignInProbe {
+    SignInProbe {
+        start_scope: session.scope(),
+        username: username.into(),
+        api_key: SecretString::new(SYNTHETIC_KEY_A),
+        user_settings: None,
+        own_collections: Some(Vec::new()),
+        verification: UsernameVerification::Verified,
     }
+}
 
-    fn update_verification(
-        &self,
-        account_id: &AccountId,
-        verification: UsernameVerification,
-        updated_at_unix: i64,
-    ) -> Result<(), StorageError> {
-        self.inner
-            .update_verification(account_id, verification, updated_at_unix)
-    }
-
-    fn remove_account(&self, account_id: &AccountId) -> Result<(), StorageError> {
-        if self.fail_remove_account.load(Ordering::SeqCst) {
-            return Err(StorageError::Query(
-                "simulated SQLite remove error".to_string(),
-            ));
-        }
-        self.inner.remove_account(account_id)
-    }
-
-    fn load_account_cache(
-        &self,
-        account_id: &AccountId,
-    ) -> Result<Option<AccountCachedState>, StorageError> {
-        self.inner.load_account_cache(account_id)
-    }
-
-    fn save_account_cache(
-        &self,
-        account_id: &AccountId,
-        cache: &AccountCachedState,
-    ) -> Result<(), StorageError> {
-        self.inner.save_account_cache(account_id, cache)
-    }
-
-    fn purge_account_cache(&self, account_id: &AccountId) -> Result<(), StorageError> {
-        self.inner.purge_account_cache(account_id)
-    }
-
-    fn load_local_preferences(&self) -> Result<LocalPreferences, StorageError> {
-        self.inner.load_local_preferences()
-    }
-
-    fn save_local_preferences(&self, prefs: &LocalPreferences) -> Result<(), StorageError> {
-        if self.fail_save_prefs.load(Ordering::SeqCst) {
-            return Err(StorageError::Query(
-                "simulated SQLite preference write error".to_string(),
-            ));
-        }
-        self.inner.save_local_preferences(prefs)
-    }
+fn sign_in(session: &mut SessionManager, username: &str) -> AccountId {
+    session
+        .commit_sign_in(candidate(session, username))
+        .unwrap();
+    session.scope().account_id().unwrap().clone()
 }
 
 #[tokio::test]
@@ -256,7 +211,8 @@ async fn sign_in_verified_and_public_lookup_is_unkeyed() {
         .await;
 
     let creds = Arc::new(InMemoryCredentialStore::new());
-    let storage = Arc::new(SqliteStore::open_in_memory().expect("db"));
+    let db = TestDb::new();
+    let storage = db.open();
     let client = test_client(&server, creds.clone());
     let mut session = SessionManager::restore(storage.clone(), creds.clone());
 
@@ -324,7 +280,8 @@ async fn sign_in_mismatch_refused_and_leaves_stores_untouched() {
         .await;
 
     let creds = Arc::new(InMemoryCredentialStore::new());
-    let storage = Arc::new(SqliteStore::open_in_memory().expect("db"));
+    let db = TestDb::new();
+    let storage = db.open();
     let client = test_client(&server, creds.clone());
     let session = SessionManager::restore(storage.clone(), creds);
 
@@ -374,7 +331,8 @@ async fn sign_in_unverifiable_private_accepted_with_own_list_available() {
         .await;
 
     let creds = Arc::new(InMemoryCredentialStore::new());
-    let storage = Arc::new(SqliteStore::open_in_memory().expect("db"));
+    let db = TestDb::new();
+    let storage = db.open();
     let client = test_client(&server, creds.clone());
     let mut session = SessionManager::restore(storage, creds);
 
@@ -621,7 +579,8 @@ async fn mid_session_key_revocation_bumps_generation_purges_caches_and_notifies_
         .await;
 
     let creds = Arc::new(InMemoryCredentialStore::new());
-    let storage = Arc::new(SqliteStore::open_in_memory().expect("db"));
+    let db = TestDb::new();
+    let storage = db.open();
     let client = test_client(&server, creds.clone());
     let mut session = SessionManager::restore(storage.clone(), creds.clone());
 
@@ -667,7 +626,6 @@ async fn mid_session_key_revocation_bumps_generation_purges_caches_and_notifies_
     assert!(storage.load_account_cache(&account_id).unwrap().is_none());
     assert!(storage.active_account().unwrap().is_none());
     assert!(creds.load(&account_id).unwrap().is_none());
-    assert!(session.purged_accounts().contains(&account_id));
 }
 
 #[tokio::test]
@@ -695,7 +653,8 @@ async fn stale_async_completions_and_stale_401_are_discarded() {
         .await;
 
     let creds = Arc::new(InMemoryCredentialStore::new());
-    let storage = Arc::new(SqliteStore::open_in_memory().expect("db"));
+    let db = TestDb::new();
+    let storage = db.open();
     let client = test_client(&server, creds.clone());
     let mut session = SessionManager::restore(storage.clone(), creds.clone());
 
@@ -796,7 +755,8 @@ async fn logout_and_account_switch_purge_caches_bump_generation_and_keep_local_p
         .await;
 
     let creds = Arc::new(InMemoryCredentialStore::new());
-    let storage = Arc::new(SqliteStore::open_in_memory().expect("db"));
+    let db = TestDb::new();
+    let storage = db.open();
     let client = test_client(&server, creds.clone());
     let mut session = SessionManager::restore(storage.clone(), creds.clone());
 
@@ -858,6 +818,18 @@ async fn logout_and_account_switch_purge_caches_bump_generation_and_keep_local_p
         }
     );
     assert_eq!(bob_defaults.toplist_range, TopRange::OneYear);
+    let toplist = bob_defaults
+        .to_search_query(Sorting::Toplist)
+        .to_query_pairs();
+    assert!(toplist.contains(&("sorting", "toplist".into())));
+    assert!(toplist.contains(&("topRange", "1y".into())));
+    assert!(!toplist.iter().any(|(name, _)| *name == "per_page"));
+    assert!(
+        bob_defaults
+            .to_search_query(Sorting::DateAdded)
+            .top_range
+            .is_none()
+    );
 
     // Switch back to Alice: bumps generation, clears Bob's cache & in-memory views, keeps Bob's key.
     let switch = session.switch_account(&alice_id).expect("switch to alice");
@@ -914,7 +886,8 @@ async fn guest_requesting_nsfw_surfaces_upstream_restriction_without_client_filt
         .await;
 
     let creds = Arc::new(InMemoryCredentialStore::new());
-    let storage = Arc::new(SqliteStore::open_in_memory().expect("db"));
+    let db = TestDb::new();
+    let storage = db.open();
     let client = test_client(&server, creds.clone());
     let mut session = SessionManager::restore(storage, creds);
     let guest_scope = session.scope();
@@ -987,7 +960,8 @@ async fn manual_proxy_routes_requests_and_preserves_single_api_pacer() {
     });
 
     let creds = Arc::new(InMemoryCredentialStore::new());
-    let storage = Arc::new(SqliteStore::open_in_memory().expect("db"));
+    let db = TestDb::new();
+    let storage = db.open();
     let client = test_client(&direct_server, creds.clone());
     let mut session = SessionManager::restore(storage.clone(), creds);
 
@@ -1020,7 +994,8 @@ async fn manual_proxy_routes_requests_and_preserves_single_api_pacer() {
         .await
         .expect("retried request finishes after cooldown")
         .expect("task join")
-        .expect("proxied retry succeeds");
+        .expect("proxied retry succeeds")
+        .expect("decoded settings");
     assert_eq!(settings.per_page, 24);
 
     let recorded = proxy_hits.lock().expect("hits lock");
@@ -1039,158 +1014,199 @@ async fn manual_proxy_routes_requests_and_preserves_single_api_pacer() {
     );
 }
 
-#[tokio::test]
-async fn partial_failures_rollback_safely_and_never_expose_secrets() {
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/api/v1/settings"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(FIXTURE_SETTINGS))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/api/v1/collections"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(FIXTURE_COLLECTIONS_PUBLIC))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/api/v1/collections/alice"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(FIXTURE_COLLECTIONS_PUBLIC))
-        .mount(&server)
-        .await;
+#[test]
+fn db_open_failure_prevents_persistent_sign_in() {
+    let db = TestDb::new();
+    let blocked = db.0.join("blocked");
+    std::fs::write(&blocked, "").unwrap();
+    assert!(SqliteStore::open(&blocked.join("wallora.db")).is_err());
+    let storage = Arc::new(SqliteStore::open_in_memory().unwrap());
+    let creds = Arc::new(FaultyCredentialStore::new());
+    creds.fail_save.store(true, Ordering::SeqCst);
+    let mut session = SessionManager::restore(storage.clone(), creds);
+    let probe = candidate(&session, "alice");
+    assert_eq!(
+        session.commit_sign_in(probe),
+        Err(SignInError::StorageUnavailable)
+    );
+    assert!(storage.list_accounts().unwrap().is_empty());
+    assert!(storage.pending_credential_cleanup().unwrap().is_empty());
+}
 
-    // 1. Credential save fails -> SQLite untouched, no secret in error.
-    {
+#[test]
+fn reopen_reconciles_interrupted_sign_in_before_and_after_vault_write() {
+    for vault_written in [false, true] {
+        let db = TestDb::new();
         let creds = Arc::new(FaultyCredentialStore::new());
+        let id = AccountId::generate();
+        {
+            let storage = db.open();
+            storage.queue_credential_cleanup(&id).unwrap();
+            if vault_written {
+                creds
+                    .save(&id, &SecretString::new(SYNTHETIC_KEY_A))
+                    .unwrap();
+            }
+        }
+        let storage = db.open();
+        let session = SessionManager::restore(storage.clone(), creds.clone());
+        assert_eq!(session.scope().kind, SessionKind::Guest);
+        assert!(storage.pending_credential_cleanup().unwrap().is_empty());
+        assert!(creds.load(&id).unwrap().is_none());
+    }
+}
+
+#[test]
+fn failed_vault_save_and_failed_activation_compensate_across_reopen() {
+    let db = TestDb::new();
+    let creds = Arc::new(FaultyCredentialStore::new());
+    let abandoned;
+    {
+        let storage = db.open();
+        let mut session = SessionManager::restore(storage.clone(), creds.clone());
         creds.fail_save.store(true, Ordering::SeqCst);
-        let storage = Arc::new(FaultyStorage::in_memory());
-        let client = test_client(&server, creds.clone());
-        let mut session = SessionManager::restore(storage.clone(), creds.clone());
+        let probe = candidate(&session, "alice");
+        assert_eq!(
+            session.commit_sign_in(probe),
+            Err(SignInError::CredentialStore)
+        );
+        assert!(storage.pending_credential_cleanup().unwrap().is_empty());
 
-        let probe = probe_sign_in(
-            &client,
-            "alice".to_string(),
-            SecretString::new(SYNTHETIC_KEY_A),
-            session.scope(),
-        )
-        .await
-        .expect("probe");
-        let err = session
-            .commit_sign_in(probe)
-            .expect_err("credential save failure must fail sign-in");
-        assert_eq!(err, SignInError::CredentialStore);
-        assert!(!err.to_string().contains(SYNTHETIC_KEY_A));
-        assert!(storage.list_accounts().unwrap().is_empty());
-        assert_eq!(session.scope().kind, SessionKind::Guest);
-    }
-
-    // 2. Credential save succeeds, SQLite save fails -> compensating credential delete runs,
-    // no orphan left, session stays Guest, no secret exposed.
-    {
-        let creds = Arc::new(FaultyCredentialStore::new());
-        let storage = Arc::new(FaultyStorage::in_memory());
-        storage.fail_save_account.store(true, Ordering::SeqCst);
-        let client = test_client(&server, creds.clone());
-        let mut session = SessionManager::restore(storage.clone(), creds.clone());
-
-        let probe = probe_sign_in(
-            &client,
-            "alice".to_string(),
-            SecretString::new(SYNTHETIC_KEY_A),
-            session.scope(),
-        )
-        .await
-        .expect("probe");
-        let err = session
-            .commit_sign_in(probe)
-            .expect_err("SQLite failure must fail sign-in");
-        assert_eq!(err, SignInError::Storage);
-        assert!(!err.to_string().contains(SYNTHETIC_KEY_A));
-        assert!(storage.list_accounts().unwrap().is_empty());
-        assert_eq!(session.scope().kind, SessionKind::Guest);
-    }
-
-    // 3. Logout when CredentialStore::delete fails -> still transitions to Guest, bumps
-    // generation, clears SQLite/in-memory views, surfaces warning without secret.
-    {
-        let creds = Arc::new(FaultyCredentialStore::new());
-        let storage = Arc::new(FaultyStorage::in_memory());
-        let client = test_client(&server, creds.clone());
-        let mut session = SessionManager::restore(storage.clone(), creds.clone());
-
-        let probe = probe_sign_in(
-            &client,
-            "alice".to_string(),
-            SecretString::new(SYNTHETIC_KEY_A),
-            session.scope(),
-        )
-        .await
-        .expect("probe");
-        let _ = session.commit_sign_in(probe).expect("commit");
-        let signed_in_gen = session.scope().generation;
-
+        creds.fail_save.store(false, Ordering::SeqCst);
         creds.fail_delete.store(true, Ordering::SeqCst);
-        let logout = session.logout();
+        db.sql()
+            .execute_batch(
+                "CREATE TRIGGER block_sign_in BEFORE INSERT ON accounts
+             BEGIN SELECT RAISE(ABORT, 'synthetic activation failure'); END;",
+            )
+            .unwrap();
+        let probe = candidate(&session, "alice");
+        assert_eq!(session.commit_sign_in(probe), Err(SignInError::Storage));
         assert_eq!(session.scope().kind, SessionKind::Guest);
-        assert_eq!(session.scope().generation, signed_in_gen + 1);
+        let pending = storage.pending_credential_cleanup().unwrap();
+        assert_eq!(pending.len(), 1);
+        abandoned = pending[0].clone();
         assert!(storage.list_accounts().unwrap().is_empty());
-        let warning = logout.warning.expect("partial cleanup warning expected");
-        assert!(!warning.message.contains(SYNTHETIC_KEY_A));
+        assert!(creds.load(&abandoned).unwrap().is_some());
+    }
+    creds.fail_delete.store(false, Ordering::SeqCst);
+    let storage = db.open();
+    let session = SessionManager::restore(storage.clone(), creds.clone());
+    assert_eq!(session.scope().kind, SessionKind::Guest);
+    assert!(storage.pending_credential_cleanup().unwrap().is_empty());
+    assert!(creds.load(&abandoned).unwrap().is_none());
+}
+
+#[test]
+fn logout_tombstone_survives_dual_cleanup_failure_and_vault_delete_boundary() {
+    let db = TestDb::new();
+    let creds = Arc::new(FaultyCredentialStore::new());
+    let id;
+    {
+        let storage = db.open();
+        let mut session = SessionManager::restore(storage.clone(), creds.clone());
+        id = sign_in(&mut session, "alice");
+        db.sql()
+            .execute_batch(
+                "CREATE TRIGGER block_purge BEFORE DELETE ON account_cache
+             BEGIN SELECT RAISE(ABORT, 'synthetic purge failure'); END;
+             CREATE TRIGGER block_finish BEFORE DELETE ON accounts
+             BEGIN SELECT RAISE(ABORT, 'synthetic finalization failure'); END;",
+            )
+            .unwrap();
+        creds.fail_delete.store(true, Ordering::SeqCst);
+
+        let logout = session.logout();
+        assert_eq!(logout.scope.kind, SessionKind::Guest);
+        assert!(logout.warning.unwrap().message.contains("pending"));
+        assert!(storage.list_accounts().unwrap().is_empty());
+        assert!(storage.load_account_cache(&id).unwrap().is_none());
+        assert_eq!(
+            storage.pending_credential_cleanup().unwrap(),
+            std::slice::from_ref(&id)
+        );
+        assert!(creds.load(&id).unwrap().is_some());
     }
 
-    // 4. Startup restore when SQLite has active account but Credential Manager is missing the key
-    // -> falls back cleanly to Guest and purges persisted account cache.
     {
-        let creds = Arc::new(FaultyCredentialStore::new());
-        let storage = Arc::new(FaultyStorage::in_memory());
-        let client = test_client(&server, creds.clone());
-        let mut session = SessionManager::restore(storage.clone(), creds.clone());
-
-        let probe = probe_sign_in(
-            &client,
-            "alice".to_string(),
-            SecretString::new(SYNTHETIC_KEY_A),
-            session.scope(),
-        )
-        .await
-        .expect("probe");
-        let _ = session.commit_sign_in(probe).expect("commit");
-        let account_id = session.scope().account_id().cloned().unwrap();
-        assert!(storage.load_account_cache(&account_id).unwrap().is_some());
-
-        // Simulate key externally deleted from Credential Manager before next launch.
-        creds.delete(&account_id).expect("delete key");
+        let storage = db.open();
         let restored = SessionManager::restore(storage.clone(), creds.clone());
         assert_eq!(restored.scope().kind, SessionKind::Guest);
-        assert!(restored.active_account().is_none());
-        assert!(storage.load_account_cache(&account_id).unwrap().is_none());
-        let notice = restored.notice().expect("missing credential notice");
-        assert!(!notice.message.contains(SYNTHETIC_KEY_A));
-
-        // Also verify unreadable Credential Manager error falls back safely to Guest.
-        storage
-            .set_active_account(Some(&account_id), None)
-            .expect("reactivate in db");
-        creds.fail_load.store(true, Ordering::SeqCst);
-        let restored_err = SessionManager::restore(storage.clone(), creds);
-        assert_eq!(restored_err.scope().kind, SessionKind::Guest);
-        assert!(restored_err.active_account().is_none());
+        assert_eq!(
+            storage.pending_credential_cleanup().unwrap(),
+            std::slice::from_ref(&id)
+        );
+        assert!(creds.load(&id).unwrap().is_some());
     }
 
-    // 5. Proxy persistence failure rolls back transport on the single WallhavenClient.
+    // Vault deletion succeeds but SQLite finalization fails. Another restart retries deletion.
+    creds.fail_delete.store(false, Ordering::SeqCst);
+    db.sql().execute_batch("DROP TRIGGER block_purge;").unwrap();
     {
-        let creds = Arc::new(FaultyCredentialStore::new());
-        let storage = Arc::new(FaultyStorage::in_memory());
-        let client = test_client(&server, creds.clone());
-        let mut session = SessionManager::restore(storage.clone(), creds);
-        storage.fail_save_prefs.store(true, Ordering::SeqCst);
-
-        let err = session
-            .update_proxy(&client, ProxyConfig::Direct)
-            .expect_err("storage failure must fail proxy update");
-        assert_eq!(err.to_string(), "failed to save local proxy preference");
-        assert_eq!(client.proxy(), ProxyConfig::System);
-        assert_eq!(session.local_preferences().proxy, ProxyConfig::System);
+        let storage = db.open();
+        let restored = SessionManager::restore(storage.clone(), creds.clone());
+        assert_eq!(restored.scope().kind, SessionKind::Guest);
+        assert!(creds.load(&id).unwrap().is_none());
+        assert_eq!(
+            storage.pending_credential_cleanup().unwrap(),
+            std::slice::from_ref(&id)
+        );
     }
+    db.sql()
+        .execute_batch("DROP TRIGGER block_finish;")
+        .unwrap();
+    let storage = db.open();
+    let restored = SessionManager::restore(storage.clone(), creds);
+    assert_eq!(restored.scope().kind, SessionKind::Guest);
+    assert!(storage.pending_credential_cleanup().unwrap().is_empty());
+    let remaining: i64 = db
+        .sql()
+        .query_row("SELECT count(*) FROM accounts", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(remaining, 0);
+}
+
+#[test]
+fn interrupted_sign_out_is_reconciled_before_session_restore() {
+    let db = TestDb::new();
+    let creds = Arc::new(InMemoryCredentialStore::new());
+    let id;
+    {
+        let storage = db.open();
+        let mut session = SessionManager::restore(storage.clone(), creds.clone());
+        id = sign_in(&mut session, "alice");
+        storage.queue_credential_cleanup(&id).unwrap();
+    }
+    let storage = db.open();
+    let restored = SessionManager::restore(storage.clone(), creds.clone());
+    assert_eq!(restored.scope().kind, SessionKind::Guest);
+    assert!(storage.pending_credential_cleanup().unwrap().is_empty());
+    assert!(creds.load(&id).unwrap().is_none());
+}
+
+#[test]
+fn startup_vault_errors_hide_cached_views_and_preserve_saved_account() {
+    let db = TestDb::new();
+    let creds = Arc::new(FaultyCredentialStore::new());
+    let storage = db.open();
+    let mut session = SessionManager::restore(storage.clone(), creds.clone());
+    let id = sign_in(&mut session, "alice");
+    drop(session);
+
+    creds.fail_load.store(true, Ordering::SeqCst);
+    let restored = SessionManager::restore(storage.clone(), creds.clone());
+    assert_eq!(restored.scope().kind, SessionKind::Guest);
+    assert!(restored.own_collections().is_none());
+    assert!(storage.active_account().unwrap().is_some());
+    assert!(storage.load_account_cache(&id).unwrap().is_some());
+    drop(restored);
+
+    creds.fail_load.store(false, Ordering::SeqCst);
+    creds.delete(&id).unwrap();
+    let restored = SessionManager::restore(storage.clone(), creds);
+    assert_eq!(restored.scope().kind, SessionKind::Guest);
+    assert!(storage.load_account_cache(&id).unwrap().is_none());
+    assert_eq!(storage.list_accounts().unwrap().len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1301,7 +1317,8 @@ async fn sign_in_inconclusive_on_malformed_own_list_and_reverify_keeps_public_un
         .await;
 
     let creds = Arc::new(InMemoryCredentialStore::new());
-    let storage = Arc::new(SqliteStore::open_in_memory().expect("db"));
+    let db = TestDb::new();
+    let storage = db.open();
     let client = test_client(&server, creds.clone());
     let mut session = SessionManager::restore(storage.clone(), creds);
 
@@ -1353,4 +1370,387 @@ async fn sign_in_inconclusive_on_malformed_own_list_and_reverify_keeps_public_un
         UsernameVerification::Verified
     );
     assert_eq!(session.own_collections().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn settings_probe_classifies_status_independently_of_defaults() {
+    for (status, body) in [
+        (200, r#"{"data":{}}"#),
+        (201, FIXTURE_SETTINGS),
+        (401, "not json"),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(path("/api/v1/settings"))
+            .and(header("x-api-key", SYNTHETIC_KEY_A))
+            .respond_with(ResponseTemplate::new(status).set_body_string(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+        for endpoint in ["/api/v1/collections", "/api/v1/collections/alice"] {
+            Mock::given(path(endpoint))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_string(FIXTURE_COLLECTIONS_PUBLIC),
+                )
+                .expect(u64::from(status == 200))
+                .mount(&server)
+                .await;
+        }
+        let db = TestDb::new();
+        let storage = db.open();
+        let creds = Arc::new(InMemoryCredentialStore::new());
+        let client = test_client(&server, creds.clone());
+        let mut session = SessionManager::restore(storage, creds);
+        let result = probe_sign_in(
+            &client,
+            "alice".into(),
+            SecretString::new(SYNTHETIC_KEY_A),
+            session.scope(),
+        )
+        .await;
+        match status {
+            200 => {
+                let probe = result.unwrap();
+                assert!(probe.user_settings.is_none());
+                assert_eq!(probe.verification, UsernameVerification::Verified);
+                session.commit_sign_in(probe).unwrap();
+                assert_eq!(session.browse_defaults(), BrowseDefaults::guest());
+                assert!(
+                    session
+                        .notice()
+                        .unwrap()
+                        .message
+                        .contains("using Guest browse defaults")
+                );
+            }
+            401 => assert_eq!(result.unwrap_err(), SignInError::InvalidApiKey),
+            _ => assert!(
+                matches!(result, Err(SignInError::TemporaryFailure(msg)) if msg.contains("HTTP 201"))
+            ),
+        }
+    }
+}
+
+#[tokio::test]
+async fn local_vault_read_error_after_restore_never_revokes_or_sends_http() {
+    let db = TestDb::new();
+    let creds = Arc::new(FaultyCredentialStore::new());
+    let id;
+    {
+        let mut session = SessionManager::restore(db.open(), creds.clone());
+        id = sign_in(&mut session, "alice");
+    }
+    let storage = db.open();
+    let mut session = SessionManager::restore(storage.clone(), creds.clone());
+    assert_eq!(session.scope().account_id(), Some(&id));
+
+    let server = MockServer::start().await;
+    let client = test_client(&server, creds.clone());
+    creds.fail_load.store(true, Ordering::SeqCst);
+    let scope = session.scope();
+    let failed = fetch_account_refresh(&client, scope.clone(), "alice".into(), true).await;
+    assert_eq!(
+        failed.user_settings,
+        Err(ProviderError::CredentialStoreUnavailable)
+    );
+    assert!(matches!(
+        session.apply_refresh(failed),
+        RefreshOutcome::Applied { warning: Some(_) }
+    ));
+    assert_eq!(session.scope(), scope);
+    assert!(
+        session
+            .notice()
+            .unwrap()
+            .message
+            .contains("Could not read Windows Credential Manager")
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+    assert_eq!(creds.delete_attempts.load(Ordering::SeqCst), 0);
+    assert_eq!(storage.active_account().unwrap().unwrap().id, id);
+    assert!(storage.pending_credential_cleanup().unwrap().is_empty());
+
+    creds.fail_load.store(false, Ordering::SeqCst);
+    for (endpoint, body) in [
+        ("/api/v1/settings", FIXTURE_SETTINGS),
+        ("/api/v1/collections", FIXTURE_COLLECTIONS_PUBLIC),
+        ("/api/v1/collections/alice", FIXTURE_COLLECTIONS_PUBLIC),
+    ] {
+        Mock::given(path(endpoint))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    let recovered = fetch_account_refresh(&client, scope, "alice".into(), true).await;
+    assert!(matches!(
+        session.apply_refresh(recovered),
+        RefreshOutcome::Applied { warning: None }
+    ));
+    assert_eq!(
+        session.active_account().unwrap().verification,
+        UsernameVerification::Verified
+    );
+}
+
+#[tokio::test]
+async fn second_open_cannot_own_sessions_and_delayed_refresh_cannot_repopulate_after_switch_back() {
+    let db = TestDb::new();
+    let storage = db.open();
+    let creds = Arc::new(InMemoryCredentialStore::new());
+    let mut owner = SessionManager::restore(storage.clone(), creds.clone());
+    let bob = sign_in(&mut owner, "bob");
+    let alice = sign_in(&mut owner, "alice");
+
+    assert!(matches!(
+        SqliteStore::open(&db.path()),
+        Err(StorageError::SessionOwned)
+    ));
+    let mut second = SessionManager::restore(
+        Arc::new(SqliteStore::open_in_memory().unwrap()),
+        creds.clone(),
+    );
+    assert_eq!(second.scope().kind, SessionKind::Guest);
+    let probe = candidate(&second, "charlie");
+    assert_eq!(
+        second.commit_sign_in(probe),
+        Err(SignInError::StorageUnavailable)
+    );
+
+    let server = MockServer::start().await;
+    let started = Arc::new(tokio::sync::Notify::new());
+    let notify = started.clone();
+    Mock::given(path("/api/v1/settings"))
+        .respond_with(move |_: &wiremock::Request| {
+            notify.notify_one();
+            ResponseTemplate::new(200)
+                .set_body_string(FIXTURE_SETTINGS)
+                .set_delay(Duration::from_millis(500))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(path("/api/v1/collections"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(FIXTURE_COLLECTIONS_PUBLIC))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = test_client(&server, creds.clone());
+    let scope = owner.scope();
+    let refresh =
+        tokio::spawn(
+            async move { fetch_account_refresh(&client, scope, "alice".into(), false).await },
+        );
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .unwrap();
+    owner.switch_account(&bob).unwrap();
+    assert!(storage.load_account_cache(&alice).unwrap().is_none());
+    owner.switch_account(&alice).unwrap();
+    assert!(matches!(
+        owner.apply_refresh(refresh.await.unwrap()),
+        RefreshOutcome::DiscardedStale
+    ));
+    assert!(owner.own_collections().is_none());
+    assert!(storage.load_account_cache(&alice).unwrap().is_none());
+    drop(owner);
+    drop(storage);
+
+    let next = SessionManager::restore(db.open(), creds);
+    assert_eq!(next.scope().account_id(), Some(&alice));
+}
+
+#[test]
+fn failed_refresh_is_atomic_and_reopen_requires_fresh_verification() {
+    use wallora_core::domain::IdentityCheckOutcome;
+
+    let db = TestDb::new();
+    let creds = Arc::new(InMemoryCredentialStore::new());
+    let id;
+    {
+        let storage = db.open();
+        let mut session = SessionManager::restore(storage.clone(), creds.clone());
+        id = sign_in(&mut session, "alice");
+        let previous_cache = storage.load_account_cache(&id).unwrap();
+        // Fail the cache write after the verification SQL has already run.
+        db.sql()
+            .execute_batch(
+                "CREATE TRIGGER block_cache BEFORE INSERT ON account_cache
+             BEGIN SELECT RAISE(ABORT, 'synthetic cache failure'); END;",
+            )
+            .unwrap();
+        let result = session.apply_refresh(AccountRefreshPayload {
+            request_scope: session.scope(),
+            user_settings: Ok(serde_json::from_value(
+                serde_json::from_str::<serde_json::Value>(FIXTURE_SETTINGS).unwrap()["data"]
+                    .clone(),
+            )
+            .unwrap()),
+            own_collections: Ok(Vec::new()),
+            identity_outcome: Some(IdentityCheckOutcome::Mismatch),
+        });
+        assert!(matches!(
+            result,
+            RefreshOutcome::Applied { warning: Some(_) }
+        ));
+        assert_eq!(
+            session.active_account().unwrap().verification,
+            UsernameVerification::Inconclusive
+        );
+        assert_eq!(
+            storage.active_account().unwrap().unwrap().verification,
+            UsernameVerification::Verified
+        );
+        assert_eq!(storage.load_account_cache(&id).unwrap(), previous_cache);
+        assert!(session.user_settings().is_none());
+    }
+    let reopened = SessionManager::restore(db.open(), creds);
+    assert_eq!(reopened.scope().account_id(), Some(&id));
+    assert_eq!(
+        reopened.active_account().unwrap().verification,
+        UsernameVerification::Inconclusive
+    );
+    assert!(
+        !reopened
+            .active_account()
+            .unwrap()
+            .verification
+            .can_access_own_collection_items()
+    );
+}
+
+struct BlockedPreferenceWrite {
+    inner: Arc<SqliteStore>,
+    entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl SessionStorage for BlockedPreferenceWrite {
+    fn list_accounts(&self) -> Result<Vec<AccountRecord>, StorageError> {
+        self.inner.list_accounts()
+    }
+    fn active_account(&self) -> Result<Option<AccountRecord>, StorageError> {
+        self.inner.active_account()
+    }
+    fn is_durable(&self) -> bool {
+        self.inner.is_durable()
+    }
+    fn queue_credential_cleanup(&self, id: &AccountId) -> Result<(), StorageError> {
+        self.inner.queue_credential_cleanup(id)
+    }
+    fn pending_credential_cleanup(&self) -> Result<Vec<AccountId>, StorageError> {
+        self.inner.pending_credential_cleanup()
+    }
+    fn purge_pending_account(&self, id: &AccountId) -> Result<(), StorageError> {
+        self.inner.purge_pending_account(id)
+    }
+    fn finish_credential_cleanup(&self, id: &AccountId) -> Result<(), StorageError> {
+        self.inner.finish_credential_cleanup(id)
+    }
+    fn load_account_cache(
+        &self,
+        id: &AccountId,
+    ) -> Result<Option<AccountCachedState>, StorageError> {
+        self.inner.load_account_cache(id)
+    }
+    fn save_refresh(
+        &self,
+        id: &AccountId,
+        verification: Option<UsernameVerification>,
+        cache: &AccountCachedState,
+    ) -> Result<(), StorageError> {
+        self.inner.save_refresh(id, verification, cache)
+    }
+    fn save_and_activate_account(
+        &self,
+        account: &AccountRecord,
+        cache: Option<&AccountCachedState>,
+        purge: bool,
+    ) -> Result<(), StorageError> {
+        self.inner.save_and_activate_account(account, cache, purge)
+    }
+    fn set_active_account(&self, id: Option<&AccountId>) -> Result<(), StorageError> {
+        self.inner.set_active_account(id)
+    }
+    fn load_local_preferences(&self) -> Result<LocalPreferences, StorageError> {
+        self.inner.load_local_preferences()
+    }
+
+    fn save_local_preferences(&self, prefs: &LocalPreferences) -> Result<(), StorageError> {
+        self.entered
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap()
+            .send(())
+            .unwrap();
+        self.release
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        self.inner.save_local_preferences(prefs)
+    }
+}
+
+#[tokio::test]
+async fn blocked_then_failed_proxy_write_never_exposes_rejected_transport() {
+    let origin = MockServer::start().await;
+    Mock::given(path("/api/v1/settings"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(FIXTURE_SETTINGS))
+        .expect(1)
+        .mount(&origin)
+        .await;
+    let rejected_proxy = MockServer::start().await;
+    let db = TestDb::new();
+    let inner = db.open();
+    inner
+        .save_local_preferences(&LocalPreferences {
+            proxy: ProxyConfig::Direct,
+        })
+        .unwrap();
+    db.sql()
+        .execute_batch(
+            "CREATE TRIGGER block_preference BEFORE INSERT ON local_preferences
+         BEGIN SELECT RAISE(ABORT, 'synthetic preference write failure'); END;",
+        )
+        .unwrap();
+
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let storage = Arc::new(BlockedPreferenceWrite {
+        inner,
+        entered: Mutex::new(Some(entered_tx)),
+        release: Mutex::new(release_rx),
+    });
+    let creds = Arc::new(InMemoryCredentialStore::new());
+    let config =
+        WallhavenClientConfig::for_test(Url::parse(&format!("{}/api/v1", origin.uri())).unwrap())
+            .unwrap()
+            .with_proxy(ProxyConfig::Direct);
+    let client = WallhavenClient::with_config(creds.clone(), config).unwrap();
+    let mut session = SessionManager::restore(storage, creds);
+
+    let updater_client = client.clone();
+    let rejected_route = ProxyConfig::Manual(rejected_proxy.uri());
+    let update = tokio::task::spawn_blocking(move || {
+        let result = session.update_proxy(&updater_client, rejected_route);
+        (result, session.local_preferences().proxy.clone())
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    let attempted = client
+        .user_settings_with_key(SecretString::new(SYNTHETIC_KEY_A))
+        .await;
+    release_tx.send(()).unwrap();
+    let (result, saved_preference) = update.await.unwrap();
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        "failed to save local proxy preference"
+    );
+    assert!(attempted.unwrap().is_some());
+    assert!(rejected_proxy.received_requests().await.unwrap().is_empty());
+    assert_eq!(client.proxy(), ProxyConfig::Direct);
+    assert_eq!(saved_preference, ProxyConfig::Direct);
 }

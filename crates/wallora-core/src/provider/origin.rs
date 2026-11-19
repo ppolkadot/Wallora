@@ -165,11 +165,11 @@ pub fn authorize_secret(
     }
 
     if secret.is_empty() {
-        return Err(ProviderError::Unauthorized);
+        return Err(ProviderError::InvalidCredential);
     }
 
-    let mut value =
-        HeaderValue::from_str(secret.expose_secret()).map_err(|_| ProviderError::Unauthorized)?;
+    let mut value = HeaderValue::from_str(secret.expose_secret())
+        .map_err(|_| ProviderError::InvalidCredential)?;
     value.set_sensitive(true);
     req.headers_mut().insert(X_API_KEY_HEADER, value);
     Ok(())
@@ -196,8 +196,14 @@ pub fn authorize(
         SessionKind::Account(account_id) => {
             let secret = credentials
                 .load(account_id)
-                .map_err(|_| ProviderError::Unauthorized)?
-                .ok_or(ProviderError::Unauthorized)?;
+                .map_err(|err| match err {
+                    crate::domain::CredentialError::InvalidData => ProviderError::InvalidCredential,
+                    _ => ProviderError::CredentialStoreUnavailable,
+                })?
+                .ok_or(ProviderError::MissingCredential)?;
+            if secret.is_empty() {
+                return Err(ProviderError::MissingCredential);
+            }
             authorize_secret(req, &secret, policy)
         }
     }

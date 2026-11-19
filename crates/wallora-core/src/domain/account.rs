@@ -9,7 +9,8 @@ use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::domain::search::{
-    AspectRatio, CategoryMask, Dimensions, PurityMask, SearchQuery, TopRange, deserialize_per_page,
+    AspectRatio, CategoryMask, Dimensions, PurityMask, SearchQuery, Sorting, TopRange,
+    deserialize_per_page,
 };
 
 /// External browser hand-off URL for editing upstream account settings (Option A gap).
@@ -340,10 +341,12 @@ impl BrowseDefaults {
     }
 
     /// Builds a [`SearchQuery`] seeded with the supported upstream defaults.
-    pub fn to_search_query(&self) -> SearchQuery {
+    pub fn to_search_query(&self, sorting: Sorting) -> SearchQuery {
         SearchQuery {
             categories: Some(self.categories),
             purity: Some(self.purity),
+            sorting: Some(sorting),
+            top_range: (sorting == Sorting::Toplist).then_some(self.toplist_range),
             resolutions: self.resolutions.clone(),
             ratios: self.aspect_ratios.clone(),
             ..SearchQuery::default()
@@ -472,6 +475,8 @@ impl SessionScope {
 pub enum CredentialError {
     #[error("credential store unavailable: {0}")]
     Unavailable(String),
+    #[error("stored credential is invalid")]
+    InvalidData,
     #[error("credential I/O failed: {0}")]
     Io(String),
 }

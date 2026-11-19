@@ -56,7 +56,10 @@ pub enum Message {
     RefreshAccount {
         reverify: bool,
     },
-    AccountRefreshFinished(AccountRefreshPayload),
+    AccountRefreshFinished {
+        op_id: u64,
+        payload: AccountRefreshPayload,
+    },
     SignOut,
     SwitchAccount(AccountId),
     SwitchToGuest,
@@ -83,9 +86,9 @@ impl fmt::Debug for Message {
                 .debug_struct("RefreshAccount")
                 .field("reverify", reverify)
                 .finish(),
-            Self::AccountRefreshFinished(payload) => f
-                .debug_tuple("AccountRefreshFinished")
-                .field(payload)
+            Self::AccountRefreshFinished { op_id, .. } => f
+                .debug_struct("AccountRefreshFinished")
+                .field("op_id", op_id)
                 .finish(),
             Self::SignOut => f.write_str("SignOut"),
             Self::SwitchAccount(id) => f.debug_tuple("SwitchAccount").field(id).finish(),

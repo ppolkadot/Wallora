@@ -52,9 +52,7 @@ fn map_keyring_error(err: keyring::Error) -> CredentialError {
         keyring::Error::PlatformFailure(_) => {
             CredentialError::Unavailable("Windows Credential Manager platform error".to_string())
         }
-        keyring::Error::BadEncoding(_) => {
-            CredentialError::Io("stored credential had invalid UTF-8 encoding".to_string())
-        }
+        keyring::Error::BadEncoding(_) => CredentialError::InvalidData,
         keyring::Error::TooLong(field, max) => {
             CredentialError::Io(format!("credential {field} exceeded {max} byte limit"))
         }
