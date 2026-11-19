@@ -12,8 +12,8 @@ use wallora_core::domain::{
     WallpaperId,
 };
 use wallora_core::provider::{
-    ImageClass, OriginPolicy, Provider, ProviderError, WallhavenClient, WallhavenClientConfig,
-    authorize,
+    IMAGE_IN_FLIGHT_CAP, ImageClass, OriginPolicy, Provider, ProviderError, WallhavenClient,
+    WallhavenClientConfig, authorize,
 };
 use wiremock::matchers::{header, header_exists, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -171,7 +171,7 @@ async fn client_with_production_policy_rejects_port_8443_and_http_before_network
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wiremock_key_sent_to_api_absent_on_images_and_redirects_blocked() {
     let log_buf = LogBuffer::default();
     let subscriber = tracing_subscriber::fmt()
@@ -351,6 +351,12 @@ async fn wiremock_key_sent_to_api_absent_on_images_and_redirects_blocked() {
         !logs.contains(SECRET_KEY),
         "secret key leaked into tracing logs!"
     );
+    // The leak check only proves something if provider worker logs really reached this
+    // subscriber; the 401/302 attempts emit this line from inside the pacer's spawned worker.
+    assert!(
+        logs.contains("upstream terminal response"),
+        "the pacer worker's provider log line never reached the caller's subscriber"
+    );
 }
 
 #[tokio::test]
@@ -463,6 +469,64 @@ async fn image_body_limit_checks_chunked_total() {
         .await
         .expect("preview accepts the same body");
     assert_eq!(preview.len(), 2_000_001);
+}
+
+#[tokio::test]
+async fn image_total_deadline_bounds_a_trickling_body() {
+    let (listener, addr) = support::bind().await;
+    let _server = support::serve(listener, |mut stream| async move {
+        let _ = support::read_request_head(&mut stream).await;
+        let _ = support::write_head(
+            &mut stream,
+            &[
+                ("Content-Type", "application/octet-stream"),
+                ("Content-Length", "1000000"),
+                ("Connection", "close"),
+            ],
+        )
+        .await;
+        // Trickle one byte at a time so the read timeout never trips; only the overall
+        // per-request deadline can end this fetch.
+        loop {
+            if stream.write_all(b"x").await.is_err() || stream.flush().await.is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+
+    let api_base = Url::parse("http://127.0.0.1:1/api/v1").expect("valid loopback base");
+    let origin = Url::parse(&format!("http://{addr}")).expect("valid loopback origin");
+    let config = WallhavenClientConfig::for_test(api_base)
+        .expect("valid test config")
+        .with_test_image_origin(origin)
+        .expect("valid test image origin")
+        .with_test_image_total_timeout(Duration::from_millis(250));
+    let client = WallhavenClient::with_config(Arc::new(InMemoryCredentialStore::new()), config)
+        .expect("client build");
+
+    assert_eq!(
+        client.available_image_slots_for_test(),
+        IMAGE_IN_FLIGHT_CAP,
+        "all image slots must start free"
+    );
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.fetch_image_bytes(&image_url(addr, "/trickle.jpg"), ImageClass::Thumbnail),
+    )
+    .await
+    .expect("the overall image deadline must end a trickling fetch");
+    assert_eq!(
+        result,
+        Err(ProviderError::Timeout),
+        "a trickling body must fail with Timeout"
+    );
+    assert_eq!(
+        client.available_image_slots_for_test(),
+        IMAGE_IN_FLIGHT_CAP,
+        "the timed-out fetch must release its image slot"
+    );
 }
 
 #[tokio::test]

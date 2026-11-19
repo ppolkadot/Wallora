@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use tokio::sync::{Notify, oneshot};
 use tokio::time::Instant;
+use tracing::instrument::WithSubscriber;
 
 use crate::domain::RequestPriority;
 use crate::provider::api::MAX_COOLDOWN;
@@ -489,10 +490,10 @@ impl ApiPacer {
         if start_worker {
             let shared = Arc::clone(&self.shared);
             let span = tracing::Span::current();
-            tokio::spawn(tracing::Instrument::instrument(
-                run_worker(shared, job_id, attempt_fn),
-                span,
-            ));
+            tokio::spawn(
+                tracing::Instrument::instrument(run_worker(shared, job_id, attempt_fn), span)
+                    .with_current_subscriber(),
+            );
         }
 
         // Admitted work, promotion and eviction can all unblock a queue front.

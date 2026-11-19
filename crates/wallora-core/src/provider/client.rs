@@ -44,6 +44,14 @@ impl ImageClass {
             Self::Preview => PREVIEW_BYTE_LIMIT,
         }
     }
+
+    /// Overall per-request deadline, so a trickling server cannot hold an image slot forever.
+    pub const fn total_timeout(self) -> Duration {
+        match self {
+            Self::Thumbnail => Duration::from_secs(60),
+            Self::Preview => Duration::from_secs(300),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -77,6 +85,9 @@ pub struct WallhavenClientConfig {
     pub request_timeout: Duration,
     pub image_read_timeout: Duration,
     pub(crate) image_origin: ImageOriginPolicy,
+    /// Test configurations may shorten the overall per-request image deadline.
+    #[cfg(any(test, feature = "test-util"))]
+    pub(crate) image_total_timeout_override: Option<Duration>,
     /// Test configurations must not inherit a developer machine's system proxy.
     pub(crate) use_system_proxy: bool,
 }
@@ -90,6 +101,8 @@ impl WallhavenClientConfig {
             request_timeout: Duration::from_secs(30),
             image_read_timeout: Duration::from_secs(120),
             image_origin: ImageOriginPolicy::production(),
+            #[cfg(any(test, feature = "test-util"))]
+            image_total_timeout_override: None,
             use_system_proxy: true,
         }
     }
@@ -106,8 +119,16 @@ impl WallhavenClientConfig {
             request_timeout: Duration::from_secs(30),
             image_read_timeout: Duration::from_secs(120),
             image_origin: ImageOriginPolicy::Disabled,
+            image_total_timeout_override: None,
             use_system_proxy: false,
         })
+    }
+
+    /// Shortens the overall per-request image deadline for tests.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn with_test_image_total_timeout(mut self, timeout: Duration) -> Self {
+        self.image_total_timeout_override = Some(timeout);
+        self
     }
 
     /// Allows image fetches from one explicit literal loopback origin.
@@ -196,8 +217,15 @@ impl WallhavenClient {
         self.inner.pacer.wait_for_cooldown().await
     }
 
+    /// Reports the free image slots. Gated behind `test-util`.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn available_image_slots_for_test(&self) -> usize {
+        self.inner.image_sem.available_permits()
+    }
+
     /// Fetches a bounded encoded thumbnail or preview from an allowlisted image host without
     /// API credentials, using same-origin redirects and the dedicated in-flight cap (6).
+    /// The class's overall deadline bounds the send plus the whole body read.
     pub async fn fetch_image_bytes(
         &self,
         url: &Url,
@@ -219,6 +247,18 @@ impl WallhavenClient {
             .await
             .map_err(|_| ProviderError::Busy)?;
 
+        match tokio::time::timeout(
+            self.inner.image_total_timeout(class),
+            self.fetch_image_body(url, limit),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(ProviderError::Timeout),
+        }
+    }
+
+    async fn fetch_image_body(&self, url: &Url, limit: usize) -> Result<Vec<u8>, ProviderError> {
         let resp = match self.inner.image_client.get(url.clone()).send().await {
             Ok(resp) => resp,
             Err(err) => return Err(map_image_transport_error(&err)),
@@ -271,6 +311,14 @@ fn map_image_transport_error(err: &reqwest::Error) -> ProviderError {
 }
 
 impl WallhavenClientInner {
+    fn image_total_timeout(&self, class: ImageClass) -> Duration {
+        #[cfg(any(test, feature = "test-util"))]
+        if let Some(timeout) = self.config.image_total_timeout_override {
+            return timeout;
+        }
+        class.total_timeout()
+    }
+
     fn build_api_url(&self, segments: &[&str]) -> Result<Url, ProviderError> {
         let mut url = self.config.api_base.clone();
         {

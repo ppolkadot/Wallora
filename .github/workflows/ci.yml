@@ -59,6 +59,12 @@ jobs:
           $zip = Join-Path $env:RUNNER_TEMP 'wix314-binaries.zip'
           $dest = Join-Path $env:RUNNER_TEMP 'wix314'
           Invoke-WebRequest -Uri 'https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip' -OutFile $zip
+          # Pinned SHA-256 of the wix3141rtm release asset above; verified before extracting.
+          $expected = '6AC824E1642D6F7277D0ED7EA09411A508F6116BA6FAE0AA5F2C7DAA2FF43D31'
+          $actual = (Get-FileHash -Path $zip -Algorithm SHA256).Hash
+          if ($actual -ne $expected) {
+            throw "WiX zip checksum mismatch: expected $expected but got $actual"
+          }
           if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
           Expand-Archive -Path $zip -DestinationPath $dest -Force
           $candles = @(Get-ChildItem -Path $dest -Recurse -File -Filter 'candle.exe')
@@ -115,7 +121,6 @@ jobs:
                 'StringData', 'GetProperty', $null, $record, @(1))
             }
             $tableView.GetType().InvokeMember('Close', 'InvokeMethod', $null, $tableView, $null) | Out-Null
-            $db.GetType().InvokeMember('Commit', 'InvokeMethod', $null, $db, $null) | Out-Null
             if ($tables -contains 'Environment') {
               throw "$($msi.Name) installs an Environment table (PATH modification)"
             }
