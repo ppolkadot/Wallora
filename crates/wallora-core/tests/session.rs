@@ -1185,6 +1185,108 @@ fn interrupted_sign_out_is_reconciled_before_session_restore() {
 }
 
 #[test]
+fn revoked_account_stays_signed_out_when_cleanup_intent_cannot_be_written() {
+    let db = TestDb::new();
+    let creds = Arc::new(FaultyCredentialStore::new());
+    let id;
+    {
+        let storage = db.open();
+        let mut session = SessionManager::restore(storage.clone(), creds.clone());
+        id = sign_in(&mut session, "alice");
+        let scope = session.scope();
+        assert!(storage.load_account_cache(&id).unwrap().is_some());
+        db.sql()
+            .execute_batch(
+                "CREATE TRIGGER block_intent BEFORE INSERT ON pending_credential_cleanup
+                 BEGIN SELECT RAISE(ABORT, 'synthetic intent failure'); END;",
+            )
+            .unwrap();
+
+        assert!(matches!(
+            session.handle_provider_result(&scope, Err::<(), _>(ProviderError::Unauthorized)),
+            ScopedResponse::Revoked(_)
+        ));
+        assert_eq!(session.scope(), SessionScope::guest(scope.generation + 1));
+        assert!(session.accounts().is_empty());
+        assert!(session.own_collections().is_none());
+        assert!(storage.list_accounts().unwrap().is_empty());
+        assert!(storage.load_account_cache(&id).unwrap().is_none());
+        assert!(creds.load(&id).unwrap().is_none());
+    }
+
+    let reopened = SessionManager::restore(db.open(), creds);
+    assert_eq!(reopened.scope().kind, SessionKind::Guest);
+    assert!(reopened.own_collections().is_none());
+}
+
+#[test]
+fn rejected_account_cache_stays_hidden_after_restart_when_both_stores_fail() {
+    let db = TestDb::new();
+    let creds = Arc::new(FaultyCredentialStore::new());
+    let id;
+    {
+        let storage = db.open();
+        let mut session = SessionManager::restore(storage.clone(), creds.clone());
+        id = sign_in(&mut session, "alice");
+        db.sql()
+            .execute_batch(
+                "CREATE TRIGGER block_intent BEFORE INSERT ON pending_credential_cleanup
+                 BEGIN SELECT RAISE(ABORT, 'synthetic intent failure'); END;
+                 CREATE TRIGGER block_deactivate BEFORE UPDATE ON accounts
+                 BEGIN SELECT RAISE(ABORT, 'synthetic deactivate failure'); END;",
+            )
+            .unwrap();
+        creds.fail_delete.store(true, Ordering::SeqCst);
+        let scope = session.scope();
+        assert!(matches!(
+            session.apply_refresh(AccountRefreshPayload {
+                request_scope: scope.clone(),
+                user_settings: Err(ProviderError::Unauthorized),
+                own_collections: Err(ProviderError::Unauthorized),
+                identity_outcome: None,
+            }),
+            RefreshOutcome::KeyRevoked(_)
+        ));
+        assert_eq!(session.scope(), SessionScope::guest(scope.generation + 1));
+        assert!(session.accounts().is_empty());
+        assert!(session.own_collections().is_none());
+        assert_eq!(storage.active_account().unwrap().unwrap().id, id);
+        assert!(storage.load_account_cache(&id).unwrap().is_some());
+        assert!(creds.load(&id).unwrap().is_some());
+    }
+
+    let mut reopened = SessionManager::restore(db.open(), creds.clone());
+    assert!(reopened.own_collections().is_none());
+    assert!(reopened.user_settings().is_none());
+    let scope = reopened.scope();
+    assert_eq!(scope.account_id(), Some(&id));
+    reopened.apply_refresh(AccountRefreshPayload {
+        request_scope: scope,
+        user_settings: Err(ProviderError::Network),
+        own_collections: Err(ProviderError::Network),
+        identity_outcome: None,
+    });
+    assert!(reopened.own_collections().is_none());
+    assert!(reopened.user_settings().is_none());
+    drop(reopened);
+
+    db.sql()
+        .execute_batch("DROP TRIGGER block_intent; DROP TRIGGER block_deactivate;")
+        .unwrap();
+    creds.fail_delete.store(false, Ordering::SeqCst);
+    let storage = db.open();
+    let mut recovered = SessionManager::restore(storage.clone(), creds.clone());
+    let scope = recovered.scope();
+    assert!(matches!(
+        recovered.handle_provider_result(&scope, Err::<(), _>(ProviderError::Unauthorized)),
+        ScopedResponse::Revoked(_)
+    ));
+    assert_eq!(recovered.scope().kind, SessionKind::Guest);
+    assert!(storage.load_account_cache(&id).unwrap().is_none());
+    assert!(creds.load(&id).unwrap().is_none());
+}
+
+#[test]
 fn startup_vault_errors_hide_cached_views_and_preserve_saved_account() {
     let db = TestDb::new();
     let creds = Arc::new(FaultyCredentialStore::new());
@@ -1431,6 +1533,46 @@ async fn settings_probe_classifies_status_independently_of_defaults() {
 }
 
 #[tokio::test]
+async fn signed_in_settings_retries_incomplete_response_bodies() {
+    let (listener, addr) = support::bind().await;
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let server = support::serve(listener, {
+        let hits = hits.clone();
+        move |mut stream| {
+            let hits = hits.clone();
+            async move {
+                let request = support::read_request_head(&mut stream).await.unwrap();
+                assert!(request.starts_with("GET /api/v1/settings HTTP/1.1\r\n"));
+                assert!(request.contains(SYNTHETIC_KEY_A));
+                support::write_head(&mut stream, &[("Content-Length", "3")])
+                    .await
+                    .unwrap();
+                stream.write_all(b"{").await.unwrap();
+                hits.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                drop(stream);
+            }
+        }
+    });
+    let creds = Arc::new(InMemoryCredentialStore::new());
+    let id = AccountId::generate();
+    creds
+        .save(&id, &SecretString::new(SYNTHETIC_KEY_A))
+        .unwrap();
+    let origin = Url::parse(&format!("http://{addr}/api/v1")).unwrap();
+    let mut config = WallhavenClientConfig::for_test(origin).unwrap();
+    config.request_timeout = Duration::from_secs(1);
+    let client = WallhavenClient::with_config(creds, config).unwrap();
+
+    assert_eq!(
+        client.user_settings(SessionScope::account(id, 1)).await,
+        Err(ProviderError::Timeout)
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 3);
+    server.abort();
+}
+
+#[tokio::test]
 async fn local_vault_read_error_after_restore_never_revokes_or_sends_http() {
     let db = TestDb::new();
     let creds = Arc::new(FaultyCredentialStore::new());
@@ -1640,8 +1782,8 @@ impl SessionStorage for BlockedPreferenceWrite {
     fn pending_credential_cleanup(&self) -> Result<Vec<AccountId>, StorageError> {
         self.inner.pending_credential_cleanup()
     }
-    fn purge_pending_account(&self, id: &AccountId) -> Result<(), StorageError> {
-        self.inner.purge_pending_account(id)
+    fn deactivate_and_purge_account(&self, id: &AccountId) -> Result<(), StorageError> {
+        self.inner.deactivate_and_purge_account(id)
     }
     fn finish_credential_cleanup(&self, id: &AccountId) -> Result<(), StorageError> {
         self.inner.finish_credential_cleanup(id)

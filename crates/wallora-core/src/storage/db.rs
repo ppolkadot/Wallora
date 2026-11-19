@@ -67,9 +67,9 @@ pub trait SessionStorage: Send + Sync + 'static {
 
     fn pending_credential_cleanup(&self) -> Result<Vec<AccountId>, StorageError>;
 
-    fn purge_pending_account(&self, account_id: &AccountId) -> Result<(), StorageError>;
+    fn deactivate_and_purge_account(&self, account_id: &AccountId) -> Result<(), StorageError>;
 
-    /// Called only after idempotent vault deletion succeeds.
+    /// Removes account metadata and any cleanup intent after idempotent vault deletion succeeds.
     fn finish_credential_cleanup(&self, account_id: &AccountId) -> Result<(), StorageError>;
 
     fn load_account_cache(
@@ -343,7 +343,7 @@ impl SessionStorage for SqliteStore {
             .map_err(|err| StorageError::Query(err.to_string()))
     }
 
-    fn purge_pending_account(&self, account_id: &AccountId) -> Result<(), StorageError> {
+    fn deactivate_and_purge_account(&self, account_id: &AccountId) -> Result<(), StorageError> {
         let mut conn = self.lock_conn()?;
         let tx = conn
             .transaction()
@@ -368,8 +368,7 @@ impl SessionStorage for SqliteStore {
             .transaction()
             .map_err(|err| StorageError::Query(err.to_string()))?;
         tx.execute(
-            "DELETE FROM accounts WHERE account_id = ?1
-               AND account_id IN (SELECT account_id FROM pending_credential_cleanup)",
+            "DELETE FROM accounts WHERE account_id = ?1",
             [account_id.as_str()],
         )
         .map_err(|err| StorageError::Query(err.to_string()))?;

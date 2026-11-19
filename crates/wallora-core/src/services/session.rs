@@ -335,8 +335,8 @@ pub struct SessionManager {
 impl SessionManager {
     /// Restores saved local preferences and active session from SQLite + `CredentialStore`.
     ///
-    /// Reconciles unfinished vault work before loading account metadata. Previously verified
-    /// identities require a fresh check after restart.
+    /// Reconciles unfinished vault work before loading account metadata. The startup refresh
+    /// must obtain current account data before showing it, even if the vault still has a key.
     pub fn restore(
         storage: Arc<dyn SessionStorage>,
         credentials: Arc<dyn CredentialStore>,
@@ -357,7 +357,7 @@ impl SessionManager {
             Ok(pending) => {
                 let mut cleanup_failed = false;
                 for id in pending {
-                    cleanup_failed |= !Self::clean_pending_account(&*storage, &*credentials, &id);
+                    cleanup_failed |= !Self::clean_account(&*storage, &*credentials, &id);
                 }
                 if cleanup_failed {
                     notice = Some(Self::pending_cleanup_notice());
@@ -375,18 +375,11 @@ impl SessionManager {
 
         let mut scope = SessionScope::guest(1);
         let mut active_account = None;
-        let mut user_settings = None;
-        let mut own_collections = None;
-
         if let Some(candidate) = accounts.iter().find(|a| a.is_active).cloned() {
             match credentials.load(&candidate.id) {
                 Ok(Some(secret)) if !secret.is_empty() => {
                     drop(secret);
                     scope = SessionScope::account(candidate.id.clone(), 1);
-                    if let Ok(Some(cached)) = storage.load_account_cache(&candidate.id) {
-                        user_settings = cached.user_settings;
-                        own_collections = cached.own_collections;
-                    }
                     active_account = Some(require_fresh_verification(candidate));
                 }
                 Ok(_) => {
@@ -415,8 +408,8 @@ impl SessionManager {
             scope,
             accounts,
             active_account,
-            user_settings,
-            own_collections,
+            user_settings: None,
+            own_collections: None,
             local_preferences,
             notice,
         }
@@ -506,7 +499,7 @@ impl SessionManager {
             .map_err(|_| SignInError::Storage)?;
         if let Err(err) = self.credentials.save(&account_id, &probe.api_key) {
             tracing::error!(reason = %err, "failed to store credential during sign-in");
-            Self::clean_pending_account(&*self.storage, &*self.credentials, &account_id);
+            Self::clean_account(&*self.storage, &*self.credentials, &account_id);
             return Err(SignInError::CredentialStore);
         }
 
@@ -522,7 +515,7 @@ impl SessionManager {
                 .pending_credential_cleanup()
                 .is_ok_and(|ids| ids.contains(&account_id))
             {
-                Self::clean_pending_account(&*self.storage, &*self.credentials, &account_id);
+                Self::clean_account(&*self.storage, &*self.credentials, &account_id);
             }
             return Err(SignInError::Storage);
         }
@@ -733,18 +726,18 @@ impl SessionManager {
         )
     }
 
-    fn clean_pending_account(
+    fn clean_account(
         storage: &dyn SessionStorage,
         credentials: &dyn CredentialStore,
         account_id: &AccountId,
     ) -> bool {
-        // Attempt both operations. The journal hides the account even if SQLite cannot yet
-        // purge its cache, or both operations fail.
-        let purge_result = storage.purge_pending_account(account_id);
+        // The journal normally hides the account. When revocation cannot write the journal,
+        // either deactivation or vault deletion can independently prevent a restart restore.
+        let purge_result = storage.deactivate_and_purge_account(account_id);
         match credentials.delete(account_id) {
             Ok(()) => storage.finish_credential_cleanup(account_id).is_ok(),
             Err(err) => {
-                tracing::warn!(%err, cache_purged = purge_result.is_ok(), "account cleanup remains pending");
+                tracing::warn!(%err, cache_purged = purge_result.is_ok(), "account cleanup did not complete");
                 false
             }
         }
@@ -761,7 +754,7 @@ impl SessionManager {
         self.storage.queue_credential_cleanup(account_id)?;
         self.clear_account_views();
         self.accounts.retain(|a| &a.id != account_id);
-        Ok(Self::clean_pending_account(
+        Ok(Self::clean_account(
             &*self.storage,
             &*self.credentials,
             account_id,
@@ -772,16 +765,15 @@ impl SessionManager {
         let message = match self.retire_account(account_id) {
             Ok(true) => "Your API key was rejected by Wallhaven (401). Signed out and cleared local account data. Sign in again with a valid API key.".into(),
             Ok(false) => format!("Your API key was rejected by Wallhaven (401). Signed out. {}", Self::pending_cleanup_notice().message),
-            Err(_) => {
-                // There is no durable intent yet. Invalidate outstanding results and restrict
-                // the current view while retaining the account ID so sign-out can be retried.
-                self.scope.generation = self.scope.generation.saturating_add(1);
-                self.user_settings = None;
-                self.own_collections = None;
-                if let Some(active) = &mut self.active_account {
-                    active.verification = UsernameVerification::Inconclusive;
+            Err(err) => {
+                tracing::warn!(%err, "could not record revoked credential cleanup");
+                self.clear_account_views();
+                self.accounts.retain(|a| &a.id != account_id);
+                if Self::clean_account(&*self.storage, &*self.credentials, account_id) {
+                    "Your API key was rejected by Wallhaven (401). Signed out and cleared local account data. Sign in again with a valid API key.".into()
+                } else {
+                    "Your API key was rejected by Wallhaven (401). Signed out. Some local account data or the saved key could not be removed.".into()
                 }
-                "Your API key was rejected by Wallhaven (401). Local storage could not record sign-out. Try signing out again.".into()
             }
         };
         let notice = SessionNotice::error(message);
@@ -853,11 +845,6 @@ impl SessionManager {
             SessionScope::account(target_id.clone(), self.scope.generation.saturating_add(1));
         self.user_settings = None;
         self.own_collections = None;
-
-        if let Ok(Some(cached)) = self.storage.load_account_cache(target_id) {
-            self.user_settings = cached.user_settings;
-            self.own_collections = cached.own_collections;
-        }
 
         let mut updated_target = target;
         updated_target.is_active = true;

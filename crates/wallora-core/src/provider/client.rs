@@ -171,6 +171,7 @@ impl HttpTransport {
 enum ApiResponse {
     Json,
     Settings,
+    SettingsProbe,
 }
 
 fn build_http_transport(
@@ -515,16 +516,16 @@ impl WallhavenClientInner {
 
                     let status = resp.status();
                     if status.is_success() {
-                        if response == ApiResponse::Settings && status != StatusCode::OK {
+                        if response != ApiResponse::Json && status != StatusCode::OK {
                             return Ok(AttemptOutcome::Terminal(ProviderError::Upstream {
                                 status: status.as_u16(),
                             }));
                         }
                         return match resp.bytes().await {
                             Ok(bytes) => Ok(AttemptOutcome::Success(bytes.to_vec())),
-                            // The status already established key validity. A failed body read
-                            // leaves Settings defaults unavailable.
-                            Err(_) if response == ApiResponse::Settings => {
+                            // Only sign-in can proceed on the status alone. An authenticated
+                            // settings refresh still needs the body and retries failed reads.
+                            Err(_) if response == ApiResponse::SettingsProbe => {
                                 Ok(AttemptOutcome::Success(Vec::new()))
                             }
                             Err(err) => {
@@ -716,7 +717,7 @@ impl Provider for WallhavenClient {
                     probe_id,
                 },
                 RequestPriority::Interactive,
-                ApiResponse::Settings,
+                ApiResponse::SettingsProbe,
             )
             .await?;
             Ok(decode_user_settings_response(&bytes).ok())
