@@ -1,0 +1,6 @@
+//! Core library for Wallora (GUI-free, Windows-free).
+
+pub mod domain;
+pub mod provider;
+pub mod services;
+pub mod storage;

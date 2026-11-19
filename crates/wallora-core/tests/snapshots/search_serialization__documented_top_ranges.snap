@@ -1,0 +1,11 @@
+---
+source: crates/wallora-core/tests/search_serialization.rs
+expression: top_ranges
+---
+sorting=toplist&topRange=1d
+sorting=toplist&topRange=3d
+sorting=toplist&topRange=1w
+sorting=toplist&topRange=1M
+sorting=toplist&topRange=3M
+sorting=toplist&topRange=6M
+sorting=toplist&topRange=1y

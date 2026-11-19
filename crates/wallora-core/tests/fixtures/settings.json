@@ -1,0 +1,14 @@
+{
+  "data": {
+    "thumb_size": "orig",
+    "per_page": "24",
+    "purity": ["sfw", "sketchy"],
+    "categories": ["general", "anime", "people"],
+    "resolutions": ["1920x1080"],
+    "aspect_ratios": ["16x9"],
+    "toplist_range": "1M",
+    "tag_blacklist": [],
+    "user_blacklist": [],
+    "ai_art_filter": 1
+  }
+}

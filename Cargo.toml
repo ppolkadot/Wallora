@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/wallora-core",
+    "crates/wallora-windows",
+    "crates/wallora-app",
+    "spikes/iced-gallery",
+]
+default-members = [
+    "crates/wallora-core",
+    "crates/wallora-windows",
+    "crates/wallora-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/ppolkadot/Wallora"
+authors = ["ppolkadot"]
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[workspace.dependencies]
+directories = "6.0.0"
+dotenvy = "0.15.7"
+httpdate = "=1.0.3"
+iced = { version = "=0.14.0", features = ["tokio", "image"] }
+image = "0.25.10"
+insta = { version = "1.49.0", features = ["json"] }
+keyring = { version = "3.6.3", default-features = false, features = ["windows-native"] }
+proptest = "1.12.0"
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "json", "gzip", "stream", "http2", "charset", "system-proxy"] }
+rusqlite = { version = "0.43.0", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.149"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "fs", "io-util"] }
+tracing = "0.1.44"
+tracing-appender = "0.2.5"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+url = "2.5.8"
+uuid = { version = "1.29.3", features = ["v4"] }
+windows = "0.62.2"
+winresource = "0.1.34"
+wiremock = "0.6.5"
+zeroize = { version = "1.9.2", features = ["derive"] }

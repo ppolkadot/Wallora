@@ -1,0 +1,5 @@
+---
+source: crates/wallora-core/tests/search_serialization.rs
+expression: serialize_query_string(&query)
+---
+

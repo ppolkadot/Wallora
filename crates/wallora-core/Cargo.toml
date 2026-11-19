@@ -1,0 +1,54 @@
+[package]
+name = "wallora-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Core domain, provider, storage, and services for Wallora"
+
+[features]
+# Enables explicit test constructors and observation hooks. Never part of the app's normal
+# dependency graph.
+test-util = []
+
+[lints]
+workspace = true
+
+[dependencies]
+directories.workspace = true
+httpdate.workspace = true
+reqwest.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+dotenvy.workspace = true
+insta.workspace = true
+proptest.workspace = true
+tokio = { workspace = true, features = ["test-util", "net"] }
+tracing-subscriber.workspace = true
+wiremock.workspace = true
+
+[[test]]
+name = "provider_contract"
+required-features = ["test-util"]
+
+[[test]]
+name = "key_isolation"
+required-features = ["test-util"]
+
+[[test]]
+name = "search_serialization"
+required-features = ["test-util"]
+
+[[test]]
+name = "session"
+required-features = ["test-util"]

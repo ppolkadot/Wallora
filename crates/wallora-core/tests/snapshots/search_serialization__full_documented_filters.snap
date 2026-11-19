@@ -1,0 +1,5 @@
+---
+source: crates/wallora-core/tests/search_serialization.rs
+expression: serialize_query_string(&query)
+---
+q=%2Blandscape+-city+%40artist+id%3A42+type%3Apng+like%3Aabc123&categories=101&purity=110&sorting=toplist&order=asc&topRange=1M&atleast=1920x1080&resolutions=1920x1080%2C2560x1440&ratios=16x9%2C21x9&colors=f37316&page=3&seed=seed42xyz
