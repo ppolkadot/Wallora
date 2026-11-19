@@ -18,5 +18,8 @@ tracing-subscriber.workspace = true
 wallora-core = { path = "../wallora-core" }
 wallora-windows = { path = "../wallora-windows" }
 
+[dev-dependencies]
+tokio.workspace = true
+
 [build-dependencies]
 winresource.workspace = true

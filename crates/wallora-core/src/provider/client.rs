@@ -1,7 +1,8 @@
 use std::error::Error as StdError;
 use std::fmt;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use reqwest::StatusCode;
@@ -9,13 +10,19 @@ use tokio::sync::Semaphore;
 use url::Url;
 
 use crate::domain::{
-    CredentialStore, RequestPriority, SearchPage, SearchQuery, SessionKind, SessionScope,
-    Wallpaper, WallpaperId,
+    CollectionSummary, CredentialStore, ProxyConfig, ProxyError, RequestPriority, SearchPage,
+    SearchQuery, SecretString, SessionKind, SessionScope, UserSettings, Wallpaper, WallpaperId,
+    validate_username,
 };
 use crate::provider::Provider;
-use crate::provider::api::{decode_search_response, decode_wallpaper_response, parse_retry_after};
+use crate::provider::api::{
+    decode_collections_response, decode_search_response, decode_user_settings_response,
+    decode_wallpaper_response, parse_retry_after,
+};
 use crate::provider::error::ProviderError;
-use crate::provider::origin::{ImageOriginPolicy, OriginPolicy, authorize, same_origin};
+use crate::provider::origin::{
+    ImageOriginPolicy, OriginPolicy, authorize, authorize_secret, same_origin,
+};
 use crate::provider::pacer::{ApiPacer, AttemptOutcome};
 
 pub const WALLHAVEN_API_BASE: &str = "https://wallhaven.cc/api/v1";
@@ -90,6 +97,8 @@ pub struct WallhavenClientConfig {
     pub(crate) image_total_timeout_override: Option<Duration>,
     /// Test configurations must not inherit a developer machine's system proxy.
     pub(crate) use_system_proxy: bool,
+    /// Initial proxy preference applied to both API and image clients.
+    pub proxy: ProxyConfig,
 }
 
 impl WallhavenClientConfig {
@@ -104,7 +113,13 @@ impl WallhavenClientConfig {
             #[cfg(any(test, feature = "test-util"))]
             image_total_timeout_override: None,
             use_system_proxy: true,
+            proxy: ProxyConfig::System,
         }
+    }
+
+    pub fn with_proxy(mut self, proxy: ProxyConfig) -> Self {
+        self.proxy = proxy;
+        self
     }
 
     /// Builds a fully sandboxed loopback configuration. Image fetches are rejected until
@@ -121,6 +136,7 @@ impl WallhavenClientConfig {
             image_origin: ImageOriginPolicy::Disabled,
             image_total_timeout_override: None,
             use_system_proxy: false,
+            proxy: ProxyConfig::System,
         })
     }
 
@@ -139,13 +155,94 @@ impl WallhavenClientConfig {
     }
 }
 
-struct WallhavenClientInner {
+struct HttpTransport {
     api_client: reqwest::Client,
     image_client: reqwest::Client,
+    proxy: ProxyConfig,
+}
+
+fn build_http_transport(
+    config: &WallhavenClientConfig,
+    proxy: &ProxyConfig,
+) -> Result<HttpTransport, ProxyError> {
+    let normalized = proxy.normalized()?;
+
+    let mut api_builder = reqwest::Client::builder()
+        .user_agent(WALLORA_USER_AGENT)
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .connect_timeout(config.connect_timeout)
+        .timeout(config.request_timeout);
+
+    let mut image_builder = reqwest::Client::builder()
+        .user_agent(WALLORA_USER_AGENT)
+        .referer(false)
+        .connect_timeout(config.connect_timeout)
+        .read_timeout(config.image_read_timeout);
+
+    match &normalized {
+        ProxyConfig::System => {
+            if !config.use_system_proxy {
+                api_builder = api_builder.no_proxy();
+                image_builder = image_builder.no_proxy();
+            }
+        }
+        ProxyConfig::Direct => {
+            api_builder = api_builder.no_proxy();
+            image_builder = image_builder.no_proxy();
+        }
+        ProxyConfig::Manual(proxy_url) => {
+            let api_proxy =
+                reqwest::Proxy::all(proxy_url).map_err(|_| ProxyError::TransportBuildFailed)?;
+            let image_proxy =
+                reqwest::Proxy::all(proxy_url).map_err(|_| ProxyError::TransportBuildFailed)?;
+            api_builder = api_builder.no_proxy().proxy(api_proxy);
+            image_builder = image_builder.no_proxy().proxy(image_proxy);
+        }
+    }
+
+    let image_origin = config.image_origin.clone();
+    image_builder = image_builder.redirect(reqwest::redirect::Policy::custom(move |attempt| {
+        if attempt.previous().len() > 5 {
+            return attempt.error(CrossOriginRedirectError);
+        }
+        let Some(initial) = attempt.previous().first() else {
+            return attempt.error(CrossOriginRedirectError);
+        };
+        if !image_origin.is_authorized_image_url(attempt.url())
+            || !same_origin(initial, attempt.url())
+        {
+            return attempt.error(CrossOriginRedirectError);
+        }
+        attempt.follow()
+    }));
+
+    let api_client = api_builder
+        .build()
+        .map_err(|_| ProxyError::TransportBuildFailed)?;
+    let image_client = image_builder
+        .build()
+        .map_err(|_| ProxyError::TransportBuildFailed)?;
+
+    Ok(HttpTransport {
+        api_client,
+        image_client,
+        proxy: normalized,
+    })
+}
+
+enum RequestAuth {
+    Scope(SessionScope),
+    EphemeralKey { key: SecretString, probe_id: u64 },
+}
+
+struct WallhavenClientInner {
+    transport: RwLock<HttpTransport>,
     image_sem: Semaphore,
     pacer: ApiPacer,
     credentials: Arc<dyn CredentialStore>,
     config: WallhavenClientConfig,
+    next_probe_id: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -162,53 +259,44 @@ impl WallhavenClient {
         credentials: Arc<dyn CredentialStore>,
         config: WallhavenClientConfig,
     ) -> Result<Self, ProviderError> {
-        let mut api_builder = reqwest::Client::builder()
-            .user_agent(WALLORA_USER_AGENT)
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .connect_timeout(config.connect_timeout)
-            .timeout(config.request_timeout);
-
-        let mut image_builder = reqwest::Client::builder()
-            .user_agent(WALLORA_USER_AGENT)
-            .referer(false)
-            .connect_timeout(config.connect_timeout)
-            .read_timeout(config.image_read_timeout);
-
-        if !config.use_system_proxy {
-            api_builder = api_builder.no_proxy();
-            image_builder = image_builder.no_proxy();
-        }
-
-        let image_origin = config.image_origin.clone();
-        image_builder = image_builder.redirect(reqwest::redirect::Policy::custom(move |attempt| {
-            if attempt.previous().len() > 5 {
-                return attempt.error(CrossOriginRedirectError);
-            }
-            let Some(initial) = attempt.previous().first() else {
-                return attempt.error(CrossOriginRedirectError);
-            };
-            if !image_origin.is_authorized_image_url(attempt.url())
-                || !same_origin(initial, attempt.url())
-            {
-                return attempt.error(CrossOriginRedirectError);
-            }
-            attempt.follow()
-        }));
-
-        let api_client = api_builder.build().map_err(|_| ProviderError::Network)?;
-        let image_client = image_builder.build().map_err(|_| ProviderError::Network)?;
+        let transport =
+            build_http_transport(&config, &config.proxy).map_err(|_| ProviderError::Network)?;
 
         Ok(Self {
             inner: Arc::new(WallhavenClientInner {
-                api_client,
-                image_client,
+                transport: RwLock::new(transport),
                 image_sem: Semaphore::new(IMAGE_IN_FLIGHT_CAP),
                 pacer: ApiPacer::new(),
                 credentials,
                 config,
+                next_probe_id: AtomicU64::new(1),
             }),
         })
+    }
+
+    /// Updates the proxy configuration on this single client instance in place without creating
+    /// a second `ApiPacer`, keeping rolling rate-limit budgets, spacing, cooldowns, and image
+    /// concurrency caps intact.
+    pub fn set_proxy(&self, proxy: ProxyConfig) -> Result<ProxyConfig, ProxyError> {
+        let new_transport = build_http_transport(&self.inner.config, &proxy)?;
+        let applied = new_transport.proxy.clone();
+        let mut guard = self
+            .inner
+            .transport
+            .write()
+            .map_err(|_| ProxyError::TransportBuildFailed)?;
+        *guard = new_transport;
+        tracing::info!(mode = applied.mode_str(), "updated HTTP proxy transport");
+        Ok(applied)
+    }
+
+    /// Returns the currently active proxy configuration on this client.
+    pub fn proxy(&self) -> ProxyConfig {
+        self.inner
+            .transport
+            .read()
+            .map(|guard| guard.proxy.clone())
+            .unwrap_or_default()
     }
 
     /// Observes the shared API cooldown for tests. Gated behind `test-util`.
@@ -259,7 +347,8 @@ impl WallhavenClient {
     }
 
     async fn fetch_image_body(&self, url: &Url, limit: usize) -> Result<Vec<u8>, ProviderError> {
-        let resp = match self.inner.image_client.get(url.clone()).send().await {
+        let image_client = self.inner.image_client()?;
+        let resp = match image_client.get(url.clone()).send().await {
             Ok(resp) => resp,
             Err(err) => return Err(map_image_transport_error(&err)),
         };
@@ -311,6 +400,20 @@ fn map_image_transport_error(err: &reqwest::Error) -> ProviderError {
 }
 
 impl WallhavenClientInner {
+    fn api_client(&self) -> Result<reqwest::Client, ProviderError> {
+        self.transport
+            .read()
+            .map(|guard| guard.api_client.clone())
+            .map_err(|_| ProviderError::Network)
+    }
+
+    fn image_client(&self) -> Result<reqwest::Client, ProviderError> {
+        self.transport
+            .read()
+            .map(|guard| guard.image_client.clone())
+            .map_err(|_| ProviderError::Network)
+    }
+
     fn image_total_timeout(&self, class: ImageClass) -> Duration {
         #[cfg(any(test, feature = "test-util"))]
         if let Some(timeout) = self.config.image_total_timeout_override {
@@ -336,7 +439,7 @@ impl WallhavenClientInner {
     async fn execute_paced_get(
         inner: Arc<WallhavenClientInner>,
         url: Url,
-        scope: SessionScope,
+        auth: RequestAuth,
         priority: RequestPriority,
     ) -> Result<Vec<u8>, ProviderError> {
         if !inner.config.origin_policy.is_authorized_api_url(&url) {
@@ -345,37 +448,49 @@ impl WallhavenClientInner {
         }
 
         let serialized = url.as_str().to_string();
-        let coalesce_key = match &scope.kind {
-            SessionKind::Guest => format!("guest:{}:{serialized}", scope.generation),
-            SessionKind::Account(id) => format!(
-                "account:{}:{}:{}:{serialized}",
-                id.as_str().len(),
-                id.as_str(),
-                scope.generation
-            ),
+        let coalesce_key = match &auth {
+            RequestAuth::Scope(scope) => match &scope.kind {
+                SessionKind::Guest => format!("guest:{}:{serialized}", scope.generation),
+                SessionKind::Account(id) => format!(
+                    "account:{}:{}:{}:{serialized}",
+                    id.as_str().len(),
+                    id.as_str(),
+                    scope.generation
+                ),
+            },
+            RequestAuth::EphemeralKey { probe_id, .. } => {
+                // Never include the secret key in coalesce keys.
+                format!("ephemeral:{probe_id}:{serialized}")
+            }
         };
 
+        let auth = Arc::new(auth);
         let pacer = inner.pacer.clone();
         pacer
             .run(coalesce_key, priority, move || {
                 let inner = Arc::clone(&inner);
                 let url = url.clone();
-                let scope = scope.clone();
+                let auth = Arc::clone(&auth);
                 async move {
-                    let mut req = inner
-                        .api_client
+                    let api_client = inner.api_client()?;
+                    let mut req = api_client
                         .get(url)
                         .build()
                         .map_err(|_| ProviderError::Network)?;
 
-                    authorize(
-                        &mut req,
-                        &scope,
-                        inner.credentials.as_ref(),
-                        &inner.config.origin_policy,
-                    )?;
+                    match auth.as_ref() {
+                        RequestAuth::Scope(scope) => authorize(
+                            &mut req,
+                            scope,
+                            inner.credentials.as_ref(),
+                            &inner.config.origin_policy,
+                        )?,
+                        RequestAuth::EphemeralKey { key, .. } => {
+                            authorize_secret(&mut req, key, &inner.config.origin_policy)?
+                        }
+                    }
 
-                    let resp = match inner.api_client.execute(req).await {
+                    let resp = match api_client.execute(req).await {
                         Ok(resp) => resp,
                         Err(err) => {
                             let mapped = if err.is_timeout() {
@@ -469,8 +584,13 @@ impl Provider for WallhavenClient {
                     query_mut.append_pair(k, &v);
                 }
             }
-            let bytes =
-                WallhavenClientInner::execute_paced_get(inner, url, scope, q.priority).await?;
+            let bytes = WallhavenClientInner::execute_paced_get(
+                inner,
+                url,
+                RequestAuth::Scope(scope),
+                q.priority,
+            )
+            .await?;
             decode_search_response(&bytes)
         }
     }
@@ -489,11 +609,112 @@ impl Provider for WallhavenClient {
             let bytes = WallhavenClientInner::execute_paced_get(
                 inner,
                 url,
-                scope,
+                RequestAuth::Scope(scope),
                 RequestPriority::Interactive,
             )
             .await?;
             decode_wallpaper_response(&bytes)
+        }
+    }
+
+    fn user_settings(
+        &self,
+        scope: SessionScope,
+    ) -> impl Future<Output = Result<UserSettings, ProviderError>> + Send + 'static {
+        let inner = Arc::clone(&self.inner);
+        async move {
+            let url = inner.build_api_url(&["settings"])?;
+            let bytes = WallhavenClientInner::execute_paced_get(
+                inner,
+                url,
+                RequestAuth::Scope(scope),
+                RequestPriority::Interactive,
+            )
+            .await?;
+            decode_user_settings_response(&bytes)
+        }
+    }
+
+    fn own_collections(
+        &self,
+        scope: SessionScope,
+    ) -> impl Future<Output = Result<Vec<CollectionSummary>, ProviderError>> + Send + 'static {
+        let inner = Arc::clone(&self.inner);
+        async move {
+            let url = inner.build_api_url(&["collections"])?;
+            let bytes = WallhavenClientInner::execute_paced_get(
+                inner,
+                url,
+                RequestAuth::Scope(scope),
+                RequestPriority::Interactive,
+            )
+            .await?;
+            decode_collections_response(&bytes)
+        }
+    }
+
+    fn public_collections(
+        &self,
+        username: String,
+        generation: u64,
+    ) -> impl Future<Output = Result<Vec<CollectionSummary>, ProviderError>> + Send + 'static {
+        let inner = Arc::clone(&self.inner);
+        async move {
+            let clean = validate_username(&username).map_err(|_| ProviderError::NotFound)?;
+            let url = inner.build_api_url(&["collections", &clean])?;
+            // Public identity lookup MUST always remain unkeyed (Guest scope).
+            let bytes = WallhavenClientInner::execute_paced_get(
+                inner,
+                url,
+                RequestAuth::Scope(SessionScope::guest(generation)),
+                RequestPriority::Interactive,
+            )
+            .await?;
+            decode_collections_response(&bytes)
+        }
+    }
+
+    fn user_settings_with_key(
+        &self,
+        api_key: SecretString,
+    ) -> impl Future<Output = Result<UserSettings, ProviderError>> + Send + 'static {
+        let inner = Arc::clone(&self.inner);
+        async move {
+            let url = inner.build_api_url(&["settings"])?;
+            let probe_id = inner.next_probe_id.fetch_add(1, Ordering::Relaxed);
+            let bytes = WallhavenClientInner::execute_paced_get(
+                inner,
+                url,
+                RequestAuth::EphemeralKey {
+                    key: api_key,
+                    probe_id,
+                },
+                RequestPriority::Interactive,
+            )
+            .await?;
+            decode_user_settings_response(&bytes)
+        }
+    }
+
+    fn own_collections_with_key(
+        &self,
+        api_key: SecretString,
+    ) -> impl Future<Output = Result<Vec<CollectionSummary>, ProviderError>> + Send + 'static {
+        let inner = Arc::clone(&self.inner);
+        async move {
+            let url = inner.build_api_url(&["collections"])?;
+            let probe_id = inner.next_probe_id.fetch_add(1, Ordering::Relaxed);
+            let bytes = WallhavenClientInner::execute_paced_get(
+                inner,
+                url,
+                RequestAuth::EphemeralKey {
+                    key: api_key,
+                    probe_id,
+                },
+                RequestPriority::Interactive,
+            )
+            .await?;
+            decode_collections_response(&bytes)
         }
     }
 }

@@ -14,9 +14,16 @@ unsafe_code = "allow"
 all = { level = "warn", priority = -1 }
 
 [dependencies]
+keyring.workspace = true
+url.workspace = true
+wallora-core = { path = "../wallora-core" }
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_System_ProcessStatus",
     "Win32_System_Threading",
+    "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[dev-dependencies]
+uuid.workspace = true

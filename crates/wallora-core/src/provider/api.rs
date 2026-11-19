@@ -2,7 +2,7 @@ use std::time::{Duration, SystemTime};
 
 use serde::Deserialize;
 
-use crate::domain::{SearchPage, Wallpaper};
+use crate::domain::{CollectionSummary, SearchPage, UserSettings, Wallpaper};
 use crate::provider::error::ProviderError;
 
 /// Hard upper bound applied to any upstream `Retry-After` value, in seconds or date form.
@@ -25,6 +25,22 @@ pub fn decode_search_response(bytes: &[u8]) -> Result<SearchPage, ProviderError>
     serde_json::from_slice::<SearchPage>(bytes).map_err(|_| ProviderError::Decode {
         context: "search page response".to_string(),
     })
+}
+
+pub fn decode_user_settings_response(bytes: &[u8]) -> Result<UserSettings, ProviderError> {
+    let envelope: DataEnvelope<UserSettings> =
+        serde_json::from_slice(bytes).map_err(|_| ProviderError::Decode {
+            context: "user settings response".to_string(),
+        })?;
+    Ok(envelope.data)
+}
+
+pub fn decode_collections_response(bytes: &[u8]) -> Result<Vec<CollectionSummary>, ProviderError> {
+    let envelope: DataEnvelope<Vec<CollectionSummary>> =
+        serde_json::from_slice(bytes).map_err(|_| ProviderError::Decode {
+            context: "collections response".to_string(),
+        })?;
+    Ok(envelope.data)
 }
 
 /// Parses an upstream `Retry-After` header: either delta-seconds or any of the three

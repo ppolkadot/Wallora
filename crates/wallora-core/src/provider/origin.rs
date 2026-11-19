@@ -3,7 +3,7 @@ use reqwest::header::{HeaderName, HeaderValue};
 use url::Host;
 use url::Url;
 
-use crate::domain::{CredentialStore, SessionKind, SessionScope};
+use crate::domain::{CredentialStore, SecretString, SessionKind, SessionScope};
 use crate::provider::error::ProviderError;
 
 const X_API_KEY_HEADER: HeaderName = HeaderName::from_static("x-api-key");
@@ -149,10 +149,36 @@ impl ImageOriginPolicy {
     }
 }
 
+/// Attaches `X-API-Key` using an explicit `SecretString` ONLY if `req.url()` passes `policy`.
+///
+/// Used by both [`authorize`] (for stored account credentials) and sign-in validation probes
+/// before credentials are persisted.
+pub fn authorize_secret(
+    req: &mut reqwest::Request,
+    secret: &SecretString,
+    policy: &OriginPolicy,
+) -> Result<(), ProviderError> {
+    req.headers_mut().remove(&X_API_KEY_HEADER);
+
+    if !policy.is_authorized_api_url(req.url()) {
+        return Err(ProviderError::OriginRejected);
+    }
+
+    if secret.is_empty() {
+        return Err(ProviderError::Unauthorized);
+    }
+
+    let mut value =
+        HeaderValue::from_str(secret.expose_secret()).map_err(|_| ProviderError::Unauthorized)?;
+    value.set_sensitive(true);
+    req.headers_mut().insert(X_API_KEY_HEADER, value);
+    Ok(())
+}
+
 /// Attaches `X-API-Key` for authenticated scopes ONLY if `req.url()` passes `policy`.
 ///
 /// The key is loaded per attempt, converted once into a sensitive header value, and the loaded
-/// secret is released (and zeroized on drop) before the header is attached.
+/// secret is released (and zeroized on drop) before returning.
 pub fn authorize(
     req: &mut reqwest::Request,
     scope: &SessionScope,
@@ -168,21 +194,11 @@ pub fn authorize(
     match &scope.kind {
         SessionKind::Guest => Ok(()),
         SessionKind::Account(account_id) => {
-            let value = {
-                let secret = credentials
-                    .load(account_id)
-                    .map_err(|_| ProviderError::Unauthorized)?
-                    .ok_or(ProviderError::Unauthorized)?;
-                if secret.is_empty() {
-                    return Err(ProviderError::Unauthorized);
-                }
-                let mut value = HeaderValue::from_str(secret.expose_secret())
-                    .map_err(|_| ProviderError::Unauthorized)?;
-                value.set_sensitive(true);
-                value
-            };
-            req.headers_mut().insert(X_API_KEY_HEADER, value);
-            Ok(())
+            let secret = credentials
+                .load(account_id)
+                .map_err(|_| ProviderError::Unauthorized)?
+                .ok_or(ProviderError::Unauthorized)?;
+            authorize_secret(req, &secret, policy)
         }
     }
 }

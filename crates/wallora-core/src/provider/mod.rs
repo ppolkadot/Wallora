@@ -8,19 +8,24 @@ pub mod pacer;
 
 use std::future::Future;
 
-use crate::domain::{SearchPage, SearchQuery, SessionScope, Wallpaper, WallpaperId};
+use crate::domain::{
+    CollectionSummary, SearchPage, SearchQuery, SecretString, SessionScope, UserSettings,
+    Wallpaper, WallpaperId,
+};
 
 pub use client::{
     IMAGE_IN_FLIGHT_CAP, ImageClass, WALLHAVEN_API_BASE, WALLORA_USER_AGENT, WallhavenClient,
     WallhavenClientConfig,
 };
 pub use error::ProviderError;
-pub use origin::{OriginPolicy, authorize, same_origin};
+pub use origin::{OriginPolicy, authorize, authorize_secret, same_origin};
 pub use pacer::ApiPacer;
 
 /// Provider abstraction consumed by GUI/services.
 ///
-/// Task 2 exposes only `search` and `wallpaper`; later tasks add account/tag/collection methods.
+/// Task 2 exposes `search` and `wallpaper`; Task 3 adds `user_settings`, `own_collections`,
+/// unkeyed public collection lookup for username verification, and candidate-key sign-in probes
+/// routed through the same pacer and origin policy.
 pub trait Provider: Send + Sync + 'static {
     fn search(
         &self,
@@ -33,4 +38,36 @@ pub trait Provider: Send + Sync + 'static {
         id: WallpaperId,
         scope: SessionScope,
     ) -> impl Future<Output = Result<Wallpaper, ProviderError>> + Send + 'static;
+
+    fn user_settings(
+        &self,
+        scope: SessionScope,
+    ) -> impl Future<Output = Result<UserSettings, ProviderError>> + Send + 'static;
+
+    fn own_collections(
+        &self,
+        scope: SessionScope,
+    ) -> impl Future<Output = Result<Vec<CollectionSummary>, ProviderError>> + Send + 'static;
+
+    /// Unkeyed lookup of a user's public collections (`GET /api/v1/collections/{username}`),
+    /// used for username verification during sign-in and re-verification.
+    fn public_collections(
+        &self,
+        username: String,
+        generation: u64,
+    ) -> impl Future<Output = Result<Vec<CollectionSummary>, ProviderError>> + Send + 'static;
+
+    /// Keyed `GET /api/v1/settings` using a candidate API key during sign-in, before writing
+    /// anything to `CredentialStore` or SQLite.
+    fn user_settings_with_key(
+        &self,
+        api_key: SecretString,
+    ) -> impl Future<Output = Result<UserSettings, ProviderError>> + Send + 'static;
+
+    /// Keyed `GET /api/v1/collections` using a candidate API key during sign-in, before writing
+    /// anything to `CredentialStore` or SQLite.
+    fn own_collections_with_key(
+        &self,
+        api_key: SecretString,
+    ) -> impl Future<Output = Result<Vec<CollectionSummary>, ProviderError>> + Send + 'static;
 }

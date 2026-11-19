@@ -67,6 +67,11 @@ impl AppPaths {
         }
         Ok(())
     }
+
+    /// SQLite database path under `%LOCALAPPDATA%\Wallora\data\wallora.db`.
+    pub fn db_path(&self) -> PathBuf {
+        self.data_dir.join("wallora.db")
+    }
 }
 
 fn create_dir_all(path: &Path) -> Result<(), PathError> {

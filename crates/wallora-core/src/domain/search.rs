@@ -128,6 +128,19 @@ impl TopRange {
             Self::OneYear => "1y",
         }
     }
+
+    pub fn from_api_str(raw: &str) -> Option<Self> {
+        match raw.trim() {
+            "1d" => Some(Self::OneDay),
+            "3d" => Some(Self::ThreeDays),
+            "1w" => Some(Self::OneWeek),
+            "1M" => Some(Self::OneMonth),
+            "3M" => Some(Self::ThreeMonths),
+            "6M" => Some(Self::SixMonths),
+            "1y" => Some(Self::OneYear),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -139,6 +152,19 @@ pub struct Dimensions {
 impl Dimensions {
     pub fn new(width: u32, height: u32) -> Self {
         Self { width, height }
+    }
+
+    pub fn parse_wxh(raw: &str) -> Option<Self> {
+        let trimmed = raw.trim();
+        let (w, h) = trimmed
+            .split_once('x')
+            .or_else(|| trimmed.split_once('X'))?;
+        let width: u32 = w.parse().ok()?;
+        let height: u32 = h.parse().ok()?;
+        if width == 0 || height == 0 {
+            return None;
+        }
+        Some(Self { width, height })
     }
 }
 
@@ -266,7 +292,7 @@ pub enum QueryEcho {
 ///
 /// The recorded `/settings` response renders `per_page` as a string while search responses use a
 /// number; both shapes are accepted defensively. Serialization always emits a number.
-fn deserialize_per_page<'de, D>(deserializer: D) -> Result<u32, D::Error>
+pub(crate) fn deserialize_per_page<'de, D>(deserializer: D) -> Result<u32, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
