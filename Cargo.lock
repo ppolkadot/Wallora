@@ -5081,6 +5081,7 @@ dependencies = [
  "directories",
  "dotenvy",
  "httpdate",
+ "image",
  "insta",
  "proptest",
  "reqwest",
