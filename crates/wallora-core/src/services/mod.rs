@@ -1,7 +1,18 @@
 //! Application services built on top of core domain, provider, and storage contracts.
 
+pub mod cache;
 pub mod image_guard;
 pub mod session;
+
+pub use cache::{
+    CacheByteStream, CacheChunkFuture, CacheClock, CacheConfig, CacheConnectivity, CacheDirEntry,
+    CacheEntryKey, CacheError, CacheFs, CacheIndex, CacheIndexSnapshot, CacheIoReadError, CacheKey,
+    CacheLockError, CacheLockGuard, CacheLookup, CacheNamespace, CachePutResult,
+    CacheScopeTransition, CacheSourceError, CacheStats, CacheStore, CancelToken,
+    DEFAULT_CACHE_CAP_BYTES, HARD_MAX_CACHE_CAP_BYTES, PendingDeleteRecord, PublishedEntryRecord,
+    RealCacheFs, SessionCacheSink, SqliteCacheIndex, StagingWriter, SystemCacheClock,
+    WATCHDOG_TIMEOUT, validate_cache_cap,
+};
 
 pub use image_guard::{
     DEFAULT_DECODED_BYTES_BUDGET, DecodedImage, ImageBudget, ImageGuard, ImageGuardConfig,
