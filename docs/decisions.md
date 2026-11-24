@@ -14,7 +14,7 @@
 
 ## 2. GUI Toolkit Spike (`spikes/iced-gallery`) — Task 1d
 
-- **Decision status:** **Deferred by the owner on 2026-11-19.** `iced = "=0.14.0"` remains provisional. Finish the hardware checks before committing to the gallery toolkit in Task 5. Task 3 can use the provisional shell after its other entry gates pass.
+- **Decision status:** **Settled by the owner on 2026-11-23: Iced is mandatory** (see §4). It was deferred on 2026-11-19 pending hardware checks; §5 now scopes those checks to the reference machine. `iced = "=0.14.0"` stays pinned.
 
 ### Reference Machine Used for Automated Run (2026-11-18)
 
@@ -78,3 +78,29 @@ Based on `https://wallhaven.cc/help/api` and the API and guest website observati
 - **(C) Pursue upstream authorization / partnership** for specific gaps in parallel with **(B)** — Optional, never a launch dependency.
 
 **Owner decision (2026-11-19): Option A.** Wallora 1.0 means *complete for supported routes*. Document each gap and provide a labelled external-browser hand-off (`Open on wallhaven.cc`) where applicable. The Task 1c inventory and Task 7 release checks remain required.
+
+---
+
+## 4. GUI Toolkit — Iced is mandatory
+
+> **Status: Owner decision, 2026-11-23.**
+
+Wallora's GUI toolkit is **Iced** (`iced = "=0.14.0"`). The Slint fallback in plan Task 1d is **not pursued**, including after the recorded p95 frame-time miss in §2. Task 5 builds its gallery on Iced. Performance work, if needed, happens inside Iced (renderer choice, tile virtualization, layout cost) and is measured against the §2 method. Accessibility gaps in Iced stay documented limitations (plan Task 1d), not fallback triggers.
+
+## 5. Hardware verification scope
+
+> **Status: Owner decision, 2026-11-23.**
+
+Hardware-dependent checks (frame timing, DPI 100/150/200%, live resize, Narrator, MSI install/upgrade/uninstall walkthroughs) run **only on the §2 reference machine** (i5-12400F, GeForce GT 340, 1440×900, Windows 11 Pro 10.0.26200). Results are valid for that machine only, and release notes must not claim wider hardware coverage. The GT 340 has no DX12/Vulkan hardware path, so `wgpu` runs on software fallback there. Consequence: the "GPU required" limitation in plan Task 1d is recorded for that machine, and Windows 10 coverage in Task 7 stays unverified until a machine is available (it is documented as such, not assumed).
+
+## 6. Font licensing — Salted Flutters Polaris
+
+> **Status: Owner statement recorded 2026-11-23; licence text checked the same day.**
+
+The owner describes the font as MIT-licensed. The `LICENSE.txt` in `ppolkadot/Salted-Flutters-Polaris` is actually a **custom permissive licence** ("Salted Flutters Polaris Font License", version 1.0, 4 November 2026), not MIT. GitHub lists it as "Other". It permits embedding in applications and redistribution, including commercial use, subject to these conditions:
+
+1. Redistributed font files must ship with an unmodified copy of that licence as `LICENSE.txt`.
+2. The metadata line `Salted Flutters Polaris - Created by ppoolar` must remain in every style.
+3. The font may not be sold or bundled for its own value. Modified versions must use the same licence and must not use the family name as their primary name.
+
+Bundling in `crates/wallora-app` is therefore **cleared, with those conditions**, and they are mirrored in `THIRD_PARTY.md`. The owner may relicense the font under MIT or add an MIT grant; if so, update this section and `THIRD_PARTY.md`. Google Sans is not needed. System-font fallback stays in place.
