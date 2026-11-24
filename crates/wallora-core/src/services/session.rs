@@ -10,6 +10,7 @@ use crate::domain::{
     SessionScope, UserSettings, UsernameVerification, validate_username,
 };
 use crate::provider::{Provider, ProviderError, WallhavenClient};
+use crate::services::cache::{CacheScopeTransition, NoopSessionCacheSink, SessionCacheSink};
 use crate::storage::{AccountCachedState, SessionStorage, StorageError};
 
 fn unix_now() -> i64 {
@@ -323,6 +324,7 @@ pub enum ProxyUpdateError {
 pub struct SessionManager {
     storage: Arc<dyn SessionStorage>,
     credentials: Arc<dyn CredentialStore>,
+    cache_sink: Arc<dyn SessionCacheSink>,
     scope: SessionScope,
     accounts: Vec<AccountRecord>,
     active_account: Option<AccountRecord>,
@@ -341,7 +343,18 @@ impl SessionManager {
         storage: Arc<dyn SessionStorage>,
         credentials: Arc<dyn CredentialStore>,
     ) -> Self {
+        Self::restore_with_cache(storage, credentials, Arc::new(NoopSessionCacheSink))
+    }
+
+    /// Restores saved local preferences and active session while wiring non-blocking
+    /// image-cache scope transitions and purges to `cache_sink`.
+    pub fn restore_with_cache(
+        storage: Arc<dyn SessionStorage>,
+        credentials: Arc<dyn CredentialStore>,
+        cache_sink: Arc<dyn SessionCacheSink>,
+    ) -> Self {
         let mut notice = None;
+        let mut purged_on_restore: Vec<AccountId> = Vec::new();
 
         let local_preferences = match storage.load_local_preferences() {
             Ok(prefs) => prefs,
@@ -358,6 +371,7 @@ impl SessionManager {
                 let mut cleanup_failed = false;
                 for id in pending {
                     cleanup_failed |= !Self::clean_account(&*storage, &*credentials, &id);
+                    purged_on_restore.push(id);
                 }
                 if cleanup_failed {
                     notice = Some(Self::pending_cleanup_notice());
@@ -386,6 +400,7 @@ impl SessionManager {
                     if let Err(err) = storage.set_active_account(None) {
                         tracing::warn!(%err, "could not purge cache for missing credential");
                     }
+                    purged_on_restore.push(candidate.id);
                     notice = Some(SessionNotice::warning(
                         "Stored API key is missing from Windows Credential Manager. Sign in again.",
                     ));
@@ -398,6 +413,14 @@ impl SessionManager {
             }
         }
 
+        for id in purged_on_restore {
+            cache_sink.on_purge_account(&id);
+        }
+        cache_sink.on_scope_transition(CacheScopeTransition {
+            new_scope: scope.clone(),
+            purge_account: None,
+        });
+
         accounts = accounts
             .into_iter()
             .map(require_fresh_verification)
@@ -405,6 +428,7 @@ impl SessionManager {
         Self {
             storage,
             credentials,
+            cache_sink,
             scope,
             accounts,
             active_account,
@@ -520,8 +544,17 @@ impl SessionManager {
             return Err(SignInError::Storage);
         }
 
+        let outgoing_account = self
+            .scope
+            .account_id()
+            .filter(|id| *id != &account_id)
+            .cloned();
         self.scope =
             SessionScope::account(account_id.clone(), self.scope.generation.saturating_add(1));
+        self.cache_sink.on_scope_transition(CacheScopeTransition {
+            new_scope: self.scope.clone(),
+            purge_account: outgoing_account,
+        });
         self.active_account = Some(record);
         self.user_settings = probe.user_settings;
         self.own_collections = probe.own_collections;
@@ -591,6 +624,12 @@ impl SessionManager {
         {
             let notice = self.revoke_active_account(&account_id);
             return RefreshOutcome::KeyRevoked(notice);
+        }
+
+        if matches!(payload.user_settings, Err(ProviderError::Forbidden))
+            || matches!(payload.own_collections, Err(ProviderError::Forbidden))
+        {
+            self.cache_sink.on_purge_account(&account_id);
         }
 
         let mut warning: Option<SessionNotice> = None;
@@ -778,6 +817,10 @@ impl SessionManager {
         };
         let notice = SessionNotice::error(message);
         self.notice = Some(notice.clone());
+        self.cache_sink.on_scope_transition(CacheScopeTransition {
+            new_scope: self.scope.clone(),
+            purge_account: Some(account_id.clone()),
+        });
         notice
     }
 
@@ -793,8 +836,20 @@ impl SessionManager {
         };
 
         let (logged_out_account, warning) = match self.retire_account(&account_id) {
-            Ok(true) => (Some(account_id), None),
-            Ok(false) => (Some(account_id), Some(Self::pending_cleanup_notice())),
+            Ok(true) => {
+                self.cache_sink.on_scope_transition(CacheScopeTransition {
+                    new_scope: self.scope.clone(),
+                    purge_account: Some(account_id.clone()),
+                });
+                (Some(account_id), None)
+            }
+            Ok(false) => {
+                self.cache_sink.on_scope_transition(CacheScopeTransition {
+                    new_scope: self.scope.clone(),
+                    purge_account: Some(account_id.clone()),
+                });
+                (Some(account_id), Some(Self::pending_cleanup_notice()))
+            }
             Err(_) => (
                 None,
                 Some(SessionNotice::error(
@@ -843,6 +898,10 @@ impl SessionManager {
 
         self.scope =
             SessionScope::account(target_id.clone(), self.scope.generation.saturating_add(1));
+        self.cache_sink.on_scope_transition(CacheScopeTransition {
+            new_scope: self.scope.clone(),
+            purge_account: previous_account.clone(),
+        });
         self.user_settings = None;
         self.own_collections = None;
 
@@ -877,6 +936,10 @@ impl SessionManager {
 
         self.storage.set_active_account(None)?;
         self.clear_account_views();
+        self.cache_sink.on_scope_transition(CacheScopeTransition {
+            new_scope: self.scope.clone(),
+            purge_account: previous,
+        });
         if let Ok(list) = self.storage.list_accounts() {
             self.accounts = list.into_iter().map(require_fresh_verification).collect();
         }

@@ -1,18 +1,26 @@
+use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
-use tokio::sync::{Notify, mpsc, oneshot, watch};
-use wallora_core::domain::SessionScope;
-use wallora_core::provider::ImageClass;
-use wallora_core::services::cache::{
-    CacheByteStream, CacheChunkFuture, CacheClock, CacheConfig, CacheDirEntry, CacheEntryKey,
-    CacheError, CacheFs, CacheIndex, CacheIndexSnapshot, CacheIoReadError, CacheKey,
-    CacheLockError, CacheLockGuard, CacheLookup, CacheSourceError, CacheStore,
-    DEFAULT_CACHE_CAP_BYTES, HARD_MAX_CACHE_CAP_BYTES, PendingDeleteRecord, PublishedEntryRecord,
-    RealCacheFs, SqliteCacheIndex, StagingWriter,
+use tokio::sync::{mpsc, oneshot, watch};
+use wallora_core::domain::{
+    AccountId, CollectionSummary, CredentialStore, InMemoryCredentialStore, SecretString,
+    SessionScope, UsernameVerification,
 };
+use wallora_core::provider::{ImageClass, ProviderError};
+use wallora_core::services::cache::{
+    CacheByteStream, CacheChunkFuture, CacheClock, CacheConfig, CacheConnectivity, CacheDirEntry,
+    CacheEntryKey, CacheError, CacheFs, CacheIndex, CacheIndexSnapshot, CacheIoReadError, CacheKey,
+    CacheLockError, CacheLockGuard, CacheLookup, CacheScopeTransition, CacheSourceError,
+    CacheStore, DEFAULT_CACHE_CAP_BYTES, HARD_MAX_CACHE_CAP_BYTES, PendingDeleteRecord,
+    PublishedEntryRecord, RealCacheFs, SessionCacheSink, SqliteCacheIndex, StagingWriter,
+    WATCHDOG_TIMEOUT,
+};
+use wallora_core::services::{AccountRefreshPayload, SessionManager, SignInProbe};
+use wallora_core::storage::{SessionStorage, SqliteStore};
 
 struct TempCacheDir(PathBuf);
 
@@ -44,11 +52,61 @@ impl CacheClock for FakeClock {
     }
 }
 
+const TEST_STEP_TIMEOUT: Duration = Duration::from_secs(30);
+
+async fn bounded<F: Future>(label: &str, fut: F) -> F::Output {
+    tokio::time::timeout(TEST_STEP_TIMEOUT, fut)
+        .await
+        .unwrap_or_else(|_| panic!("test step timed out after {TEST_STEP_TIMEOUT:?}: {label}"))
+}
+
+struct CloseGate {
+    pair: Mutex<bool>,
+    cv: Condvar,
+}
+
+impl CloseGate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            pair: Mutex::new(false),
+            cv: Condvar::new(),
+        })
+    }
+
+    fn release(&self) {
+        let mut released = self.pair.lock().expect("lock");
+        *released = true;
+        self.cv.notify_all();
+    }
+
+    fn wait(&self) {
+        let mut released = self.pair.lock().expect("lock");
+        while !*released {
+            released = self.cv.wait(released).expect("wait");
+        }
+    }
+}
+
+struct ObservableLockGuard {
+    _inner: Box<dyn CacheLockGuard>,
+    lock_held: Arc<AtomicBool>,
+}
+
+impl CacheLockGuard for ObservableLockGuard {}
+
+impl Drop for ObservableLockGuard {
+    fn drop(&mut self) {
+        self.lock_held.store(false, Ordering::SeqCst);
+    }
+}
+
 struct ObservableWriter {
     inner: Box<dyn StagingWriter>,
     open_handles: Arc<AtomicUsize>,
-    closed_notify: Arc<Notify>,
-    hold_close_gate: Option<Arc<Notify>>,
+    open_handles_tx: watch::Sender<usize>,
+    hold_close_gate: Option<Arc<CloseGate>>,
+    close_entered_count: Arc<AtomicUsize>,
+    close_entered_tx: watch::Sender<usize>,
     drop_closed: bool,
 }
 
@@ -62,6 +120,11 @@ impl StagingWriter for ObservableWriter {
     }
 
     fn close(mut self: Box<Self>) -> io::Result<()> {
+        let entered = self.close_entered_count.fetch_add(1, Ordering::SeqCst) + 1;
+        let _ = self.close_entered_tx.send(entered);
+        if let Some(gate) = &self.hold_close_gate {
+            gate.wait();
+        }
         let res = {
             let dummy = Box::new(NoopWriter);
             let inner = std::mem::replace(&mut self.inner, dummy);
@@ -69,8 +132,8 @@ impl StagingWriter for ObservableWriter {
         };
         if !self.drop_closed {
             self.drop_closed = true;
-            self.open_handles.fetch_sub(1, Ordering::SeqCst);
-            self.closed_notify.notify_waiters();
+            let remaining = self.open_handles.fetch_sub(1, Ordering::SeqCst) - 1;
+            let _ = self.open_handles_tx.send(remaining);
         }
         res
     }
@@ -80,12 +143,8 @@ impl Drop for ObservableWriter {
     fn drop(&mut self) {
         if !self.drop_closed {
             self.drop_closed = true;
-            if let Some(gate) = &self.hold_close_gate {
-                // Allow tests to observe synchronous handle closure only when released.
-                let _ = gate;
-            }
-            self.open_handles.fetch_sub(1, Ordering::SeqCst);
-            self.closed_notify.notify_waiters();
+            let remaining = self.open_handles.fetch_sub(1, Ordering::SeqCst) - 1;
+            let _ = self.open_handles_tx.send(remaining);
         }
     }
 }
@@ -109,10 +168,18 @@ impl StagingWriter for NoopWriter {
 struct FaultyCacheFs {
     real: RealCacheFs,
     writers_opened: AtomicUsize,
+    writers_opened_tx: watch::Sender<usize>,
+    _writers_opened_rx: watch::Receiver<usize>,
     open_writer_handles: Arc<AtomicUsize>,
-    writer_closed_notify: Arc<Notify>,
-    writer_opened_notify: Notify,
+    open_handles_tx: watch::Sender<usize>,
+    _open_handles_rx: watch::Receiver<usize>,
+    close_entered_count: Arc<AtomicUsize>,
+    close_entered_tx: watch::Sender<usize>,
+    _close_entered_rx: watch::Receiver<usize>,
+    lock_held: Arc<AtomicBool>,
+    next_close_gate: Mutex<Option<Arc<CloseGate>>>,
     file_removed_tx: watch::Sender<usize>,
+    _file_removed_rx: watch::Receiver<usize>,
     fail_remove_prefix: Mutex<Option<String>>,
     fail_rename: AtomicBool,
     removed_paths: Mutex<Vec<PathBuf>>,
@@ -121,14 +188,25 @@ struct FaultyCacheFs {
 
 impl Default for FaultyCacheFs {
     fn default() -> Self {
-        let (file_removed_tx, _rx) = watch::channel(0usize);
+        let (writers_opened_tx, _writers_opened_rx) = watch::channel(0usize);
+        let (open_handles_tx, _open_handles_rx) = watch::channel(0usize);
+        let (close_entered_tx, _close_entered_rx) = watch::channel(0usize);
+        let (file_removed_tx, _file_removed_rx) = watch::channel(0usize);
         Self {
             real: RealCacheFs,
             writers_opened: AtomicUsize::new(0),
+            writers_opened_tx,
+            _writers_opened_rx,
             open_writer_handles: Arc::new(AtomicUsize::new(0)),
-            writer_closed_notify: Arc::new(Notify::new()),
-            writer_opened_notify: Notify::new(),
+            open_handles_tx,
+            _open_handles_rx,
+            close_entered_count: Arc::new(AtomicUsize::new(0)),
+            close_entered_tx,
+            _close_entered_rx,
+            lock_held: Arc::new(AtomicBool::new(false)),
+            next_close_gate: Mutex::new(None),
             file_removed_tx,
+            _file_removed_rx,
             fail_remove_prefix: Mutex::new(None),
             fail_rename: AtomicBool::new(false),
             removed_paths: Mutex::new(Vec::new()),
@@ -140,6 +218,41 @@ impl Default for FaultyCacheFs {
 impl FaultyCacheFs {
     fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    fn arm_close_gate(&self) -> Arc<CloseGate> {
+        let gate = CloseGate::new();
+        *self.next_close_gate.lock().expect("lock") = Some(Arc::clone(&gate));
+        gate
+    }
+
+    fn is_lock_held(&self) -> bool {
+        self.lock_held.load(Ordering::SeqCst)
+    }
+
+    fn subscribe_writers_opened(&self) -> watch::Receiver<usize> {
+        self.writers_opened_tx.subscribe()
+    }
+
+    async fn wait_writers_opened(&self, count: usize) {
+        let mut rx = self.writers_opened_tx.subscribe();
+        bounded("wait_writers_opened", rx.wait_for(|&c| c >= count))
+            .await
+            .expect("writers opened watch");
+    }
+
+    async fn wait_open_handles(&self, expected: usize) {
+        let mut rx = self.open_handles_tx.subscribe();
+        bounded("wait_open_handles", rx.wait_for(|&c| c == expected))
+            .await
+            .expect("open handles watch");
+    }
+
+    async fn wait_close_entered(&self, count: usize) {
+        let mut rx = self.close_entered_tx.subscribe();
+        bounded("wait_close_entered", rx.wait_for(|&c| c >= count))
+            .await
+            .expect("close entered watch");
     }
 
     fn subscribe_removed(&self) -> watch::Receiver<usize> {
@@ -172,19 +285,28 @@ impl CacheFs for FaultyCacheFs {
         &self,
         lock_path: &Path,
     ) -> Result<Box<dyn CacheLockGuard>, CacheLockError> {
-        self.real.try_lock_exclusive(lock_path)
+        let inner = self.real.try_lock_exclusive(lock_path)?;
+        self.lock_held.store(true, Ordering::SeqCst);
+        Ok(Box::new(ObservableLockGuard {
+            _inner: inner,
+            lock_held: Arc::clone(&self.lock_held),
+        }))
     }
 
     fn create_new_writer(&self, path: &Path) -> io::Result<Box<dyn StagingWriter>> {
         let inner = self.real.create_new_writer(path)?;
-        self.writers_opened.fetch_add(1, Ordering::SeqCst);
-        self.open_writer_handles.fetch_add(1, Ordering::SeqCst);
-        self.writer_opened_notify.notify_waiters();
+        let opened = self.writers_opened.fetch_add(1, Ordering::SeqCst) + 1;
+        let _ = self.writers_opened_tx.send(opened);
+        let handles = self.open_writer_handles.fetch_add(1, Ordering::SeqCst) + 1;
+        let _ = self.open_handles_tx.send(handles);
+        let hold_close_gate = self.next_close_gate.lock().expect("lock").take();
         Ok(Box::new(ObservableWriter {
             inner,
             open_handles: Arc::clone(&self.open_writer_handles),
-            closed_notify: Arc::clone(&self.writer_closed_notify),
-            hold_close_gate: None,
+            open_handles_tx: self.open_handles_tx.clone(),
+            hold_close_gate,
+            close_entered_count: Arc::clone(&self.close_entered_count),
+            close_entered_tx: self.close_entered_tx.clone(),
             drop_closed: false,
         }))
     }
@@ -450,9 +572,7 @@ async fn concurrent_puts_never_exceed_cap_including_staging() {
     let h2 = tokio::spawn(async move { s2.put(k2, sc2, Some(800), rx2).await });
 
     // Wait until both 800-byte writers have opened staging (1600 == cap).
-    while fs.writers_opened() < 2 {
-        fs.writer_opened_notify.notified().await;
-    }
+    fs.wait_writers_opened(2).await;
 
     let err3 = store
         .put(thumb_key("k3"), scope.clone(), Some(1), rx3)
@@ -616,9 +736,7 @@ async fn put_cannot_fit_after_safe_eviction_returns_capacity_without_starting_wr
     let sc1 = scope.clone();
     let h1 =
         tokio::spawn(async move { s1.put(thumb_key("inflight-120"), sc1, Some(120), rx).await });
-    while fs.writers_opened() < 2 {
-        fs.writer_opened_notify.notified().await;
-    }
+    fs.wait_writers_opened(2).await;
 
     // Non-evictable = 120. 120 + 100 > 200, so safe eviction cannot make room.
     let err = store
@@ -715,9 +833,7 @@ async fn lower_cap_rejected_while_reservations_are_charged() {
     let sc1 = scope.clone();
     let handle =
         tokio::spawn(async move { s1.put(thumb_key("reserved-700"), sc1, Some(700), rx).await });
-    while fs.writers_opened() < 1 {
-        fs.writer_opened_notify.notified().await;
-    }
+    fs.wait_writers_opened(1).await;
 
     let err = store.set_cap(500).await.unwrap_err();
     assert_eq!(
@@ -767,9 +883,7 @@ async fn second_actor_cannot_reconcile_live_staging() {
     let sc1 = scope.clone();
     let writer_task =
         tokio::spawn(async move { s1.put(thumb_key("live-staging"), sc1, Some(64), rx).await });
-    while fs.writers_opened() < 1 {
-        fs.writer_opened_notify.notified().await;
-    }
+    fs.wait_writers_opened(1).await;
 
     let staging_files_before: Vec<_> = std::fs::read_dir(dir.path().join("staging"))
         .unwrap()
@@ -931,21 +1045,28 @@ async fn dropped_caller_cancels_writer_through_actor_without_touching_staging() 
     let put_fut = store.put(thumb_key("drop-me"), scope.clone(), Some(256), rx);
     let mut put_task = Box::pin(put_fut);
 
+    let mut opened_rx = fs.subscribe_writers_opened();
     // Poll once to send BeginPut, then wait until writer opens staging.
-    tokio::select! {
-        _ = &mut put_task => panic!("put should wait on empty stream"),
-        _ = fs.writer_opened_notify.notified() => {}
-    }
+    bounded("wait drop-me writer open", async {
+        tokio::select! {
+            _ = &mut put_task => panic!("put should wait on empty stream"),
+            res = opened_rx.wait_for(|&c| c >= 1) => { res.expect("watch"); }
+        }
+    })
+    .await;
     assert_eq!(fs.open_handles(), 1);
 
     let mut removed_rx = fs.subscribe_removed();
     // Drop caller future; CancelOnDrop cancels reservation through the actor.
     drop(put_task);
 
-    while fs.open_handles() > 0 {
-        fs.writer_closed_notify.notified().await;
-    }
-    removed_rx.wait_for(|&c| c >= 1).await.unwrap();
+    fs.wait_open_handles(0).await;
+    bounded(
+        "wait drop-me staging removed",
+        removed_rx.wait_for(|&c| c >= 1),
+    )
+    .await
+    .unwrap();
 
     let stats = store.stats().await.unwrap();
     assert_eq!(stats.live_reservations, 0);
@@ -1013,4 +1134,1053 @@ async fn failed_cleanup_keeps_bytes_charged_and_is_retried() {
     assert_eq!(stats.pending_deletes, 0);
     assert_eq!(stats.published_bytes, 120);
     store.shutdown().await;
+}
+
+#[derive(Default)]
+struct FakeSessionCacheSink {
+    transitions: Mutex<Vec<CacheScopeTransition>>,
+    purges: Mutex<Vec<AccountId>>,
+}
+
+impl FakeSessionCacheSink {
+    fn transitions(&self) -> Vec<CacheScopeTransition> {
+        self.transitions.lock().expect("lock").clone()
+    }
+
+    fn purges(&self) -> Vec<AccountId> {
+        self.purges.lock().expect("lock").clone()
+    }
+}
+
+impl SessionCacheSink for FakeSessionCacheSink {
+    fn on_scope_transition(&self, transition: CacheScopeTransition) {
+        self.transitions.lock().expect("lock").push(transition);
+    }
+
+    fn on_purge_account(&self, account_id: &AccountId) {
+        self.purges.lock().expect("lock").push(account_id.clone());
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn watchdog_does_not_delete_or_uncharge_live_writer() {
+    let dir = TempCacheDir::new();
+    let fs = FaultyCacheFs::new();
+    let gate = fs.arm_close_gate();
+    let acct = AccountId::new("acct-watchdog");
+    let scope1 = SessionScope::account(acct.clone(), 1);
+
+    let store = CacheStore::open_with_seams(
+        CacheConfig::new(dir.path().to_path_buf(), scope1.clone())
+            .with_cap_bytes(10_000)
+            .unwrap(),
+        fs.clone(),
+        Arc::new(SqliteCacheIndex::new()),
+        Arc::new(FakeClock::default()),
+    )
+    .await
+    .expect("open cache");
+
+    let (_tx, rx) = mpsc::channel::<Result<Vec<u8>, CacheSourceError>>(2);
+    let s1 = store.clone();
+    let sc1 = scope1.clone();
+    let put_handle =
+        tokio::spawn(async move { s1.put(thumb_key("held-writer"), sc1, Some(512), rx).await });
+    fs.wait_writers_opened(1).await;
+
+    // Logout transition triggers cancellation, while ObservableWriter holds the file open at close().
+    let scope2 = SessionScope::guest(2);
+    bounded(
+        "watchdog transition_scope",
+        store.transition_scope(CacheScopeTransition {
+            new_scope: scope2.clone(),
+            purge_account: Some(acct),
+        }),
+    )
+    .await
+    .unwrap();
+
+    fs.wait_close_entered(1).await;
+    assert_eq!(fs.open_handles(), 1);
+    assert_eq!(
+        std::fs::read_dir(dir.path().join("staging"))
+            .unwrap()
+            .count(),
+        1
+    );
+
+    let before_watchdog = store.stats().await.unwrap();
+    assert_eq!(before_watchdog.reserved_bytes, 512);
+    assert_eq!(before_watchdog.overdue_writers, 0);
+
+    // Advance simulated clock past the 10s watchdog.
+    tokio::time::advance(WATCHDOG_TIMEOUT).await;
+    let after_watchdog = store.stats().await.unwrap();
+    assert_eq!(after_watchdog.overdue_writers, 1);
+    assert_eq!(after_watchdog.overdue_reservation_ids, vec![1]);
+    assert_eq!(
+        after_watchdog.reserved_bytes, 512,
+        "watchdog must not uncharge live writer"
+    );
+    assert_eq!(
+        std::fs::read_dir(dir.path().join("staging"))
+            .unwrap()
+            .count(),
+        1,
+        "watchdog must not delete live writer staging file"
+    );
+
+    // Actor keeps serving other requests while the overdue writer still holds the file open.
+    store
+        .put(thumb_key("guest-ok"), scope2.clone(), Some(32), vec![7; 32])
+        .await
+        .expect("actor continues serving while overdue writer is live");
+
+    // Release the held handle -> normal cleanup deletes staging and releases reservation.
+    let mut removed_rx = fs.subscribe_removed();
+    gate.release();
+    fs.wait_open_handles(0).await;
+    bounded(
+        "wait watchdog staging removed",
+        removed_rx.wait_for(|&c| c >= 1),
+    )
+    .await
+    .unwrap();
+    let put_err = bounded("wait watchdog put_handle", put_handle)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(put_err, CacheError::ScopeMismatch);
+
+    let final_stats = store.stats().await.unwrap();
+    assert_eq!(final_stats.overdue_writers, 0);
+    assert_eq!(final_stats.live_reservations, 0);
+    assert_eq!(final_stats.reserved_bytes, 0);
+    assert_eq!(final_stats.published_bytes, 32);
+    assert_eq!(
+        std::fs::read_dir(dir.path().join("staging"))
+            .unwrap()
+            .count(),
+        0
+    );
+    store.shutdown().await;
+}
+
+#[tokio::test]
+async fn shutdown_joins_writers_before_releasing_root_lock() {
+    let dir = TempCacheDir::new();
+    let fs = FaultyCacheFs::new();
+    let gate = fs.arm_close_gate();
+    let scope = SessionScope::guest(1);
+
+    let store = CacheStore::open_with_seams(
+        CacheConfig::new(dir.path().to_path_buf(), scope.clone())
+            .with_cap_bytes(5000)
+            .unwrap(),
+        fs.clone(),
+        Arc::new(SqliteCacheIndex::new()),
+        Arc::new(FakeClock::default()),
+    )
+    .await
+    .expect("open cache");
+    assert!(fs.is_lock_held());
+
+    let (_tx, rx) = mpsc::channel::<Result<Vec<u8>, CacheSourceError>>(2);
+    let s1 = store.clone();
+    let sc1 = scope.clone();
+    let put_task =
+        tokio::spawn(async move { s1.put(thumb_key("shutting-down"), sc1, Some(256), rx).await });
+    fs.wait_writers_opened(1).await;
+
+    let store_for_shutdown = store.clone();
+    let shutdown_task = tokio::spawn(async move {
+        store_for_shutdown.shutdown().await;
+    });
+
+    // Wait until shutdown signals cancellation and the writer hits close().
+    fs.wait_close_entered(1).await;
+    assert!(
+        !shutdown_task.is_finished(),
+        "shutdown must wait for live writer"
+    );
+    assert!(
+        fs.is_lock_held(),
+        "root lock must remain held until writers join"
+    );
+
+    // Second open must still fail with Locked while shutdown waits on the writer.
+    assert!(matches!(
+        CacheStore::open(CacheConfig::new(dir.path().to_path_buf(), scope.clone())).await,
+        Err(CacheError::Locked)
+    ));
+
+    gate.release();
+    shutdown_task.await.unwrap();
+    let put_err = put_task.await.unwrap().unwrap_err();
+    assert_eq!(put_err, CacheError::ShuttingDown);
+    assert!(
+        !fs.is_lock_held(),
+        "root lock released after writers joined"
+    );
+    assert_eq!(fs.open_handles(), 0);
+    assert_eq!(
+        std::fs::read_dir(dir.path().join("staging"))
+            .unwrap()
+            .count(),
+        0
+    );
+
+    // Now a new actor can open cleanly.
+    let reopened = CacheStore::open(CacheConfig::new(dir.path().to_path_buf(), scope))
+        .await
+        .expect("reopen succeeds after shutdown releases lock");
+    reopened.shutdown().await;
+}
+
+#[tokio::test]
+async fn startup_recovers_rename_without_index_commit() {
+    let dir = TempCacheDir::new();
+    let scope = SessionScope::guest(1);
+
+    // Seed one valid entry and shut down cleanly.
+    let store = CacheStore::open(
+        CacheConfig::new(dir.path().to_path_buf(), scope.clone())
+            .with_cap_bytes(500)
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    store
+        .put(
+            thumb_key("committed"),
+            scope.clone(),
+            Some(64),
+            vec![0x11; 64],
+        )
+        .await
+        .unwrap();
+    store.shutdown().await;
+
+    // Simulate crash after rename into objects/ and before index commit.
+    let unindexed_path = dir.path().join("objects").join("orphan_renamed.bin");
+    std::fs::write(&unindexed_path, vec![0x99; 300]).unwrap();
+
+    // Case A: delete fails during startup reconciliation, and retained bytes fit cap (500 >= 364).
+    let fs_fail_del = FaultyCacheFs::new();
+    fs_fail_del.set_fail_remove_prefix(Some("orphan_renamed.bin"));
+    let recovered = CacheStore::open_with_seams(
+        CacheConfig::new(dir.path().to_path_buf(), scope.clone())
+            .with_cap_bytes(500)
+            .unwrap(),
+        fs_fail_del,
+        Arc::new(SqliteCacheIndex::new()),
+        Arc::new(FakeClock::default()),
+    )
+    .await
+    .expect("reconcile retains unindexed file as charged tombstone");
+
+    let stats = recovered.stats().await.unwrap();
+    assert_eq!(stats.published_bytes, 64);
+    assert_eq!(stats.tombstone_bytes, 300);
+    assert_eq!(stats.total_charged_bytes, 364);
+    assert_eq!(stats.pending_deletes, 1);
+    recovered.shutdown().await;
+
+    // Case B: delete succeeds on next startup -> unindexed orphan is removed, committed entry intact.
+    let clean = CacheStore::open(
+        CacheConfig::new(dir.path().to_path_buf(), scope.clone())
+            .with_cap_bytes(500)
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert!(!unindexed_path.exists());
+    let stats = clean.stats().await.unwrap();
+    assert_eq!(stats.published_bytes, 64);
+    assert_eq!(stats.tombstone_bytes, 0);
+    assert_eq!(stats.pending_deletes, 0);
+    assert!(matches!(
+        clean
+            .get(thumb_key("committed"), scope.clone())
+            .await
+            .unwrap(),
+        CacheLookup::Hit { .. }
+    ));
+    clean.shutdown().await;
+
+    // Case C: delete still fails and cap is too small (200 < 300 retained after evicting committed)
+    // -> startup fails instead of admitting work, releasing the root lock cleanly.
+    std::fs::write(&unindexed_path, vec![0x99; 300]).unwrap();
+    let fs_fail_cap = FaultyCacheFs::new();
+    fs_fail_cap.set_fail_remove_prefix(Some("orphan_renamed.bin"));
+    let err = match CacheStore::open_with_seams(
+        CacheConfig::new(dir.path().to_path_buf(), scope)
+            .with_cap_bytes(200)
+            .unwrap(),
+        fs_fail_cap.clone(),
+        Arc::new(SqliteCacheIndex::new()),
+        Arc::new(FakeClock::default()),
+    )
+    .await
+    {
+        Ok(_) => panic!("startup must fail when retained bytes exceed cap"),
+        Err(err) => err,
+    };
+    assert!(matches!(
+        err,
+        CacheError::StartupCapExceeded {
+            charged: 300,
+            cap: 200
+        }
+    ));
+    assert!(
+        !fs_fail_cap.is_lock_held(),
+        "lock released on failed startup"
+    );
+}
+
+#[tokio::test]
+async fn failed_purge_tombstone_stays_hidden_across_restart() {
+    let dir = TempCacheDir::new();
+    let acct = AccountId::new("acct-purge-fail");
+    let scope1 = SessionScope::account(acct.clone(), 1);
+    let fs1 = FaultyCacheFs::new();
+
+    let store1 = CacheStore::open_with_seams(
+        CacheConfig::new(dir.path().to_path_buf(), scope1.clone())
+            .with_cap_bytes(1000)
+            .unwrap(),
+        fs1.clone(),
+        Arc::new(SqliteCacheIndex::new()),
+        Arc::new(FakeClock::default()),
+    )
+    .await
+    .unwrap();
+
+    let key = thumb_key("secret-nsfw");
+    store1
+        .put(key.clone(), scope1.clone(), Some(150), vec![0xAB; 150])
+        .await
+        .unwrap();
+
+    // Inject delete failure during logout purge.
+    fs1.set_fail_remove_prefix(Some("/objects/"));
+    store1
+        .transition_scope(CacheScopeTransition {
+            new_scope: SessionScope::guest(2),
+            purge_account: Some(acct.clone()),
+        })
+        .await
+        .unwrap();
+
+    // Entry is immediately hidden/unreadable, while bytes remain charged as tombstone.
+    assert_eq!(
+        store1.get(key.clone(), scope1.clone()).await.unwrap(),
+        CacheLookup::Miss
+    );
+    let stats1 = store1.stats().await.unwrap();
+    assert_eq!(stats1.entry_count, 0);
+    assert_eq!(stats1.tombstone_bytes, 150);
+    assert_eq!(stats1.pending_deletes, 1);
+    store1.shutdown().await;
+
+    // Restart with delete STILL failing and same account scope -> entry stays hidden and charged.
+    let fs2 = FaultyCacheFs::new();
+    fs2.set_fail_remove_prefix(Some("/objects/"));
+    let restarted_scope = SessionScope::account(acct.clone(), 1);
+    let store2 = CacheStore::open_with_seams(
+        CacheConfig::new(dir.path().to_path_buf(), restarted_scope.clone())
+            .with_cap_bytes(1000)
+            .unwrap(),
+        fs2,
+        Arc::new(SqliteCacheIndex::new()),
+        Arc::new(FakeClock::default()),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        store2
+            .get(key.clone(), restarted_scope.clone())
+            .await
+            .unwrap(),
+        CacheLookup::Miss
+    );
+    let stats2 = store2.stats().await.unwrap();
+    assert_eq!(stats2.entry_count, 0);
+    assert_eq!(stats2.tombstone_bytes, 150);
+    assert_eq!(stats2.pending_deletes, 1);
+    store2.shutdown().await;
+
+    // Restart with delete succeeding -> tombstone file is physically deleted and charge released.
+    let store3 = CacheStore::open(
+        CacheConfig::new(dir.path().to_path_buf(), restarted_scope.clone())
+            .with_cap_bytes(1000)
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    let stats3 = store3.stats().await.unwrap();
+    assert_eq!(stats3.tombstone_bytes, 0);
+    assert_eq!(stats3.pending_deletes, 0);
+    assert_eq!(
+        store3.get(key, restarted_scope).await.unwrap(),
+        CacheLookup::Miss
+    );
+    store3.shutdown().await;
+}
+
+#[tokio::test]
+async fn same_generation_different_account_cannot_publish() {
+    let dir = TempCacheDir::new();
+    let fs = FaultyCacheFs::new();
+    let acct_a = AccountId::new("acct-alpha");
+    let acct_b = AccountId::new("acct-beta");
+    let scope_a = SessionScope::account(acct_a.clone(), 5);
+    let scope_b = SessionScope::account(acct_b.clone(), 5);
+
+    let store = CacheStore::open_with_seams(
+        CacheConfig::new(dir.path().to_path_buf(), scope_a.clone())
+            .with_cap_bytes(5000)
+            .unwrap(),
+        fs.clone(),
+        Arc::new(SqliteCacheIndex::new()),
+        Arc::new(FakeClock::default()),
+    )
+    .await
+    .unwrap();
+
+    let (tx, rx) = mpsc::channel(2);
+    let s1 = store.clone();
+    let sc_a = scope_a.clone();
+    let key = thumb_key("shared-id");
+    let k1 = key.clone();
+    let put_handle = tokio::spawn(async move { s1.put(k1, sc_a, Some(64), rx).await });
+    fs.wait_writers_opened(1).await;
+
+    // Transition to a DIFFERENT account with the SAME generation (5).
+    store
+        .transition_scope(CacheScopeTransition {
+            new_scope: scope_b.clone(),
+            purge_account: Some(acct_a),
+        })
+        .await
+        .unwrap();
+
+    // Even if stream immediately sends EOF bytes, writer must not publish into acct_a or acct_b.
+    let _ = tx.send(Ok(vec![0x12; 64])).await;
+    drop(tx);
+    let err = put_handle.await.unwrap().unwrap_err();
+    assert_eq!(err, CacheError::ScopeMismatch);
+
+    assert_eq!(
+        store.get(key.clone(), scope_a.clone()).await.unwrap(),
+        CacheLookup::Miss
+    );
+    assert_eq!(
+        store.get(key.clone(), scope_b.clone()).await.unwrap(),
+        CacheLookup::Miss
+    );
+    assert_eq!(
+        store
+            .put(key, scope_a, Some(32), vec![0x34; 32])
+            .await
+            .unwrap_err(),
+        CacheError::ScopeMismatch
+    );
+    assert_eq!(store.stats().await.unwrap().entry_count, 0);
+    store.shutdown().await;
+}
+
+#[tokio::test]
+async fn scope_mismatch_misses_reads_and_rejects_stale_writes() {
+    let dir = TempCacheDir::new();
+    let acct_a = AccountId::new("acct-a");
+    let scope_a1 = SessionScope::account(acct_a.clone(), 1);
+    let scope_a2 = SessionScope::account(acct_a, 2);
+    let guest1 = SessionScope::guest(1);
+
+    let store = CacheStore::open(
+        CacheConfig::new(dir.path().to_path_buf(), scope_a1.clone())
+            .with_cap_bytes(5000)
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let key = thumb_key("wp-99");
+    store
+        .put(key.clone(), scope_a1.clone(), Some(16), vec![1; 16])
+        .await
+        .unwrap();
+
+    // Wrong generation and guest scope miss on read and reject writes.
+    assert_eq!(
+        store.get(key.clone(), scope_a2.clone()).await.unwrap(),
+        CacheLookup::Miss
+    );
+    assert_eq!(
+        store.get(key.clone(), guest1.clone()).await.unwrap(),
+        CacheLookup::Miss
+    );
+    assert_eq!(
+        store
+            .put(key.clone(), scope_a2, Some(16), vec![2; 16])
+            .await
+            .unwrap_err(),
+        CacheError::ScopeMismatch
+    );
+    assert_eq!(
+        store
+            .put(key, guest1, Some(16), vec![3; 16])
+            .await
+            .unwrap_err(),
+        CacheError::ScopeMismatch
+    );
+    store.shutdown().await;
+}
+
+#[tokio::test]
+async fn logout_while_staging_and_while_handle_held_open_keeps_actor_responsive() {
+    let dir = TempCacheDir::new();
+    let fs = FaultyCacheFs::new();
+    let acct = AccountId::new("acct-logout-staging");
+    let scope1 = SessionScope::account(acct.clone(), 1);
+
+    let store = CacheStore::open_with_seams(
+        CacheConfig::new(dir.path().to_path_buf(), scope1.clone())
+            .with_cap_bytes(5000)
+            .unwrap(),
+        fs.clone(),
+        Arc::new(SqliteCacheIndex::new()),
+        Arc::new(FakeClock::default()),
+    )
+    .await
+    .unwrap();
+
+    // Seed one published entry in acct before arming the close gate for the held writer.
+    store
+        .put(
+            thumb_key("published"),
+            scope1.clone(),
+            Some(40),
+            vec![0xAA; 40],
+        )
+        .await
+        .unwrap();
+
+    let gate = fs.arm_close_gate();
+    let (_tx_held, rx_held) = mpsc::channel::<Result<Vec<u8>, CacheSourceError>>(2);
+    let s1 = store.clone();
+    let sc1 = scope1.clone();
+    let held_put = tokio::spawn(async move {
+        s1.put(thumb_key("held-staging"), sc1, Some(200), rx_held)
+            .await
+    });
+    fs.wait_writers_opened(2).await;
+
+    let (_tx_fast, rx_fast) = mpsc::channel::<Result<Vec<u8>, CacheSourceError>>(2);
+    let s2 = store.clone();
+    let sc2 = scope1.clone();
+    let fast_put = tokio::spawn(async move {
+        s2.put(thumb_key("fast-staging"), sc2, Some(100), rx_fast)
+            .await
+    });
+    fs.wait_writers_opened(3).await;
+
+    // Logout: published entry deleted immediately, fast staging cancelled & deleted,
+    // held writer keeps file open until gate releases while actor keeps serving guest writes!
+    let mut removed_rx = fs.subscribe_removed();
+    let scope_guest = SessionScope::guest(2);
+    bounded(
+        "logout transition_scope",
+        store.transition_scope(CacheScopeTransition {
+            new_scope: scope_guest.clone(),
+            purge_account: Some(acct),
+        }),
+    )
+    .await
+    .unwrap();
+
+    // Both cancelled writers enter close(); held writer blocks inside close() while fast exits.
+    fs.wait_close_entered(3).await;
+    bounded(
+        "wait fast+published removed",
+        removed_rx.wait_for(|&c| c >= 2),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        bounded("wait fast_put", fast_put)
+            .await
+            .unwrap()
+            .unwrap_err(),
+        CacheError::ScopeMismatch
+    );
+    assert_eq!(fs.open_handles(), 1);
+    assert_eq!(
+        std::fs::read_dir(dir.path().join("staging"))
+            .unwrap()
+            .count(),
+        1
+    );
+
+    let mid_stats = bounded("mid stats", store.stats()).await.unwrap();
+    assert_eq!(mid_stats.published_bytes, 0);
+    assert_eq!(
+        mid_stats.reserved_bytes, 200,
+        "held writer stays charged until Finished"
+    );
+
+    // Actor remains responsive while held writer is still open.
+    bounded(
+        "guest put while held",
+        store.put(
+            thumb_key("guest-while-held"),
+            scope_guest.clone(),
+            Some(50),
+            vec![0x55; 50],
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        bounded(
+            "guest get while held",
+            store.get(thumb_key("guest-while-held"), scope_guest),
+        )
+        .await
+        .unwrap(),
+        CacheLookup::Hit { .. }
+    ));
+
+    // Release held handle -> staging deleted and charge released.
+    gate.release();
+    fs.wait_open_handles(0).await;
+    bounded(
+        "wait held staging removed",
+        removed_rx.wait_for(|&c| c >= 3),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        bounded("wait held_put", held_put)
+            .await
+            .unwrap()
+            .unwrap_err(),
+        CacheError::ScopeMismatch
+    );
+
+    let end_stats = store.stats().await.unwrap();
+    assert_eq!(end_stats.reserved_bytes, 0);
+    assert_eq!(end_stats.live_reservations, 0);
+    assert_eq!(end_stats.published_bytes, 50);
+    assert_eq!(
+        std::fs::read_dir(dir.path().join("staging"))
+            .unwrap()
+            .count(),
+        0
+    );
+    store.shutdown().await;
+}
+
+#[tokio::test]
+async fn duplicate_completion_and_retired_id_after_failed_delete_ignored() {
+    let dir = TempCacheDir::new();
+    let fs = FaultyCacheFs::new();
+    let scope = SessionScope::guest(1);
+
+    let store = CacheStore::open_with_seams(
+        CacheConfig::new(dir.path().to_path_buf(), scope.clone())
+            .with_cap_bytes(5000)
+            .unwrap(),
+        fs.clone(),
+        Arc::new(SqliteCacheIndex::new()),
+        Arc::new(FakeClock::default()),
+    )
+    .await
+    .unwrap();
+
+    // 1. Normal completion (reservation_id = 1) followed by duplicate Finished injection.
+    let key1 = thumb_key("dup");
+    store
+        .put(key1.clone(), scope.clone(), Some(32), vec![1; 32])
+        .await
+        .unwrap();
+    store
+        .inject_writer_finished_for_test(1, scope.clone(), key1.clone(), 32, 0)
+        .await
+        .unwrap();
+    assert_eq!(store.stats().await.unwrap().entry_count, 1);
+
+    // 2. Cancelled reservation whose staging cleanup fails -> retired as tombstone (reservation_id = 2).
+    // Injecting a late Finished for that retired id must be completely ignored and publish nothing.
+    fs.set_fail_remove_prefix(Some("/staging/"));
+    let (_tx, rx) = mpsc::channel::<Result<Vec<u8>, CacheSourceError>>(2);
+    let s1 = store.clone();
+    let sc1 = scope.clone();
+    let key2 = thumb_key("retired-after-failed-delete");
+    let k2 = key2.clone();
+    let put2 = tokio::spawn(async move { s1.put(k2, sc1, Some(80), rx).await });
+    fs.wait_writers_opened(2).await;
+
+    store
+        .transition_scope(CacheScopeTransition {
+            new_scope: SessionScope::guest(2),
+            purge_account: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(put2.await.unwrap().unwrap_err(), CacheError::ScopeMismatch);
+
+    let stats_tomb = store.stats().await.unwrap();
+    assert_eq!(stats_tomb.tombstone_bytes, 0); // staging file was empty (0 bytes actual_len)
+    assert_eq!(stats_tomb.pending_deletes, 1);
+
+    // Inject Finished for retired reservation_id = 2 -> ignored, nothing published.
+    store
+        .inject_writer_finished_for_test(2, SessionScope::guest(2), key2.clone(), 80, 1234)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get(key2, SessionScope::guest(2)).await.unwrap(),
+        CacheLookup::Miss
+    );
+    assert_eq!(store.stats().await.unwrap().entry_count, 1);
+    store.shutdown().await;
+}
+
+#[tokio::test]
+async fn startup_reconciles_staging_missing_corrupt_and_pending_deletes() {
+    let dir = TempCacheDir::new();
+    let scope = SessionScope::guest(1);
+
+    let store = CacheStore::open(
+        CacheConfig::new(dir.path().to_path_buf(), scope.clone())
+            .with_cap_bytes(10_000)
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    store
+        .put(thumb_key("keep"), scope.clone(), Some(40), vec![0x11; 40])
+        .await
+        .unwrap();
+    store
+        .put(
+            thumb_key("missing"),
+            scope.clone(),
+            Some(40),
+            vec![0x22; 40],
+        )
+        .await
+        .unwrap();
+    store
+        .put(
+            thumb_key("corrupt"),
+            scope.clone(),
+            Some(40),
+            vec![0x33; 40],
+        )
+        .await
+        .unwrap();
+    store.shutdown().await;
+
+    // Inspect SQLite index to find paths for missing and corrupt entries, plus plant a staging file.
+    let conn = rusqlite::Connection::open(dir.path().join("cache_index.db")).unwrap();
+    let missing_rel: String = conn
+        .query_row(
+            "SELECT rel_path FROM cache_entries WHERE cache_key = 'missing'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let corrupt_rel: String = conn
+        .query_row(
+            "SELECT rel_path FROM cache_entries WHERE cache_key = 'corrupt'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    drop(conn);
+
+    std::fs::remove_file(dir.path().join(&missing_rel)).unwrap();
+    std::fs::write(dir.path().join(&corrupt_rel), vec![0xFF; 40]).unwrap();
+    let stale_staging = dir.path().join("staging").join("crashed.part");
+    std::fs::write(&stale_staging, vec![0xAA; 128]).unwrap();
+
+    let reopened = CacheStore::open(
+        CacheConfig::new(dir.path().to_path_buf(), scope.clone())
+            .with_cap_bytes(10_000)
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    assert!(!stale_staging.exists());
+    assert!(!dir.path().join(&corrupt_rel).exists());
+    let stats = reopened.stats().await.unwrap();
+    assert_eq!(stats.entry_count, 1);
+    assert_eq!(stats.published_bytes, 40);
+    assert_eq!(stats.tombstone_bytes, 0);
+    assert!(matches!(
+        reopened
+            .get(thumb_key("keep"), scope.clone())
+            .await
+            .unwrap(),
+        CacheLookup::Hit { .. }
+    ));
+    assert_eq!(
+        reopened
+            .get(thumb_key("missing"), scope.clone())
+            .await
+            .unwrap(),
+        CacheLookup::Miss
+    );
+    assert_eq!(
+        reopened.get(thumb_key("corrupt"), scope).await.unwrap(),
+        CacheLookup::Miss
+    );
+    reopened.shutdown().await;
+}
+
+#[tokio::test]
+async fn offline_scope_visibility_and_reconnect_purge() {
+    let dir = TempCacheDir::new();
+    let acct_a = AccountId::new("acct-offline-a");
+    let acct_b = AccountId::new("acct-offline-b");
+    let guest = SessionScope::guest(1);
+    let scope_a = SessionScope::account(acct_a.clone(), 2);
+    let scope_b = SessionScope::account(acct_b.clone(), 3);
+
+    let store = CacheStore::open(
+        CacheConfig::new(dir.path().to_path_buf(), guest.clone())
+            .with_cap_bytes(10_000)
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let k_guest = thumb_key("guest-item");
+    let k_acct_a = thumb_key("acct-a-item");
+    store
+        .put(k_guest.clone(), guest.clone(), Some(24), vec![0x01; 24])
+        .await
+        .unwrap();
+
+    // Switch to Account A (without purging Guest) and cache an item for Account A.
+    store
+        .transition_scope(CacheScopeTransition {
+            new_scope: scope_a.clone(),
+            purge_account: None,
+        })
+        .await
+        .unwrap();
+    store
+        .put(k_acct_a.clone(), scope_a.clone(), Some(32), vec![0x02; 32])
+        .await
+        .unwrap();
+
+    // Offline while signed in as Account A: Account A entry visible & labelled stale; Guest/Account B miss.
+    store
+        .set_connectivity(CacheConnectivity::Offline)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get(k_acct_a.clone(), scope_a.clone()).await.unwrap(),
+        CacheLookup::Hit {
+            scope: scope_a.clone(),
+            bytes: vec![0x02; 32],
+            stale: true,
+        }
+    );
+    assert_eq!(
+        store.get(k_guest.clone(), guest.clone()).await.unwrap(),
+        CacheLookup::Miss
+    );
+    assert_eq!(
+        store.get(k_acct_a.clone(), scope_b.clone()).await.unwrap(),
+        CacheLookup::Miss
+    );
+
+    // Offline in Guest mode: Guest offline content shown labelled stale, Account A misses.
+    store
+        .transition_scope(CacheScopeTransition {
+            new_scope: SessionScope::guest(4),
+            purge_account: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get(k_guest.clone(), SessionScope::guest(4))
+            .await
+            .unwrap(),
+        CacheLookup::Hit {
+            scope: SessionScope::guest(4),
+            bytes: vec![0x01; 24],
+            stale: true,
+        }
+    );
+    assert_eq!(
+        store.get(k_acct_a.clone(), scope_a.clone()).await.unwrap(),
+        CacheLookup::Miss
+    );
+
+    // Return to Account A (persisted on disk) and reconnect -> 403/401 purges Account A cache.
+    store
+        .transition_scope(CacheScopeTransition {
+            new_scope: SessionScope::account(acct_a.clone(), 5),
+            purge_account: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get(k_acct_a.clone(), SessionScope::account(acct_a.clone(), 5))
+            .await
+            .unwrap(),
+        CacheLookup::Hit {
+            scope: SessionScope::account(acct_a.clone(), 5),
+            bytes: vec![0x02; 32],
+            stale: true,
+        }
+    );
+
+    store
+        .set_connectivity(CacheConnectivity::Online)
+        .await
+        .unwrap();
+    store.purge_account(acct_a.clone()).await.unwrap();
+    assert_eq!(
+        store
+            .get(k_acct_a, SessionScope::account(acct_a, 5))
+            .await
+            .unwrap(),
+        CacheLookup::Miss
+    );
+    store.shutdown().await;
+}
+
+fn test_probe(start_scope: SessionScope, username: &str, key: &str) -> SignInProbe {
+    SignInProbe {
+        start_scope,
+        username: username.to_string(),
+        api_key: SecretString::new(key),
+        user_settings: None,
+        own_collections: Some(Vec::<CollectionSummary>::new()),
+        verification: UsernameVerification::UnverifiableEmpty,
+    }
+}
+
+#[tokio::test]
+async fn session_manager_wires_logout_switch_and_401_to_fake_and_real_cache() {
+    let dir = TempCacheDir::new();
+    let db_path = dir.path().join("wallora.db");
+    let storage: Arc<dyn SessionStorage> =
+        Arc::new(SqliteStore::open(&db_path).expect("open sqlite"));
+    let creds: Arc<dyn CredentialStore> = Arc::new(InMemoryCredentialStore::new());
+
+    // Part 1: Fake sink verifies every transition emitted synchronously without blocking.
+    let fake_sink = Arc::new(FakeSessionCacheSink::default());
+    let mut session = SessionManager::restore_with_cache(
+        Arc::clone(&storage),
+        Arc::clone(&creds),
+        fake_sink.clone(),
+    );
+
+    let probe_a = test_probe(session.scope(), "alice", "wh_fake_alpha_111");
+    let acct_a = match session.commit_sign_in(probe_a).unwrap() {
+        wallora_core::services::SignInCommitOutcome::Applied { scope, .. } => {
+            scope.account_id().unwrap().clone()
+        }
+        other => panic!("unexpected sign in outcome: {other:?}"),
+    };
+
+    let probe_b = test_probe(session.scope(), "bob", "wh_fake_beta_222");
+    let acct_b = match session.commit_sign_in(probe_b).unwrap() {
+        wallora_core::services::SignInCommitOutcome::Applied { scope, .. } => {
+            scope.account_id().unwrap().clone()
+        }
+        other => panic!("unexpected sign in outcome: {other:?}"),
+    };
+
+    // Switch back to A -> purges B.
+    session.switch_account(&acct_a).unwrap();
+    // Refresh 403 -> purges A via on_purge_account.
+    session.apply_refresh(AccountRefreshPayload {
+        request_scope: session.scope(),
+        user_settings: Err(ProviderError::Forbidden),
+        own_collections: Err(ProviderError::Forbidden),
+        identity_outcome: None,
+    });
+    // 401 revocation -> bumps scope to guest and purges A.
+    let _ =
+        session.handle_provider_result::<()>(&session.scope(), Err(ProviderError::Unauthorized));
+    // Switch to B and logout -> bumps scope to guest and purges B.
+    session.switch_account(&acct_b).unwrap();
+    let logout_out = session.logout();
+    assert_eq!(logout_out.logged_out_account, Some(acct_b.clone()));
+
+    let transitions = fake_sink.transitions();
+    assert!(
+        transitions
+            .iter()
+            .any(|t| t.purge_account.as_ref() == Some(&acct_a))
+    );
+    assert!(
+        transitions
+            .iter()
+            .any(|t| t.purge_account.as_ref() == Some(&acct_b))
+    );
+    assert_eq!(fake_sink.purges(), vec![acct_a.clone()]);
+
+    // Part 2: End-to-end SessionManager + real CacheStore actor.
+    let cache_dir = dir.path().join("real-cache");
+    let cache_store = CacheStore::open(
+        CacheConfig::new(cache_dir, SessionScope::guest(1))
+            .with_cap_bytes(50_000)
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    let cache_sink: Arc<dyn SessionCacheSink> = Arc::new(cache_store.clone());
+
+    let db_path2 = dir.path().join("wallora2.db");
+    let storage2: Arc<dyn SessionStorage> =
+        Arc::new(SqliteStore::open(&db_path2).expect("open sqlite 2"));
+    let creds2: Arc<dyn CredentialStore> = Arc::new(InMemoryCredentialStore::new());
+    let mut live_session = SessionManager::restore_with_cache(storage2, creds2, cache_sink);
+
+    let acct1 = match live_session
+        .commit_sign_in(test_probe(live_session.scope(), "carol", "wh_live_carol_1"))
+        .unwrap()
+    {
+        wallora_core::services::SignInCommitOutcome::Applied { scope, .. } => {
+            scope.account_id().unwrap().clone()
+        }
+        other => panic!("unexpected outcome: {other:?}"),
+    };
+    let s_carol = live_session.scope();
+    let key = thumb_key("carol-thumb");
+    cache_store
+        .put(key.clone(), s_carol.clone(), Some(48), vec![0xCC; 48])
+        .await
+        .unwrap();
+
+    // Sync 401 revocation from SessionManager purges Carol's cached entries non-blockingly.
+    let _ = live_session.handle_provider_result::<()>(&s_carol, Err(ProviderError::Unauthorized));
+    assert_eq!(
+        cache_store
+            .get(key, SessionScope::account(acct1, s_carol.generation))
+            .await
+            .unwrap(),
+        CacheLookup::Miss
+    );
+    let stats = cache_store.stats().await.unwrap();
+    assert_eq!(stats.entry_count, 0);
+    assert_eq!(stats.published_bytes, 0);
+    assert_eq!(stats.current_scope, live_session.scope());
+    cache_store.shutdown().await;
 }

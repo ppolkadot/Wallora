@@ -195,6 +195,11 @@ impl Drop for CancelOnDrop {
     }
 }
 
+enum CacheSyncNotice {
+    ScopeTransition(CacheScopeTransition),
+    PurgeAccount(AccountId),
+}
+
 /// Single-writer actor handle for the scoped thumbnail and preview cache.
 ///
 /// All reads, writes, evictions, cap updates, and scope transitions are serialized through
@@ -202,7 +207,7 @@ impl Drop for CancelOnDrop {
 #[derive(Clone)]
 pub struct CacheStore {
     cmd_tx: mpsc::Sender<ActorCommand>,
-    transition_tx: mpsc::UnboundedSender<CacheScopeTransition>,
+    transition_tx: mpsc::UnboundedSender<CacheSyncNotice>,
     next_caller_id: Arc<AtomicU64>,
     actor_task: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
@@ -438,7 +443,15 @@ impl CacheStore {
 
 impl SessionCacheSink for CacheStore {
     fn on_scope_transition(&self, transition: CacheScopeTransition) {
-        let _ = self.transition_tx.send(transition);
+        let _ = self
+            .transition_tx
+            .send(CacheSyncNotice::ScopeTransition(transition));
+    }
+
+    fn on_purge_account(&self, account_id: &AccountId) {
+        let _ = self
+            .transition_tx
+            .send(CacheSyncNotice::PurgeAccount(account_id.clone()));
     }
 }
 
@@ -678,17 +691,20 @@ impl CacheActor {
     async fn run(
         mut self,
         mut cmd_rx: mpsc::Receiver<ActorCommand>,
-        mut transition_rx: mpsc::UnboundedReceiver<CacheScopeTransition>,
+        mut transition_rx: mpsc::UnboundedReceiver<CacheSyncNotice>,
     ) {
         loop {
             let next_deadline = self.next_watchdog_deadline();
             tokio::select! {
                 biased;
 
-                maybe_transition = transition_rx.recv() => {
-                    match maybe_transition {
-                        Some(transition) => {
+                maybe_notice = transition_rx.recv() => {
+                    match maybe_notice {
+                        Some(CacheSyncNotice::ScopeTransition(transition)) => {
                             let _ = self.handle_scope_transition(transition).await;
+                        }
+                        Some(CacheSyncNotice::PurgeAccount(account_id)) => {
+                            let _ = self.purge_account_entries(&account_id).await;
                         }
                         None => {
                             // Transition channel closed only when all CacheStore handles drop.

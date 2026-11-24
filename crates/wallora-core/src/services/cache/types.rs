@@ -165,9 +165,21 @@ pub struct CacheScopeTransition {
     pub purge_account: Option<AccountId>,
 }
 
-/// Non-blocking sink notified whenever [`crate::services::SessionManager`] transitions scope.
+/// Non-blocking sink notified whenever [`crate::services::SessionManager`] transitions scope
+/// or must purge an account's cache (such as 401 revocation or 403 on reconnect).
 pub trait SessionCacheSink: Send + Sync + 'static {
     fn on_scope_transition(&self, transition: CacheScopeTransition);
+    fn on_purge_account(&self, account_id: &AccountId);
+}
+
+/// Default no-op [`SessionCacheSink`] used when [`crate::services::SessionManager`] is
+/// constructed without an attached cache actor.
+#[derive(Debug, Default)]
+pub struct NoopSessionCacheSink;
+
+impl SessionCacheSink for NoopSessionCacheSink {
+    fn on_scope_transition(&self, _transition: CacheScopeTransition) {}
+    fn on_purge_account(&self, _account_id: &AccountId) {}
 }
 
 /// Cooperative cancellation token passed to supervised cache writers.

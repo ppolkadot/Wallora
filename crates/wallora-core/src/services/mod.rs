@@ -9,9 +9,9 @@ pub use cache::{
     CacheEntryKey, CacheError, CacheFs, CacheIndex, CacheIndexSnapshot, CacheIoReadError, CacheKey,
     CacheLockError, CacheLockGuard, CacheLookup, CacheNamespace, CachePutResult,
     CacheScopeTransition, CacheSourceError, CacheStats, CacheStore, CancelToken,
-    DEFAULT_CACHE_CAP_BYTES, HARD_MAX_CACHE_CAP_BYTES, PendingDeleteRecord, PublishedEntryRecord,
-    RealCacheFs, SessionCacheSink, SqliteCacheIndex, StagingWriter, SystemCacheClock,
-    WATCHDOG_TIMEOUT, validate_cache_cap,
+    DEFAULT_CACHE_CAP_BYTES, HARD_MAX_CACHE_CAP_BYTES, NoopSessionCacheSink, PendingDeleteRecord,
+    PublishedEntryRecord, RealCacheFs, SessionCacheSink, SqliteCacheIndex, StagingWriter,
+    SystemCacheClock, WATCHDOG_TIMEOUT, validate_cache_cap,
 };
 
 pub use image_guard::{

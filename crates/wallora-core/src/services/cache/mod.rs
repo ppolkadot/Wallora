@@ -12,6 +12,6 @@ pub use seams::{
 pub use types::{
     CacheByteStream, CacheChunkFuture, CacheConfig, CacheConnectivity, CacheError, CacheKey,
     CacheLookup, CacheNamespace, CachePutResult, CacheScopeTransition, CacheSourceError,
-    CacheStats, CancelToken, DEFAULT_CACHE_CAP_BYTES, HARD_MAX_CACHE_CAP_BYTES, SessionCacheSink,
-    WATCHDOG_TIMEOUT, validate_cache_cap,
+    CacheStats, CancelToken, DEFAULT_CACHE_CAP_BYTES, HARD_MAX_CACHE_CAP_BYTES,
+    NoopSessionCacheSink, SessionCacheSink, WATCHDOG_TIMEOUT, validate_cache_cap,
 };
