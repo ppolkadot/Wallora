@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::Path;
@@ -53,7 +54,7 @@ pub trait CacheLockGuard: Send + Sync {}
 /// Directory entry returned by [`CacheFs::list_dir`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CacheDirEntry {
-    pub file_name: String,
+    pub file_name: OsString,
     pub byte_len: u64,
     pub is_file: bool,
 }
@@ -83,6 +84,9 @@ pub trait StagingWriter: Send {
 /// Injectable filesystem seam for cache locking, staging, publication, reads, and reconciliation.
 pub trait CacheFs: Send + Sync + 'static {
     fn create_dir_all(&self, path: &Path) -> io::Result<()>;
+
+    /// Ensures a recovery marker exists and returns whether it was already present.
+    fn create_recovery_marker(&self, path: &Path) -> io::Result<bool>;
 
     fn try_lock_exclusive(
         &self,
@@ -155,6 +159,17 @@ impl CacheFs for RealCacheFs {
         std::fs::create_dir_all(path)
     }
 
+    fn create_recovery_marker(&self, path: &Path) -> io::Result<bool> {
+        match OpenOptions::new().write(true).create_new(true).open(path) {
+            Ok(file) => {
+                file.sync_all()?;
+                Ok(false)
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(true),
+            Err(err) => Err(err),
+        }
+    }
+
     fn try_lock_exclusive(
         &self,
         lock_path: &Path,
@@ -204,8 +219,8 @@ impl CacheFs for RealCacheFs {
     }
 
     fn file_len(&self, path: &Path) -> Result<Option<u64>, io::Error> {
-        match std::fs::metadata(path) {
-            Ok(meta) => Ok(Some(meta.len())),
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) => Ok(meta.is_file().then_some(meta.len())),
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(err) => Err(err),
         }
@@ -214,21 +229,25 @@ impl CacheFs for RealCacheFs {
     fn rename_no_overwrite(&self, from: &Path, to: &Path) -> io::Result<()> {
         match std::fs::hard_link(from, to) {
             Ok(()) => {
-                // Remove staging link after hard-link publication succeeds. If removing the staging
-                // entry fails transiently, startup staging cleanup handles the leftover link safely.
-                let _ = std::fs::remove_file(from);
+                if let Err(err) = std::fs::remove_file(from) {
+                    let _ = std::fs::remove_file(to);
+                    return Err(err);
+                }
                 Ok(())
             }
-            Err(err) if err.kind() == io::ErrorKind::Unsupported => {
-                if to.try_exists()? {
-                    return Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        "destination cache object already exists",
-                    ));
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Err(err),
+            Err(_) => match std::fs::symlink_metadata(to) {
+                Ok(_) => Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "destination cache object already exists",
+                )),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                    // On filesystems without hard links, the root lock and single
+                    // actor own the fresh UUID destination across this check and move.
+                    std::fs::rename(from, to)
                 }
-                std::fs::rename(from, to)
-            }
-            Err(err) => Err(err),
+                Err(err) => Err(err),
+            },
         }
     }
 
@@ -246,12 +265,12 @@ impl CacheFs for RealCacheFs {
             let entry = item?;
             let file_type = entry.file_type()?;
             let byte_len = if file_type.is_file() {
-                entry.metadata().map(|m| m.len()).unwrap_or(0)
+                entry.metadata()?.len()
             } else {
                 0
             };
             entries.push(CacheDirEntry {
-                file_name: entry.file_name().to_string_lossy().into_owned(),
+                file_name: entry.file_name(),
                 byte_len,
                 is_file: file_type.is_file(),
             });
@@ -452,105 +471,127 @@ fn configure_and_migrate_cache_db(conn: &mut Connection) -> Result<(), CacheErro
     Ok(())
 }
 
+fn valid_cache_rel_path(path: &str) -> bool {
+    let Some((dir, name)) = path.split_once('/') else {
+        return false;
+    };
+    matches!(dir, "objects" | "staging")
+        && !name.is_empty()
+        && !name.ends_with(['.', ' '])
+        && !name.contains(['/', '\\', ':', '\0'])
+}
+
+fn load_ready_row(row: &rusqlite::Row<'_>) -> Option<PublishedEntryRecord> {
+    let namespace: String = row.get(1).ok()?;
+    let class: String = row.get(2).ok()?;
+    let key: String = row.get(3).ok()?;
+    let rel_path: String = row.get(4).ok()?;
+    let byte_len = u64::try_from(row.get::<_, i64>(5).ok()?).ok()?;
+    if !valid_cache_rel_path(&rel_path) || byte_len == 0 {
+        return None;
+    }
+    Some(PublishedEntryRecord {
+        entry_key: CacheEntryKey::new(
+            CacheNamespace::from_db_str(&namespace)?,
+            CacheKey::new(class_from_db_str(&class)?, key).ok()?,
+        ),
+        rel_path,
+        byte_len,
+        crc32: u32::try_from(row.get::<_, i64>(6).ok()?).ok()?,
+        last_access: u64::try_from(row.get::<_, i64>(7).ok()?).ok()?,
+        created_at_unix: row.get(8).ok()?,
+    })
+}
+
+fn load_cache_db(db_path: &Path) -> Result<(Connection, CacheIndexSnapshot), CacheError> {
+    let mut conn = Connection::open(db_path).map_err(cache_index_error)?;
+    configure_and_migrate_cache_db(&mut conn)?;
+    let tx = conn.transaction().map_err(cache_index_error)?;
+    let mut snapshot = CacheIndexSnapshot::default();
+    let mut bad_ready = Vec::new();
+    let mut bad_pending = Vec::new();
+    {
+        let mut stmt = tx.prepare(
+            "SELECT rowid, namespace, image_class, cache_key, rel_path, byte_len, crc32, last_access, created_at_unix
+             FROM cache_entries ORDER BY last_access ASC, created_at_unix ASC",
+        ).map_err(cache_index_error)?;
+        let mut rows = stmt.query([]).map_err(cache_index_error)?;
+        while let Some(row) = rows.next().map_err(cache_index_error)? {
+            if let Some(record) = load_ready_row(row) {
+                snapshot.ready_entries.push(record);
+            } else {
+                bad_ready.push(row.get::<_, i64>(0).map_err(cache_index_error)?);
+            }
+        }
+    }
+    {
+        let mut stmt = tx
+            .prepare("SELECT rowid, rel_path, byte_len FROM pending_deletes ORDER BY rel_path ASC")
+            .map_err(cache_index_error)?;
+        let mut rows = stmt.query([]).map_err(cache_index_error)?;
+        while let Some(row) = rows.next().map_err(cache_index_error)? {
+            if let (Ok(rel_path), Ok(byte_len)) = (row.get::<_, String>(1), row.get::<_, i64>(2))
+                && valid_cache_rel_path(&rel_path)
+                && let Ok(byte_len) = u64::try_from(byte_len)
+            {
+                snapshot
+                    .pending_deletes
+                    .push(PendingDeleteRecord { rel_path, byte_len });
+            } else {
+                bad_pending.push(row.get::<_, i64>(0).map_err(cache_index_error)?);
+            }
+        }
+    }
+    for rowid in bad_ready {
+        tx.execute("DELETE FROM cache_entries WHERE rowid = ?1", [rowid])
+            .map_err(cache_index_error)?;
+    }
+    for rowid in bad_pending {
+        tx.execute("DELETE FROM pending_deletes WHERE rowid = ?1", [rowid])
+            .map_err(cache_index_error)?;
+    }
+    tx.commit().map_err(cache_index_error)?;
+    Ok((conn, snapshot))
+}
+
+fn cache_index_error(err: rusqlite::Error) -> CacheError {
+    CacheError::Index(err.to_string())
+}
+
 impl CacheIndex for SqliteCacheIndex {
     fn open_and_load(&self, db_path: &Path) -> Result<CacheIndexSnapshot, CacheError> {
         let mut guard = self
             .conn
             .lock()
             .map_err(|_| CacheError::Index("cache index mutex poisoned".to_string()))?;
-
-        let mut conn = Connection::open(db_path).map_err(|e| CacheError::Index(e.to_string()))?;
-        configure_and_migrate_cache_db(&mut conn)?;
-
-        let mut ready_entries = Vec::new();
-        {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT namespace, image_class, cache_key, rel_path, byte_len, crc32, last_access, created_at_unix
-                     FROM cache_entries
-                     ORDER BY last_access ASC, created_at_unix ASC",
-                )
-                .map_err(|e| CacheError::Index(e.to_string()))?;
-            let rows = stmt
-                .query_map([], |row| {
-                    let ns_raw: String = row.get(0)?;
-                    let class_raw: String = row.get(1)?;
-                    let key_raw: String = row.get(2)?;
-                    let rel_path: String = row.get(3)?;
-                    let byte_len: i64 = row.get(4)?;
-                    let crc32: i64 = row.get(5)?;
-                    let last_access: i64 = row.get(6)?;
-                    let created_at_unix: i64 = row.get(7)?;
-                    Ok((
-                        ns_raw,
-                        class_raw,
-                        key_raw,
-                        rel_path,
-                        byte_len,
-                        crc32,
-                        last_access,
-                        created_at_unix,
-                    ))
-                })
-                .map_err(|e| CacheError::Index(e.to_string()))?;
-            for row in rows {
-                let (
-                    ns_raw,
-                    class_raw,
-                    key_raw,
-                    rel_path,
-                    byte_len,
-                    crc32,
-                    last_access,
-                    created_at_unix,
-                ) = row.map_err(|e| CacheError::Index(e.to_string()))?;
-                let Some(namespace) = CacheNamespace::from_db_str(&ns_raw) else {
-                    return Err(CacheError::Index(format!(
-                        "invalid cache namespace in index: {ns_raw}"
-                    )));
-                };
-                let Some(class) = class_from_db_str(&class_raw) else {
-                    return Err(CacheError::Index(format!(
-                        "invalid image_class in index: {class_raw}"
-                    )));
-                };
-                let key = CacheKey::new(class, key_raw)?;
-                ready_entries.push(PublishedEntryRecord {
-                    entry_key: CacheEntryKey::new(namespace, key),
-                    rel_path,
-                    byte_len: u64::try_from(byte_len).unwrap_or(0),
-                    crc32: u32::try_from(crc32).unwrap_or(0),
-                    last_access: u64::try_from(last_access).unwrap_or(0),
-                    created_at_unix,
-                });
+        // Drop any prior connection before moving the DB and its SQLite sidecars.
+        guard.take();
+        let (conn, snapshot) = match load_cache_db(db_path) {
+            Ok(loaded) => loaded,
+            Err(err) => {
+                tracing::warn!(%err, "rebuilding unusable cache index");
+                let mut quarantine = db_path.as_os_str().to_os_string();
+                quarantine.push(format!(".corrupt-{}", uuid::Uuid::new_v4()));
+                for suffix in ["-wal", "-shm", "-journal", ""] {
+                    let mut source = db_path.as_os_str().to_os_string();
+                    source.push(suffix);
+                    let mut destination = quarantine.clone();
+                    destination.push(suffix);
+                    match std::fs::rename(source, destination) {
+                        Ok(()) => {}
+                        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                        Err(err) => {
+                            return Err(CacheError::Index(format!(
+                                "could not quarantine cache index: {err}"
+                            )));
+                        }
+                    }
+                }
+                load_cache_db(db_path)?
             }
-        }
-
-        let mut pending_deletes = Vec::new();
-        {
-            let mut stmt = conn
-                .prepare("SELECT rel_path, byte_len FROM pending_deletes ORDER BY rel_path ASC")
-                .map_err(|e| CacheError::Index(e.to_string()))?;
-            let rows = stmt
-                .query_map([], |row| {
-                    let rel_path: String = row.get(0)?;
-                    let byte_len: i64 = row.get(1)?;
-                    Ok(PendingDeleteRecord {
-                        rel_path,
-                        byte_len: u64::try_from(byte_len).unwrap_or(0),
-                    })
-                })
-                .map_err(|e| CacheError::Index(e.to_string()))?;
-            for row in rows {
-                pending_deletes.push(row.map_err(|e| CacheError::Index(e.to_string()))?);
-            }
-        }
-
+        };
         *guard = Some(conn);
-        Ok(CacheIndexSnapshot {
-            ready_entries,
-            pending_deletes,
-        })
+        Ok(snapshot)
     }
 
     fn commit_publish(
@@ -710,5 +751,56 @@ impl CacheIndex for SqliteCacheIndex {
             .map_err(|e| CacheError::Index(e.to_string()))?;
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("wallora-rename-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn rename_no_overwrite_preserves_existing_destination_and_source() {
+        let dir = TempDir::new();
+        let from = dir.0.join("staging");
+        let to = dir.0.join("object");
+        std::fs::write(&from, b"source").unwrap();
+        std::fs::write(&to, b"existing").unwrap();
+        assert_eq!(
+            RealCacheFs
+                .rename_no_overwrite(&from, &to)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(std::fs::read(&from).unwrap(), b"source");
+        assert_eq!(std::fs::read(&to).unwrap(), b"existing");
+    }
+
+    #[test]
+    fn rename_no_overwrite_moves_file_to_fresh_destination() {
+        let dir = TempDir::new();
+        let from = dir.0.join("staging");
+        let to = dir.0.join("object");
+        std::fs::write(&from, b"payload").unwrap();
+        RealCacheFs.rename_no_overwrite(&from, &to).unwrap();
+        assert!(!from.exists());
+        assert_eq!(std::fs::read(&to).unwrap(), b"payload");
     }
 }

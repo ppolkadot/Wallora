@@ -181,7 +181,9 @@ struct FaultyCacheFs {
     file_removed_tx: watch::Sender<usize>,
     _file_removed_rx: watch::Receiver<usize>,
     fail_remove_prefix: Mutex<Option<String>>,
+    read_bounded_calls: AtomicUsize,
     fail_rename: AtomicBool,
+    panic_after_rename: AtomicBool,
     removed_paths: Mutex<Vec<PathBuf>>,
     renamed_targets: Mutex<Vec<PathBuf>>,
 }
@@ -208,7 +210,9 @@ impl Default for FaultyCacheFs {
             file_removed_tx,
             _file_removed_rx,
             fail_remove_prefix: Mutex::new(None),
+            read_bounded_calls: AtomicUsize::new(0),
             fail_rename: AtomicBool::new(false),
+            panic_after_rename: AtomicBool::new(false),
             removed_paths: Mutex::new(Vec::new()),
             renamed_targets: Mutex::new(Vec::new()),
         }
@@ -281,6 +285,10 @@ impl CacheFs for FaultyCacheFs {
         self.real.create_dir_all(path)
     }
 
+    fn create_recovery_marker(&self, path: &Path) -> io::Result<bool> {
+        self.real.create_recovery_marker(path)
+    }
+
     fn try_lock_exclusive(
         &self,
         lock_path: &Path,
@@ -312,6 +320,7 @@ impl CacheFs for FaultyCacheFs {
     }
 
     fn read_bounded(&self, path: &Path, max_bytes: usize) -> Result<Vec<u8>, CacheIoReadError> {
+        self.read_bounded_calls.fetch_add(1, Ordering::SeqCst);
         self.real.read_bounded(path, max_bytes)
     }
 
@@ -328,6 +337,10 @@ impl CacheFs for FaultyCacheFs {
             .lock()
             .expect("lock")
             .push(to.to_path_buf());
+        assert!(
+            !self.panic_after_rename.load(Ordering::SeqCst),
+            "injected publish panic"
+        );
         Ok(())
     }
 
@@ -359,6 +372,7 @@ impl CacheFs for FaultyCacheFs {
 struct FaultyCacheIndex {
     inner: SqliteCacheIndex,
     fail_commit_publish: AtomicBool,
+    fail_hide: AtomicBool,
 }
 
 impl FaultyCacheIndex {
@@ -366,6 +380,7 @@ impl FaultyCacheIndex {
         Arc::new(Self {
             inner: SqliteCacheIndex::new(),
             fail_commit_publish: AtomicBool::new(false),
+            fail_hide: AtomicBool::new(false),
         })
     }
 }
@@ -401,6 +416,9 @@ impl CacheIndex for FaultyCacheIndex {
         entries: &[CacheEntryKey],
         deletes: &[PendingDeleteRecord],
     ) -> Result<(), CacheError> {
+        if self.fail_hide.load(Ordering::SeqCst) {
+            return Err(CacheError::Index("injected hide failure".into()));
+        }
         self.inner.hide_and_queue_deletes(entries, deletes)
     }
 
@@ -808,6 +826,12 @@ async fn index_failure_preserves_previous_entry() {
     assert_eq!(stats.published_bytes, 64);
     assert_eq!(stats.reserved_bytes, 0);
     assert_eq!(stats.tombstone_bytes, 0);
+    assert_eq!(
+        std::fs::read_dir(dir.path().join("objects"))
+            .unwrap()
+            .count(),
+        1
+    );
     store.shutdown().await;
 }
 
@@ -1537,7 +1561,7 @@ async fn same_generation_different_account_cannot_publish() {
     let acct_a = AccountId::new("acct-alpha");
     let acct_b = AccountId::new("acct-beta");
     let scope_a = SessionScope::account(acct_a.clone(), 5);
-    let scope_b = SessionScope::account(acct_b.clone(), 5);
+    let scope_b = SessionScope::account(acct_b.clone(), 6);
 
     let store = CacheStore::open_with_seams(
         CacheConfig::new(dir.path().to_path_buf(), scope_a.clone())
@@ -1558,7 +1582,21 @@ async fn same_generation_different_account_cannot_publish() {
     let put_handle = tokio::spawn(async move { s1.put(k1, sc_a, Some(64), rx).await });
     fs.wait_writers_opened(1).await;
 
-    // Transition to a DIFFERENT account with the SAME generation (5).
+    // Reject a different account at the same generation, without cancelling A.
+    assert_eq!(
+        store
+            .transition_scope(CacheScopeTransition {
+                new_scope: SessionScope::account(acct_b, 5),
+                purge_account: Some(acct_a.clone()),
+            })
+            .await,
+        Err(CacheError::ScopeMismatch)
+    );
+    let stats = store.stats().await.unwrap();
+    assert_eq!(stats.current_scope, scope_a);
+    assert_eq!(stats.reserved_bytes, 64);
+
+    // A valid transition supersedes the old writer.
     store
         .transition_scope(CacheScopeTransition {
             new_scope: scope_b.clone(),
@@ -1813,16 +1851,26 @@ async fn duplicate_completion_and_retired_id_after_failed_delete_ignored() {
         .unwrap();
     assert_eq!(store.stats().await.unwrap().entry_count, 1);
 
+    assert_eq!(fs.renamed_targets().len(), 1);
+    assert_eq!(
+        store.get(key1, scope.clone()).await.unwrap(),
+        CacheLookup::Hit {
+            scope: scope.clone(),
+            bytes: vec![1; 32],
+            stale: false,
+        }
+    );
+
     // 2. Cancelled reservation whose staging cleanup fails -> retired as tombstone (reservation_id = 2).
     // Injecting a late Finished for that retired id must be completely ignored and publish nothing.
     fs.set_fail_remove_prefix(Some("/staging/"));
-    let (_tx, rx) = mpsc::channel::<Result<Vec<u8>, CacheSourceError>>(2);
+    let gate = fs.arm_close_gate();
     let s1 = store.clone();
     let sc1 = scope.clone();
     let key2 = thumb_key("retired-after-failed-delete");
     let k2 = key2.clone();
-    let put2 = tokio::spawn(async move { s1.put(k2, sc1, Some(80), rx).await });
-    fs.wait_writers_opened(2).await;
+    let put2 = tokio::spawn(async move { s1.put(k2, sc1, Some(80), vec![2; 32]).await });
+    fs.wait_close_entered(2).await;
 
     store
         .transition_scope(CacheScopeTransition {
@@ -1831,10 +1879,11 @@ async fn duplicate_completion_and_retired_id_after_failed_delete_ignored() {
         })
         .await
         .unwrap();
+    gate.release();
     assert_eq!(put2.await.unwrap().unwrap_err(), CacheError::ScopeMismatch);
 
     let stats_tomb = store.stats().await.unwrap();
-    assert_eq!(stats_tomb.tombstone_bytes, 0); // staging file was empty (0 bytes actual_len)
+    assert_eq!(stats_tomb.tombstone_bytes, 32);
     assert_eq!(stats_tomb.pending_deletes, 1);
 
     // Inject Finished for retired reservation_id = 2 -> ignored, nothing published.
@@ -1847,6 +1896,8 @@ async fn duplicate_completion_and_retired_id_after_failed_delete_ignored() {
         CacheLookup::Miss
     );
     assert_eq!(store.stats().await.unwrap().entry_count, 1);
+    assert_eq!(fs.renamed_targets().len(), 1);
+    assert_eq!(store.stats().await.unwrap().tombstone_bytes, 32);
     store.shutdown().await;
 }
 
@@ -1906,7 +1957,7 @@ async fn startup_reconciles_staging_missing_corrupt_and_pending_deletes() {
     drop(conn);
 
     std::fs::remove_file(dir.path().join(&missing_rel)).unwrap();
-    std::fs::write(dir.path().join(&corrupt_rel), vec![0xFF; 40]).unwrap();
+    std::fs::write(dir.path().join(&corrupt_rel), vec![0xFF; 41]).unwrap();
     let stale_staging = dir.path().join("staging").join("crashed.part");
     std::fs::write(&stale_staging, vec![0xAA; 128]).unwrap();
 
@@ -2183,4 +2234,490 @@ async fn session_manager_wires_logout_switch_and_401_to_fake_and_real_cache() {
     assert_eq!(stats.published_bytes, 0);
     assert_eq!(stats.current_scope, live_session.scope());
     cache_store.shutdown().await;
+}
+
+async fn open_test_cache(
+    dir: &TempCacheDir,
+    scope: SessionScope,
+    fs: Arc<FaultyCacheFs>,
+    index: Arc<FaultyCacheIndex>,
+    cap: u64,
+) -> Result<CacheStore, CacheError> {
+    CacheStore::open_with_seams(
+        CacheConfig::new(dir.path().to_path_buf(), scope)
+            .with_cap_bytes(cap)
+            .unwrap(),
+        fs,
+        index,
+        Arc::new(FakeClock::default()),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_last_handle_drop_releases_root_lock() {
+    let dir = TempCacheDir::new();
+    let scope = SessionScope::guest(1);
+    let store = CacheStore::open(CacheConfig::new(dir.path().into(), scope.clone()))
+        .await
+        .unwrap();
+    drop(store);
+    let reopened = bounded("root lock released", async {
+        loop {
+            match open_test_cache(
+                &dir,
+                scope.clone(),
+                FaultyCacheFs::new(),
+                FaultyCacheIndex::new(),
+                100,
+            )
+            .await
+            {
+                Err(CacheError::Locked) => tokio::task::yield_now().await,
+                result => break result.unwrap(),
+            }
+        }
+    })
+    .await;
+    reopened.shutdown().await;
+}
+
+#[tokio::test]
+async fn review_failed_sink_purge_hides_keeps_charge_and_retries() {
+    let dir = TempCacheDir::new();
+    let fs = FaultyCacheFs::new();
+    let index = FaultyCacheIndex::new();
+    let id = AccountId::new("purge-retry");
+    let scope = SessionScope::account(id.clone(), 1);
+    let store = open_test_cache(&dir, scope.clone(), fs, index.clone(), 100)
+        .await
+        .unwrap();
+    let key = thumb_key("private");
+    store
+        .put(key.clone(), scope, Some(10), vec![1; 10])
+        .await
+        .unwrap();
+    index.fail_hide.store(true, Ordering::SeqCst);
+    store.on_scope_transition(CacheScopeTransition {
+        new_scope: SessionScope::guest(2),
+        purge_account: Some(id.clone()),
+    });
+    let next = SessionScope::account(id, 3);
+    store
+        .transition_scope(CacheScopeTransition {
+            new_scope: next.clone(),
+            purge_account: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get(key, next.clone()).await.unwrap(),
+        CacheLookup::Miss
+    );
+    let stats = store.stats().await.unwrap();
+    assert_eq!(
+        (
+            stats.published_bytes,
+            stats.tombstone_bytes,
+            stats.total_charged_bytes
+        ),
+        (0, 10, 10)
+    );
+    index.fail_hide.store(false, Ordering::SeqCst);
+    store
+        .put(thumb_key("new"), next, Some(5), vec![2; 5])
+        .await
+        .unwrap();
+    assert_eq!(store.stats().await.unwrap().total_charged_bytes, 5);
+    assert_eq!(
+        std::fs::read_dir(dir.path().join("objects"))
+            .unwrap()
+            .count(),
+        1
+    );
+    store.shutdown().await;
+}
+
+#[tokio::test]
+async fn review_failed_purge_stays_hidden_on_reopen() {
+    let dir = TempCacheDir::new();
+    let index = FaultyCacheIndex::new();
+    let id = AccountId::new("purge-restart");
+    let scope = SessionScope::account(id.clone(), 1);
+    let store = open_test_cache(
+        &dir,
+        scope.clone(),
+        FaultyCacheFs::new(),
+        index.clone(),
+        100,
+    )
+    .await
+    .unwrap();
+    let key = thumb_key("private");
+    store
+        .put(key.clone(), scope.clone(), Some(10), vec![1; 10])
+        .await
+        .unwrap();
+    index.fail_hide.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        store.purge_account(id).await,
+        Err(CacheError::Index(_))
+    ));
+    store.shutdown().await;
+    drop(index);
+    let reopened = CacheStore::open(CacheConfig::new(dir.path().into(), scope.clone()))
+        .await
+        .unwrap();
+    assert_eq!(reopened.get(key, scope).await.unwrap(), CacheLookup::Miss);
+    assert_eq!(reopened.stats().await.unwrap().total_charged_bytes, 0);
+    reopened.shutdown().await;
+}
+
+#[tokio::test]
+async fn review_purge_cancels_held_writer_until_finished() {
+    let dir = TempCacheDir::new();
+    let fs = FaultyCacheFs::new();
+    let id = AccountId::new("purge-held");
+    let scope = SessionScope::account(id.clone(), 1);
+    let store = open_test_cache(
+        &dir,
+        scope.clone(),
+        fs.clone(),
+        FaultyCacheIndex::new(),
+        100,
+    )
+    .await
+    .unwrap();
+    let gate = fs.arm_close_gate();
+    let key = thumb_key("private");
+    let put = tokio::spawn({
+        let (store, scope, key) = (store.clone(), scope.clone(), key.clone());
+        async move { store.put(key, scope, Some(10), vec![1; 10]).await }
+    });
+    fs.wait_close_entered(1).await;
+    store.on_purge_account(&id);
+    let stats = store.stats().await.unwrap();
+    gate.release();
+    assert_eq!(stats.reserved_bytes, 10);
+    assert_eq!(
+        bounded("writer finishes", put).await.unwrap(),
+        Err(CacheError::Cancelled)
+    );
+    assert_eq!(store.get(key, scope).await.unwrap(), CacheLookup::Miss);
+    assert!(fs.renamed_targets().is_empty());
+    assert_eq!(store.stats().await.unwrap().total_charged_bytes, 0);
+    store.shutdown().await;
+}
+
+#[tokio::test]
+async fn review_scope_transition_requires_new_generation_unless_identical() {
+    let dir = TempCacheDir::new();
+    let scope = SessionScope::guest(5);
+    let store = CacheStore::open(CacheConfig::new(dir.path().into(), scope.clone()))
+        .await
+        .unwrap();
+    for new_scope in [
+        SessionScope::guest(4),
+        SessionScope::account(AccountId::new("same-gen"), 5),
+    ] {
+        assert_eq!(
+            store
+                .transition_scope(CacheScopeTransition {
+                    new_scope,
+                    purge_account: None
+                })
+                .await,
+            Err(CacheError::ScopeMismatch)
+        );
+        assert_eq!(store.stats().await.unwrap().current_scope, scope);
+    }
+    store
+        .transition_scope(CacheScopeTransition {
+            new_scope: scope.clone(),
+            purge_account: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(store.stats().await.unwrap().current_scope, scope);
+    store.shutdown().await;
+}
+
+#[tokio::test]
+async fn review_publish_panic_keeps_charge_until_cleanup() {
+    let dir = TempCacheDir::new();
+    let fs = FaultyCacheFs::new();
+    let scope = SessionScope::guest(1);
+    let store = open_test_cache(&dir, scope.clone(), fs.clone(), FaultyCacheIndex::new(), 20)
+        .await
+        .unwrap();
+    fs.panic_after_rename.store(true, Ordering::SeqCst);
+    fs.set_fail_remove_prefix(Some("/objects/"));
+    let key = thumb_key("panic");
+    assert!(matches!(
+        store
+            .put(key.clone(), scope.clone(), Some(20), vec![3; 20])
+            .await,
+        Err(CacheError::Io(_))
+    ));
+    assert_eq!(
+        store.get(key.clone(), scope.clone()).await.unwrap(),
+        CacheLookup::Miss
+    );
+    assert_eq!(store.stats().await.unwrap().tombstone_bytes, 20);
+    assert!(fs.renamed_targets()[0].exists());
+    fs.set_fail_remove_prefix(None);
+    fs.panic_after_rename.store(false, Ordering::SeqCst);
+    store.put(key, scope, Some(20), vec![4; 20]).await.unwrap();
+    assert!(!fs.renamed_targets()[0].exists());
+    assert_eq!(store.stats().await.unwrap().total_charged_bytes, 20);
+    store.shutdown().await;
+}
+
+#[tokio::test]
+async fn review_truncated_and_empty_payloads_do_not_publish() {
+    let dir = TempCacheDir::new();
+    let fs = FaultyCacheFs::new();
+    let scope = SessionScope::guest(1);
+    let store = open_test_cache(
+        &dir,
+        scope.clone(),
+        fs.clone(),
+        FaultyCacheIndex::new(),
+        2_000_000,
+    )
+    .await
+    .unwrap();
+    for (expected, payload) in [(Some(10), vec![1; 9]), (Some(0), vec![]), (None, vec![])] {
+        let key = thumb_key("bad-size");
+        assert!(matches!(
+            store
+                .put(key.clone(), scope.clone(), expected, payload)
+                .await,
+            Err(CacheError::WriterFailed(_))
+        ));
+        assert_eq!(
+            store.get(key, scope.clone()).await.unwrap(),
+            CacheLookup::Miss
+        );
+        assert_eq!(store.stats().await.unwrap().total_charged_bytes, 0);
+    }
+    assert!(fs.renamed_targets().is_empty());
+    store.shutdown().await;
+}
+
+#[tokio::test]
+async fn review_rename_failure_preserves_previous_entry() {
+    let dir = TempCacheDir::new();
+    let fs = FaultyCacheFs::new();
+    let scope = SessionScope::guest(1);
+    let store = open_test_cache(
+        &dir,
+        scope.clone(),
+        fs.clone(),
+        FaultyCacheIndex::new(),
+        100,
+    )
+    .await
+    .unwrap();
+    let key = thumb_key("replacement");
+    store
+        .put(key.clone(), scope.clone(), Some(10), vec![1; 10])
+        .await
+        .unwrap();
+    fs.fail_rename.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        store
+            .put(key.clone(), scope.clone(), Some(20), vec![2; 20])
+            .await,
+        Err(CacheError::Io(_))
+    ));
+    assert_eq!(
+        store.get(key, scope.clone()).await.unwrap(),
+        CacheLookup::Hit {
+            scope,
+            bytes: vec![1; 10],
+            stale: false
+        }
+    );
+    assert_eq!(store.stats().await.unwrap().total_charged_bytes, 10);
+    assert_eq!(fs.renamed_targets().len(), 1);
+    assert_eq!(
+        std::fs::read_dir(dir.path().join("staging"))
+            .unwrap()
+            .count(),
+        0
+    );
+    store.shutdown().await;
+}
+
+#[tokio::test]
+async fn review_startup_salvages_valid_rows_and_never_follows_invalid_paths() {
+    let dir = TempCacheDir::new();
+    let scope = SessionScope::guest(1);
+    let config = CacheConfig::new(dir.path().into(), scope.clone());
+    let store = CacheStore::open(config.clone()).await.unwrap();
+    let good = thumb_key("good");
+    store
+        .put(good.clone(), scope.clone(), Some(3), vec![1; 3])
+        .await
+        .unwrap();
+    store.shutdown().await;
+    std::fs::write(dir.path().join("outside"), b"keep").unwrap();
+    std::fs::write(dir.path().join("objects/bad.bin"), b"discard").unwrap();
+    let db = rusqlite::Connection::open(dir.path().join("cache_index.db")).unwrap();
+    db.execute_batch(
+        "INSERT INTO cache_entries VALUES
+        ('bad namespace','thumb','bad','objects/bad.bin',7,0,1,0),
+        ('guest','thumb','bad-path','objects/../outside',4,0,1,0);
+        INSERT INTO pending_deletes VALUES ('../outside',4), ('objects/../outside',4);",
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO pending_deletes VALUES (?1,4)",
+        [dir.path().join("outside").to_str().unwrap()],
+    )
+    .unwrap();
+    drop(db);
+    let store = CacheStore::open(config).await.unwrap();
+    assert_eq!(std::fs::read(dir.path().join("outside")).unwrap(), b"keep");
+    assert!(!dir.path().join("objects/bad.bin").exists());
+    assert_eq!(
+        store.get(good, scope.clone()).await.unwrap(),
+        CacheLookup::Hit {
+            scope,
+            bytes: vec![1; 3],
+            stale: false
+        }
+    );
+    let db = rusqlite::Connection::open(dir.path().join("cache_index.db")).unwrap();
+    let count = |table: &str| {
+        db.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap()
+    };
+    assert_eq!(count("cache_entries"), 1);
+    assert_eq!(count("pending_deletes"), 0);
+    store.shutdown().await;
+}
+
+#[tokio::test]
+async fn review_startup_rebuilds_corrupt_index_and_reconciles_payloads() {
+    let dir = TempCacheDir::new();
+    std::fs::create_dir_all(dir.path().join("objects")).unwrap();
+    std::fs::create_dir_all(dir.path().join("staging")).unwrap();
+    std::fs::write(dir.path().join("cache_index.db"), vec![0xBB; 4096]).unwrap();
+    for path in ["objects/lost.bin", "staging/lost.part"] {
+        std::fs::write(dir.path().join(path), b"unindexed").unwrap();
+    }
+    let store = CacheStore::open(CacheConfig::new(dir.path().into(), SessionScope::guest(1)))
+        .await
+        .unwrap();
+    assert!(std::fs::read_dir(dir.path()).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("cache_index.db.corrupt-")
+    }));
+    assert!(!dir.path().join("objects/lost.bin").exists());
+    assert!(!dir.path().join("staging/lost.part").exists());
+    assert_eq!(store.stats().await.unwrap().total_charged_bytes, 0);
+    store.shutdown().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn review_startup_removes_non_utf8_files() {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = TempCacheDir::new();
+    std::fs::create_dir_all(dir.path().join("objects")).unwrap();
+    let path = dir
+        .path()
+        .join("objects")
+        .join(std::ffi::OsStr::from_bytes(b"bad-\xff"));
+    std::fs::write(&path, b"unindexed").unwrap();
+    let store = CacheStore::open(CacheConfig::new(dir.path().into(), SessionScope::guest(1)))
+        .await
+        .unwrap();
+    assert!(!path.exists());
+    store.shutdown().await;
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::test_runner::Config::with_cases(12))]
+    #[test]
+    fn review_random_puts_and_evictions_preserve_ledger(
+        cap in 8u64..64,
+        puts in proptest::collection::vec((0u8..5, 1u64..72), 1..16)
+    ) {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let dir = TempCacheDir::new();
+            let scope = SessionScope::guest(1);
+            let store = CacheStore::open(CacheConfig::new(dir.path().into(), scope.clone()).with_cap_bytes(cap).unwrap()).await.unwrap();
+            for (key, size) in puts {
+                let result = store.put(thumb_key(&key.to_string()), scope.clone(), Some(size), vec![key; size as usize]).await;
+                if size > cap {
+                    assert_eq!(result, Err(CacheError::CapacityExceeded));
+                } else {
+                    assert_eq!(result.unwrap().byte_len, size);
+                }
+                let stats = store.stats().await.unwrap();
+                let disk_bytes: u64 = std::fs::read_dir(dir.path().join("objects")).unwrap()
+                    .map(|entry| entry.unwrap().metadata().unwrap().len()).sum();
+                assert!(stats.total_charged_bytes <= cap);
+                assert_eq!(stats.total_charged_bytes, stats.published_bytes + stats.reserved_bytes + stats.tombstone_bytes);
+                assert_eq!(stats.published_bytes, disk_bytes);
+            }
+            store.shutdown().await;
+        });
+    }
+}
+
+#[tokio::test]
+async fn startup_defers_same_length_corruption_to_first_get() {
+    let dir = TempCacheDir::new();
+    let fs = FaultyCacheFs::new();
+    let scope = SessionScope::guest(1);
+    let key = thumb_key("lazy-crc");
+    let store = open_test_cache(
+        &dir,
+        scope.clone(),
+        fs.clone(),
+        FaultyCacheIndex::new(),
+        100,
+    )
+    .await
+    .unwrap();
+    store
+        .put(key.clone(), scope.clone(), Some(16), vec![1; 16])
+        .await
+        .unwrap();
+    let path = fs.renamed_targets()[0].clone();
+    store.shutdown().await;
+    std::fs::write(&path, [2; 16]).unwrap();
+
+    let reopened = open_test_cache(
+        &dir,
+        scope.clone(),
+        fs.clone(),
+        FaultyCacheIndex::new(),
+        100,
+    )
+    .await
+    .unwrap();
+    let stats = reopened.stats().await.unwrap();
+    assert_eq!(stats.entry_count, 1);
+    assert_eq!(stats.published_bytes, 16);
+    assert!(path.exists());
+    assert_eq!(fs.read_bounded_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        reopened.get(key.clone(), scope.clone()).await.unwrap(),
+        CacheLookup::CorruptPurged
+    );
+    assert_eq!(reopened.get(key, scope).await.unwrap(), CacheLookup::Miss);
+    assert!(!path.exists());
+    assert_eq!(fs.read_bounded_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(reopened.stats().await.unwrap().total_charged_bytes, 0);
+    reopened.shutdown().await;
 }

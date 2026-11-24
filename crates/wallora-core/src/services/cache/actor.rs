@@ -92,12 +92,23 @@ struct LiveReservation {
     entry_key: CacheEntryKey,
     scope: SessionScope,
     charge: u64,
+    expected_len: Option<u64>,
     staging_rel_path: String,
     cancel_token: CancelToken,
     cancelled: bool,
     watchdog_deadline: Option<Instant>,
     overdue: bool,
     reply_tx: Option<oneshot::Sender<Result<CachePutResult, CacheError>>>,
+}
+
+impl LiveReservation {
+    fn cancel(&mut self, now: Instant) {
+        if !self.cancelled {
+            self.cancelled = true;
+            self.watchdog_deadline = Some(now + WATCHDOG_TIMEOUT);
+            self.cancel_token.cancel();
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -467,6 +478,8 @@ struct CacheActor {
     ledger: ByteLedger,
     ready_entries: HashMap<CacheEntryKey, PublishedEntryRecord>,
     tombstones: HashMap<String, u64>,
+    pending_purges: HashMap<AccountId, Vec<PublishedEntryRecord>>,
+    uncertain_publishes: Vec<(Vec<String>, u64)>,
     live_reservations: HashMap<u64, LiveReservation>,
     task_to_reservation: HashMap<TaskId, u64>,
     caller_to_reservation: HashMap<u64, u64>,
@@ -476,6 +489,8 @@ struct CacheActor {
     next_access_seq: u64,
     shutting_down: bool,
 }
+
+const ACTIVE_MARKER: &str = "cache.active";
 
 fn init_and_reconcile(
     root_dir: PathBuf,
@@ -501,6 +516,11 @@ fn init_and_reconcile(
     fs.create_dir_all(&objects_dir)
         .map_err(|e| CacheError::Io(e.to_string()))?;
 
+    // A prior actor can exit before persisting an account purge. Keep this
+    // marker until shutdown has verified that every purge reached SQLite.
+    let discard_account_entries = fs
+        .create_recovery_marker(&root_dir.join(ACTIVE_MARKER))
+        .map_err(|e| CacheError::Io(e.to_string()))?;
     let snapshot = index.open_and_load(&root_dir.join("cache_index.db"))?;
 
     let mut tombstones: HashMap<String, u64> = HashMap::new();
@@ -514,7 +534,12 @@ fn init_and_reconcile(
         if !entry.is_file {
             continue;
         }
-        let rel_path = format!("staging/{}", entry.file_name);
+        let Some(name) = entry.file_name.to_str() else {
+            fs.remove_file(&staging_dir.join(entry.file_name))
+                .map_err(|e| CacheError::Io(e.to_string()))?;
+            continue;
+        };
+        let rel_path = format!("staging/{name}");
         if fs.remove_file(&root_dir.join(&rel_path)).is_err() {
             let actual_len = fs
                 .file_len(&root_dir.join(&rel_path))
@@ -556,32 +581,39 @@ fn init_and_reconcile(
     let mut max_access_seq: u64 = 0;
 
     for record in snapshot.ready_entries {
+        if tombstones.contains_key(&record.rel_path)
+            || (discard_account_entries
+                && matches!(record.entry_key.namespace, CacheNamespace::Account(_)))
+        {
+            // The object scan removes unindexed files after the ready rows are hidden.
+            dead_entry_keys.push(record.entry_key);
+            continue;
+        }
         max_access_seq = max_access_seq.max(record.last_access);
         let abs_path = root_dir.join(&record.rel_path);
-        match fs.read_bounded(&abs_path, record.entry_key.key.class.byte_limit()) {
-            Ok(bytes)
-                if bytes.len() as u64 == record.byte_len && crc32_ieee(&bytes) == record.crc32 =>
+        // Check metadata at startup. The first read verifies the payload checksum.
+        let size = fs.file_len(&abs_path);
+        match size {
+            Ok(Some(len))
+                if len == record.byte_len
+                    && len <= record.entry_key.key.class.byte_limit() as u64 =>
             {
                 indexed_paths.insert(record.rel_path.clone());
                 ready_entries.insert(record.entry_key.clone(), record);
             }
-            Ok(_) | Err(CacheIoReadError::TooLarge) | Err(CacheIoReadError::Io(_)) => {
+            Ok(None) => {
+                dead_entry_keys.push(record.entry_key);
+            }
+            size => {
                 dead_entry_keys.push(record.entry_key);
                 if fs.remove_file(&abs_path).is_err() {
-                    let actual_len = fs
-                        .file_len(&abs_path)
-                        .ok()
-                        .flatten()
-                        .unwrap_or(record.byte_len);
+                    let actual_len = size.ok().flatten().unwrap_or(record.byte_len);
                     tombstones.insert(record.rel_path.clone(), actual_len);
                     new_pending_deletes.push(PendingDeleteRecord {
                         rel_path: record.rel_path,
                         byte_len: actual_len,
                     });
                 }
-            }
-            Err(CacheIoReadError::NotFound) => {
-                dead_entry_keys.push(record.entry_key);
             }
         }
     }
@@ -599,7 +631,12 @@ fn init_and_reconcile(
         if !entry.is_file {
             continue;
         }
-        let rel_path = format!("objects/{}", entry.file_name);
+        let Some(name) = entry.file_name.to_str() else {
+            fs.remove_file(&objects_dir.join(entry.file_name))
+                .map_err(|e| CacheError::Io(e.to_string()))?;
+            continue;
+        };
+        let rel_path = format!("objects/{name}");
         if indexed_paths.contains(&rel_path) || tombstones.contains_key(&rel_path) {
             continue;
         }
@@ -640,6 +677,8 @@ fn init_and_reconcile(
         ledger,
         ready_entries,
         tombstones,
+        pending_purges: HashMap::new(),
+        uncertain_publishes: Vec::new(),
         live_reservations: HashMap::new(),
         task_to_reservation: HashMap::new(),
         caller_to_reservation: HashMap::new(),
@@ -693,22 +732,27 @@ impl CacheActor {
         mut cmd_rx: mpsc::Receiver<ActorCommand>,
         mut transition_rx: mpsc::UnboundedReceiver<CacheSyncNotice>,
     ) {
+        let mut transitions_open = true;
         loop {
             let next_deadline = self.next_watchdog_deadline();
             tokio::select! {
                 biased;
 
-                maybe_notice = transition_rx.recv() => {
-                    match maybe_notice {
+                maybe_notice = transition_rx.recv(), if transitions_open => {
+                    let result = match maybe_notice {
                         Some(CacheSyncNotice::ScopeTransition(transition)) => {
-                            let _ = self.handle_scope_transition(transition).await;
+                            self.handle_scope_transition(transition).await
                         }
                         Some(CacheSyncNotice::PurgeAccount(account_id)) => {
-                            let _ = self.purge_account_entries(&account_id).await;
+                            self.purge_account_entries(&account_id).await
                         }
                         None => {
-                            // Transition channel closed only when all CacheStore handles drop.
+                            transitions_open = false;
+                            Ok(())
                         }
+                    };
+                    if let Err(err) = result {
+                        tracing::warn!(%err, "cache session notification failed");
                     }
                 }
 
@@ -837,7 +881,13 @@ impl CacheActor {
             total_charged_bytes,
             entry_count: self.ready_entries.len(),
             live_reservations: self.live_reservations.len(),
-            pending_deletes: self.tombstones.len(),
+            pending_deletes: self.tombstones.len()
+                + self.pending_purges.values().map(Vec::len).sum::<usize>()
+                + self
+                    .uncertain_publishes
+                    .iter()
+                    .map(|(paths, _)| paths.len())
+                    .sum::<usize>(),
             overdue_writers: overdue_ids.len(),
             overdue_reservation_ids: overdue_ids,
             current_scope: self.current_scope.clone(),
@@ -856,6 +906,10 @@ impl CacheActor {
     }
 
     async fn retry_pending_deletes(&mut self) {
+        let uncertain = std::mem::take(&mut self.uncertain_publishes);
+        for (paths, charge) in uncertain {
+            self.clean_uncertain_publish(paths, charge).await;
+        }
         if self.tombstones.is_empty() {
             return;
         }
@@ -1149,8 +1203,22 @@ impl CacheActor {
             return;
         }
 
+        self.retry_account_purges().await;
+        if let Some(id) = scope.account_id()
+            && self.pending_purges.contains_key(id)
+        {
+            let _ = reply.send(Err(CacheError::Index(
+                "account cache purge is pending".into(),
+            )));
+            return;
+        }
+
         let class_max = key.class.byte_limit() as u64;
         let charge = match expected_len {
+            Some(0) => {
+                let _ = reply.send(Err(CacheError::WriterFailed("empty cache payload".into())));
+                return;
+            }
             Some(len) if len > class_max => {
                 let _ = reply.send(Err(CacheError::PayloadTooLarge {
                     actual: len,
@@ -1245,6 +1313,7 @@ impl CacheActor {
                 entry_key,
                 scope,
                 charge,
+                expected_len,
                 staging_rel_path,
                 cancel_token,
                 cancelled: false,
@@ -1264,12 +1333,8 @@ impl CacheActor {
     }
 
     fn cancel_reservation(&mut self, reservation_id: u64) {
-        if let Some(res) = self.live_reservations.get_mut(&reservation_id)
-            && !res.cancelled
-        {
-            res.cancelled = true;
-            res.watchdog_deadline = Some(Instant::now() + WATCHDOG_TIMEOUT);
-            res.cancel_token.cancel();
+        if let Some(res) = self.live_reservations.get_mut(&reservation_id) {
+            res.cancel(Instant::now());
         }
     }
 
@@ -1317,13 +1382,16 @@ impl CacheActor {
             return Err(CacheError::ShuttingDown);
         }
 
-        self.current_scope = transition.new_scope;
-        let now = Instant::now();
-        for res in self.live_reservations.values_mut() {
-            if res.scope != self.current_scope && !res.cancelled {
-                res.cancelled = true;
-                res.watchdog_deadline = Some(now + WATCHDOG_TIMEOUT);
-                res.cancel_token.cancel();
+        if transition.new_scope != self.current_scope {
+            if transition.new_scope.generation <= self.current_scope.generation {
+                return Err(CacheError::ScopeMismatch);
+            }
+            self.current_scope = transition.new_scope;
+            let now = Instant::now();
+            for res in self.live_reservations.values_mut() {
+                if res.scope != self.current_scope {
+                    res.cancel(now);
+                }
             }
         }
 
@@ -1335,18 +1403,38 @@ impl CacheActor {
 
     async fn purge_account_entries(&mut self, account_id: &AccountId) -> Result<(), CacheError> {
         let target_ns = CacheNamespace::Account(account_id.clone());
-        let outgoing: Vec<PublishedEntryRecord> = self
-            .ready_entries
-            .values()
-            .filter(|r| r.entry_key.namespace == target_ns)
-            .cloned()
-            .collect();
-        if outgoing.is_empty() {
-            return Ok(());
+        let now = Instant::now();
+        for res in self.live_reservations.values_mut() {
+            if res.entry_key.namespace == target_ns {
+                res.cancel(now);
+            }
         }
 
-        let entry_keys: Vec<CacheEntryKey> = outgoing.iter().map(|r| r.entry_key.clone()).collect();
-        let deletes: Vec<PendingDeleteRecord> = outgoing
+        let outgoing: Vec<CacheEntryKey> = self
+            .ready_entries
+            .keys()
+            .filter(|key| key.namespace == target_ns)
+            .cloned()
+            .collect();
+        for key in outgoing {
+            if let Some(record) = self.ready_entries.remove(&key) {
+                self.ledger.release_published(record.byte_len)?;
+                self.ledger.charge_tombstone(record.byte_len)?;
+                self.pending_purges
+                    .entry(account_id.clone())
+                    .or_default()
+                    .push(record);
+            }
+        }
+        self.persist_account_purge(account_id).await
+    }
+
+    async fn persist_account_purge(&mut self, account_id: &AccountId) -> Result<(), CacheError> {
+        let Some(outgoing) = self.pending_purges.get(account_id) else {
+            return Ok(());
+        };
+        let entry_keys: Vec<_> = outgoing.iter().map(|r| r.entry_key.clone()).collect();
+        let deletes: Vec<_> = outgoing
             .iter()
             .map(|r| PendingDeleteRecord {
                 rel_path: r.rel_path.clone(),
@@ -1357,27 +1445,26 @@ impl CacheActor {
         let index = Arc::clone(self.require_index()?);
         let fs = Arc::clone(&self.fs);
         let root_dir = self.root_dir.clone();
-
         let outcomes = self
             .run_blocking(move || {
                 index.hide_and_queue_deletes(&entry_keys, &deletes)?;
-                let mut results = Vec::with_capacity(deletes.len());
-                for del in deletes {
-                    let removed = fs.remove_file(&root_dir.join(&del.rel_path)).is_ok();
-                    if removed {
-                        let _ = index.mark_delete_completed(&del.rel_path);
-                    }
-                    results.push((del, removed));
-                }
-                Ok(results)
+                Ok(deletes
+                    .into_iter()
+                    .map(|del| {
+                        let removed = fs.remove_file(&root_dir.join(&del.rel_path)).is_ok();
+                        if removed {
+                            let _ = index.mark_delete_completed(&del.rel_path);
+                        }
+                        (del, removed)
+                    })
+                    .collect::<Vec<_>>())
             })
-            .await?;
+            .await;
+        let outcomes = outcomes.inspect_err(|err| {
+            tracing::warn!(%err, "could not persist account cache purge");
+        })?;
 
-        for record in outgoing {
-            self.ready_entries.remove(&record.entry_key);
-            self.ledger.release_published(record.byte_len)?;
-            self.ledger.charge_tombstone(record.byte_len)?;
-        }
+        self.pending_purges.remove(account_id);
         for (del, removed) in outcomes {
             if removed {
                 self.ledger.release_tombstone(del.byte_len)?;
@@ -1386,6 +1473,13 @@ impl CacheActor {
             }
         }
         Ok(())
+    }
+
+    async fn retry_account_purges(&mut self) {
+        let accounts: Vec<_> = self.pending_purges.keys().cloned().collect();
+        for id in accounts {
+            let _ = self.persist_account_purge(&id).await;
+        }
     }
 
     fn handle_watchdog_tick(&mut self, now: Instant) {
@@ -1439,7 +1533,11 @@ impl CacheActor {
 
         if let WriterExit::Complete { actual_len, crc32 } = outcome
             && can_publish
+            && actual_len > 0
             && actual_len <= res.charge
+            && res
+                .expected_len
+                .is_none_or(|expected| expected == actual_len)
         {
             let obj_rel_path = format!("objects/{}.bin", uuid::Uuid::new_v4());
             let staging_abs = self.root_dir.join(&res.staging_rel_path);
@@ -1476,29 +1574,18 @@ impl CacheActor {
 
             enum PublishResult {
                 Committed { prev_removed: bool },
-                RenameFailed { staging_removed: bool, err: String },
+                RenameFailed(std::io::Error),
                 IndexFailed { obj_removed: bool, err: CacheError },
             }
 
             let root_dir = self.root_dir.clone();
             let record_for_db = new_record.clone();
             let prev_for_db = prev_tombstone.clone();
-            let staging_rel_for_db = res.staging_rel_path.clone();
             let obj_rel_for_db = obj_rel_path.clone();
             let publish_outcome = self
                 .run_blocking(move || {
                     if let Err(err) = fs.rename_no_overwrite(&staging_abs, &obj_abs) {
-                        let staging_removed = fs.remove_file(&staging_abs).is_ok();
-                        if !staging_removed {
-                            let _ = index.record_pending_deletes(&[PendingDeleteRecord {
-                                rel_path: staging_rel_for_db,
-                                byte_len: actual_len,
-                            }]);
-                        }
-                        return Ok(PublishResult::RenameFailed {
-                            staging_removed,
-                            err: err.to_string(),
-                        });
+                        return Ok(PublishResult::RenameFailed(err));
                     }
 
                     if let Err(err) = index.commit_publish(&record_for_db, prev_for_db.as_ref()) {
@@ -1546,17 +1633,15 @@ impl CacheActor {
                         }));
                     }
                 }
-                Ok(PublishResult::RenameFailed {
-                    staging_removed,
-                    err,
-                }) => {
-                    let _ = self.ledger.release_reserved(res.charge);
-                    if !staging_removed {
-                        let _ = self.ledger.charge_tombstone(actual_len);
-                        self.tombstones.insert(res.staging_rel_path, actual_len);
+                Ok(PublishResult::RenameFailed(err)) => {
+                    if err.kind() == std::io::ErrorKind::AlreadyExists {
+                        self.cleanup_failed_staging(&res).await;
+                    } else {
+                        self.charge_uncertain_publish(&res, obj_rel_path, actual_len)
+                            .await;
                     }
                     if let Some(tx) = reply_tx {
-                        let _ = tx.send(Err(CacheError::Io(err)));
+                        let _ = tx.send(Err(CacheError::Io(err.to_string())));
                     }
                 }
                 Ok(PublishResult::IndexFailed { obj_removed, err }) => {
@@ -1570,7 +1655,8 @@ impl CacheActor {
                     }
                 }
                 Err(err) => {
-                    let _ = self.ledger.release_reserved(res.charge);
+                    self.charge_uncertain_publish(&res, obj_rel_path, res.charge)
+                        .await;
                     if let Some(tx) = reply_tx {
                         let _ = tx.send(Err(err));
                     }
@@ -1610,10 +1696,70 @@ impl CacheActor {
                     WriterExit::PanickedOrAborted => {
                         CacheError::WriterFailed("supervised cache writer panicked".to_string())
                     }
-                    WriterExit::Complete { .. } => CacheError::ScopeMismatch,
+                    WriterExit::Complete { actual_len: 0, .. } => {
+                        CacheError::WriterFailed("empty cache payload".into())
+                    }
+                    WriterExit::Complete { actual_len, .. } => CacheError::WriterFailed(format!(
+                        "cache payload length mismatch: wrote {actual_len} bytes, expected {}",
+                        res.expected_len.unwrap_or(res.charge)
+                    )),
                 }
             };
             let _ = tx.send(Err(err));
+        }
+    }
+
+    async fn charge_uncertain_publish(
+        &mut self,
+        res: &LiveReservation,
+        object: String,
+        charge: u64,
+    ) {
+        // Either path can still own the payload. Retain one charge until both
+        // paths are confirmed absent (a failed hard-link move can leave two links).
+        let _ = self.ledger.release_reserved(res.charge);
+        let _ = self.ledger.charge_tombstone(charge);
+        self.clean_uncertain_publish(vec![res.staging_rel_path.clone(), object], charge)
+            .await;
+    }
+
+    async fn clean_uncertain_publish(&mut self, paths: Vec<String>, charge: u64) {
+        let fs = Arc::clone(&self.fs);
+        let root = self.root_dir.clone();
+        let index = self.index.clone();
+        let candidates = paths.clone();
+        let remaining = self
+            .run_blocking(move || {
+                let mut remaining = Vec::new();
+                for rel_path in candidates {
+                    if fs.remove_file(&root.join(&rel_path)).is_ok() {
+                        if let Some(index) = &index {
+                            let _ = index.mark_delete_completed(&rel_path);
+                        }
+                    } else {
+                        remaining.push(rel_path);
+                    }
+                }
+                if let Some(index) = &index {
+                    let deletes: Vec<_> = remaining
+                        .iter()
+                        .map(|rel_path| PendingDeleteRecord {
+                            rel_path: rel_path.clone(),
+                            byte_len: charge,
+                        })
+                        .collect();
+                    if let Err(err) = index.record_pending_deletes(&deletes) {
+                        tracing::warn!(%err, "could not record failed publish cleanup");
+                    }
+                }
+                Ok(remaining)
+            })
+            .await
+            .unwrap_or(paths);
+        if remaining.is_empty() {
+            let _ = self.ledger.release_tombstone(charge);
+        } else {
+            self.uncertain_publishes.push((remaining, charge));
         }
     }
 
@@ -1667,6 +1813,21 @@ impl CacheActor {
 
         while let Some(join_res) = self.join_set.join_next_with_id().await {
             self.handle_writer_join(join_res).await;
+        }
+
+        self.retry_account_purges().await;
+        if self.pending_purges.is_empty() {
+            let marker = self.root_dir.join(ACTIVE_MARKER);
+            let fs = Arc::clone(&self.fs);
+            if let Err(err) = self
+                .run_blocking(move || {
+                    fs.remove_file(&marker)
+                        .map_err(|e| CacheError::Io(e.to_string()))
+                })
+                .await
+            {
+                tracing::warn!(%err, "could not clear cache recovery marker");
+            }
         }
 
         // Close SQLite index before releasing the exclusive root lock.

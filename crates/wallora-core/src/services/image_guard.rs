@@ -232,31 +232,11 @@ impl ImageGuard {
         check_encoded_len(bytes.len() as u64, budget.max_encoded_bytes)?;
         let header = inspect_reader_header(Cursor::new(bytes.as_slice()), budget)?;
 
-        let budget_permit = self
-            .acquire_decoded_budget(header.decoded_rgba_bytes)
-            .await?;
-        let decode_permit = self
-            .inner
-            .decode_sem
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| ImageGuardError::TaskCancelled)?;
-
         let limits = second_layer_limits(class, budget, header.decoded_rgba_bytes);
-        let decoded = tokio::task::spawn_blocking(move || {
-            let _decode_guard = decode_permit;
+        self.decode_guarded(header, move || {
             decode_from_reader(Cursor::new(bytes), header, limits)
         })
         .await
-        .map_err(|_| ImageGuardError::TaskCancelled)??;
-
-        Ok(DecodedImage {
-            width: header.width,
-            height: header.height,
-            rgba: decoded,
-            _budget_permit: budget_permit,
-        })
     }
 
     /// Validates an on-disk image file (for example an original wallpaper previewed under
@@ -281,6 +261,23 @@ impl ImageGuard {
         .await
         .map_err(|_| ImageGuardError::TaskCancelled)??;
 
+        let limits = second_layer_limits(class, budget, header.decoded_rgba_bytes);
+        self.decode_guarded(header, move || {
+            let file = File::open(&path).map_err(|e| ImageGuardError::Io(e.to_string()))?;
+            let metadata = file
+                .metadata()
+                .map_err(|e| ImageGuardError::Io(e.to_string()))?;
+            check_encoded_len(metadata.len(), budget.max_encoded_bytes)?;
+            decode_from_reader(BufReader::new(file), header, limits)
+        })
+        .await
+    }
+
+    async fn decode_guarded(
+        &self,
+        header: ImageHeader,
+        decode: impl FnOnce() -> Result<Vec<u8>, ImageGuardError> + Send + 'static,
+    ) -> Result<DecodedImage, ImageGuardError> {
         let budget_permit = self
             .acquire_decoded_budget(header.decoded_rgba_bytes)
             .await?;
@@ -292,25 +289,18 @@ impl ImageGuard {
             .await
             .map_err(|_| ImageGuardError::TaskCancelled)?;
 
-        let limits = second_layer_limits(class, budget, header.decoded_rgba_bytes);
-        let decoded = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let _decode_guard = decode_permit;
-            let file = File::open(&path).map_err(|e| ImageGuardError::Io(e.to_string()))?;
-            let metadata = file
-                .metadata()
-                .map_err(|e| ImageGuardError::Io(e.to_string()))?;
-            check_encoded_len(metadata.len(), budget.max_encoded_bytes)?;
-            decode_from_reader(BufReader::new(file), header, limits)
+            let rgba = decode()?;
+            Ok(DecodedImage {
+                width: header.width,
+                height: header.height,
+                rgba,
+                _budget_permit: budget_permit,
+            })
         })
         .await
-        .map_err(|_| ImageGuardError::TaskCancelled)??;
-
-        Ok(DecodedImage {
-            width: header.width,
-            height: header.height,
-            rgba: decoded,
-            _budget_permit: budget_permit,
-        })
+        .map_err(|_| ImageGuardError::TaskCancelled)?
     }
 
     async fn acquire_decoded_budget(
@@ -492,5 +482,55 @@ fn map_decode_error(err: ImageError) -> ImageGuardError {
         ImageError::Unsupported(_) => ImageGuardError::UnsupportedFormat,
         ImageError::IoError(io) => ImageGuardError::Io(io.to_string()),
         other => ImageGuardError::DecodeFailed(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn cancelled_decode_keeps_budget_until_blocking_work_returns() {
+        let guard = ImageGuard::with_config(ImageGuardConfig {
+            decode_concurrency: 1,
+            decoded_bytes_budget: 4,
+        });
+        let header = ImageHeader {
+            width: 1,
+            height: 1,
+            decoded_rgba_bytes: 4,
+            format: ImageFormat::Png,
+        };
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let decode = tokio::spawn({
+            let guard = guard.clone();
+            async move {
+                guard
+                    .decode_guarded(header, move || {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                        Ok(vec![0; 4])
+                    })
+                    .await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(10), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        decode.abort();
+        assert!(matches!(decode.await, Err(err) if err.is_cancelled()));
+        let available_while_blocked = guard.available_decoded_bytes();
+        release_tx.send(()).unwrap();
+        let permit = tokio::time::timeout(Duration::from_secs(10), guard.acquire_decoded_budget(4))
+            .await
+            .unwrap()
+            .unwrap();
+        drop(permit);
+        assert_eq!(available_while_blocked, 0);
+        assert_eq!(guard.available_decoded_bytes(), 4);
     }
 }
