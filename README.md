@@ -6,14 +6,14 @@ Wallora is an independent, open-source desktop client written in Rust. It is **n
 
 ## Status: pre-release (v0.1.x)
 
-Wallora is under active development and is **not usable as a wallpaper browser yet**. The native shell, the Wallhaven API client, and account sign-in are built. Browsing, the image pipeline, downloads and wallpaper control are still to come.
+Wallora is under active development and is **not usable as a wallpaper browser yet**. The native shell, the Wallhaven API client, account sign-in, and the guarded image pipeline and scoped cache are built. Browsing, the gallery, downloads and wallpaper control are still to come.
 
 | Area | State |
 | --- | --- |
 | Windows shell (Iced), navigation, settings, MSI packaging | Built |
 | Provider client: search and wallpaper requests, pacing, retries, API-key isolation | Built |
 | Accounts: API-key sign-in, Windows Credential Manager, account switching, local proxy setting | Built |
-| Image pipeline and scoped thumbnail cache | Implemented on branch `t3/image-cache-pipeline`, in review, not merged |
+| Image pipeline and scoped thumbnail cache | Built in the core library; app integration arrives with Task 5 |
 | Discovery and search UI, wallpaper details, original downloads | Planned |
 | Collections (read-only), profiles, tags | Planned |
 | Wallpaper control, history, adaptive themes, rotation, tray | Planned, after 1.0 |

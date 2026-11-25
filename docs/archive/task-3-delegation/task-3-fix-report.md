@@ -48,4 +48,3 @@ The verification logs and local installer are under `C:\Users\A3\Wallora\target\
 - Lock exclusion is for app instances using the new storage path and protocol. Orphaned entries created by older code without a surviving AccountId cannot be discovered through the new journal.
 - Verification used loopback API mocks, synthetic credentials, temporary SQLite files and the scoped synthetic native-vault smoke. No live Wallhaven calls or `.env` reads. The MSI was built and inspected locally. Interactive installer launch, upgrade and uninstall, and hosted CI were outside this verification.
 - The inherited privacy inventory remains a follow-up. Task 4 image caching, Task 5 discovery UI and pagination, and Task 6a item access/Favorites remain separate. The fresh review and Task 4 readiness verdict are pending.
-

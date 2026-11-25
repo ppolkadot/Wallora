@@ -1,6 +1,6 @@
 # Wallora implementation status
 
-Updated 2026-11-23. Verified against `main` at `3b782aa` (PR #1 merged; its tree is identical to `feat/foundation` at `ef0466d`, and the last code commit is `5590726`). [Execution plan](2026-11-18-wallora-plan-v2.md) · [Scope decisions](decisions.md) · [Architecture](architecture.md) · [Privacy inventory](privacy.md)
+Updated 2026-11-25. Task 4 landed in `main` at `edb885c`. [Execution plan](2026-11-18-wallora-plan-v2.md) · [Scope decisions](decisions.md) · [Architecture](architecture.md) · [Privacy inventory](privacy.md)
 
 ## Current milestones
 
@@ -9,7 +9,7 @@ Updated 2026-11-23. Verified against `main` at `3b782aa` (PR #1 merged; its tree
 | Task 1 · Foundation | Done, except the signed-in website audit and the Favorites mapping check (see Open work). Workspace, Iced shell, CI, and MSI packaging are implemented and verified on GitHub Actions. The API probe, guest website audit, spike results and parity-scope decision are recorded. |
 | Task 2 · Provider client | Done. Search and wallpaper requests, pacing, retries, cooldown, cancellation, and API-key origin isolation are implemented. Encoded image downloads have byte and time limits. |
 | Task 3 · Sessions and preferences | Done and independently reviewed. Includes sign-in, username verification, Windows Credential Manager, SQLite account state, account switching, revocation, and local proxy preferences. |
-| Task 4 · Image pipeline and caches | **Implemented on branch `t3/image-cache-pipeline`, not merged.** Three commits: `aecdb8a` (feat(core): image guard with decode budgets), `a9b1654` (feat(core): scoped cache store actor), `b3f7564` (feat(core): cache scope transitions and recovery). The review fixes are applied on top of `b3f7564` and verified (fmt, Clippy in both feature lanes, all tests in both lanes, 20/20 repeat runs, release build and `cargo deny --locked check`), but they are still uncommitted on the branch. `main` is still `3b782aa`. |
+| Task 4 · Image pipeline and caches | Landed in `main` with the review fixes. `ImageGuard` and `CacheStore` are implemented, and `Cargo.lock` now pins `url` 2.5.9 and `form_urlencoded` 1.2.3, which clears RUSTSEC-2026-0592. The original commits `aecdb8a`, `a9b1654` and `b3f7564` remain as historical references. The app does not use the pipeline yet; wiring it in is Task 5. |
 
 ## Decisions since the last update (2026-11-23)
 
@@ -25,16 +25,15 @@ Updated 2026-11-23. Verified against `main` at `3b782aa` (PR #1 merged; its tree
 
 ## Verification
 
-- **Hosted CI:** green on all three runs for `ef0466d` and its merge `3b782aa` (run `44552943473` on `main`). Every step passed: fmt, both Clippy lanes, both test lanes, `cargo deny`, release build, MSI build, the read-only MSI check, and artifact upload. The `wallora-msi` artifact (about 8.6 MB) was produced. [GitHub Actions](https://github.com/ppolkadot/Wallora/actions)
-- **Local, 2026-11-23:** `cargo fmt --check` clean. The workspace test run with `--features wallora-core/test-util` passed 95 tests (app 8, core unit 32, `key_isolation` 9, `provider_contract` 13, `search_serialization` 3, `session` 27, windows 3 plus 1 ignored Credential Manager smoke test).
-- **Branch `t3/image-cache-pipeline`, 2026-11-24:** with `--features wallora-core/test-util`, all tests pass: app 8, core lib 35, `cache` 36 (new), `image_guard` 9 (new), `key_isolation` 9, `provider_contract` 13, `search_serialization` 3, `session` 27, windows 3 plus 1 ignored. These counts include the review fixes, which are still uncommitted.
+- **Hosted CI for Task 4:** Windows CI passed on `main` at `edb885c`, including formatting, both Clippy and test lanes, `cargo deny`, the release build, and MSI verification and upload. [GitHub Actions run 45423820201](https://github.com/ppolkadot/Wallora/actions/runs/45423820201)
+- **Hosted CI (historical, before Task 4 landed):** green on all three runs for `ef0466d` and its merge `3b782aa` (run `44552943473` on `main`). Every step passed: fmt, both Clippy lanes, both test lanes, `cargo deny`, release build, MSI build, the read-only MSI check, and artifact upload. The `wallora-msi` artifact (about 8.6 MB) was produced. [GitHub Actions](https://github.com/ppolkadot/Wallora/actions)
+- **Local, 2026-11-23 (historical):** `cargo fmt --check` clean. The workspace test run with `--features wallora-core/test-util` passed 95 tests (app 8, core unit 32, `key_isolation` 9, `provider_contract` 13, `search_serialization` 3, `session` 27, windows 3 plus 1 ignored Credential Manager smoke test).
+- **Task 4 branch (historical), 2026-11-24:** with `--features wallora-core/test-util`, all tests pass: app 8, core lib 35, `cache` 36, `image_guard` 9, `key_isolation` 9, `provider_contract` 13, `search_serialization` 3, `session` 27, windows 3 plus 1 ignored. These counts include the review fixes.
 - At `5590726` the Windows Credential Manager smoke test passed with a synthetic key. A provider timeout test failed intermittently in an earlier revision's local run and passed on later runs; it is still worth watching.
 
 ## Open work
 
 - **Signed-in Wallhaven walkthrough** (needs the owner's browser session): record the website's Favorites label and empty state, the real username, AI-art and Hot visibility, profile, settings and upload controls. The favorite add/remove stability test changes the account and needs explicit owner action. [Parity matrix](parity-matrix.md#outstanding-signed-in-checks)
-- **Task 4 merge:** commit the review fixes, then merge `t3/image-cache-pipeline`. `cargo deny check` failed on `main` and on that branch because of advisory RUSTSEC-2026-0592 in `url` 2.5.8; the branch now bumps `url` to 2.5.9 (and `form_urlencoded` to 1.2.3) in `Cargo.lock`, which clears the advisory, so it closes when Task 4 merges. `main` keeps `url` 2.5.8 until then.
-- **Task 4 gate command:** the plan's command is wrong. `tests/cache.rs` needs the `test-util` feature, so the working gate is `cargo test --locked -p wallora-core --features test-util --test image_guard --test cache`.
 - **Task 5 (gallery on Iced):** wire the cache in at app boot. `SessionManager::restore_with_cache(storage, credentials, cache_sink)` was added and the old `restore` still exists, but the app does not call `restore_with_cache` yet. No UI uses the cache yet, so the cache directory stays empty in released builds until this lands.
 - **Task 5 cache shutdown:** the app must await `CacheStore::shutdown()` on window close. Otherwise the `cache.active` marker survives, and every launch discards the account caches.
 - Task 7 owns interactive MSI install, upgrade and uninstall checks. They run on the reference machine only; Windows 10 stays unverified and must be documented as such.

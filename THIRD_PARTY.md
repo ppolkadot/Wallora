@@ -6,7 +6,7 @@ Wallora itself is MIT-licensed ([LICENSE](LICENSE)). This file lists what it bui
 cargo deny --locked list --layout crate --format json
 ```
 
-Generated 2026-11-23 from `Cargo.lock` at `main` (`3b782aa`). It covers the whole workspace graph, including the unshipped `spikes/iced-gallery` crate and build-time crates, so it over-approximates what the installer ships. Where a crate offers several licences (`A OR B`), you may use it under any one of them. `cargo deny check` enforces the allow-list in `deny.toml` in CI.
+Generated 2026-11-23 from `Cargo.lock` at `main` (`3b782aa`); `url` and `form_urlencoded` were updated 2026-11-25. It covers the whole workspace graph, including the unshipped `spikes/iced-gallery` crate and build-time crates, so it over-approximates what the installer ships. Where a crate offers several licences (`A OR B`), you may use it under any one of them. `cargo deny check` enforces the allow-list in `deny.toml` in CI.
 
 ## Font
 
@@ -129,7 +129,7 @@ Generated 2026-11-23 from `Cargo.lock` at `main` (`3b782aa`). It covers the whol
 | font-types | 0.10.1 | MIT OR Apache-2.0 |
 | font-types | 0.12.7 | MIT OR Apache-2.0 |
 | fontdb | 0.23.0 | MIT |
-| form_urlencoded | 1.2.2 | MIT OR Apache-2.0 |
+| form_urlencoded | 1.2.3 | MIT OR Apache-2.0 |
 | futures | 0.3.34 | MIT OR Apache-2.0 |
 | futures-channel | 0.3.34 | MIT OR Apache-2.0 |
 | futures-core | 0.3.34 | MIT OR Apache-2.0 |
@@ -358,7 +358,7 @@ Generated 2026-11-23 from `Cargo.lock` at `main` (`3b782aa`). It covers the whol
 | unicode-segmentation | 1.13.3 | MIT OR Apache-2.0 |
 | unicode-width | 0.2.3 | MIT OR Apache-2.0 |
 | untrusted | 0.9.0 | ISC |
-| url | 2.5.8 | MIT OR Apache-2.0 |
+| url | 2.5.9 | MIT OR Apache-2.0 |
 | utf8_iter | 1.1.0 | Apache-2.0 OR MIT |
 | utf_types | 1.0.0 | Apache-2.0 OR MIT |
 | uuid | 1.29.3 | Apache-2.0 OR MIT |

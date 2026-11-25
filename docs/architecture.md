@@ -1,6 +1,6 @@
 # Wallora architecture
 
-Updated 2026-11-23, reflecting `main` after Task 3. The plan lives in [2026-11-18-wallora-plan-v2.md](2026-11-18-wallora-plan-v2.md). This file describes what is built; planned modules are marked.
+Updated 2026-11-25, reflecting `main` after Task 4. The plan lives in [2026-11-18-wallora-plan-v2.md](2026-11-18-wallora-plan-v2.md). This file describes what is built; planned modules are marked.
 
 ## Workspace
 
@@ -19,9 +19,9 @@ Dependency direction: `wallora-app` → `wallora-core` and `wallora-windows`; `w
 | --- | --- |
 | `domain` | Plain types: `SearchQuery` and `SearchPage`, `Wallpaper`, `CollectionSummary`, and account types (`AccountId`, `SessionScope`, `SecretString`, `UsernameVerification`, `LocalPreferences`, `ProxyConfig`). The `CredentialStore` trait is defined here. |
 | `provider` | The `Provider` trait and its `WallhavenClient` implementation. `origin` decides where the API key may be sent. `pacer` schedules every API attempt. `error` holds `ProviderError`. `api` parses `Retry-After` and similar details. |
-| `services::session` | `SessionManager`: sign-in, identity verification, refresh, logout, account switching, 401 revocation, proxy preference. The only place that mutates session state. `restore_with_cache(storage, credentials, cache_sink)` takes a `SessionCacheSink` that is notified of every scope transition (restore, sign-in, sign-out, account switch, key revocation) and of account purges (including a 403 during account refresh), so the image cache can hide and delete the outgoing account's entries *(on branch `t3/image-cache-pipeline`, not merged yet)*; the app still calls the plain `restore` and will switch with Task 5. |
-| `services::image_guard` *(on branch `t3/image-cache-pipeline`, not merged yet)* | `ImageGuard`: per-class budgets. Thumbnail: encoded ≤ 2 MB, ≤ 1024 px per side. Preview: encoded ≤ 64 MB, ≤ 16,384 px per side, ≤ 150 MP. A header-only dimension check runs before decoding, with `image::Limits` as a second layer. Decode concurrency is `max(1, cores/2)`, and in-flight decoded bytes are budgeted (default 640 MiB). |
-| `services::cache` *(on branch `t3/image-cache-pipeline`, not merged yet)* | `CacheStore`: one actor that serializes reads, writes, eviction and scope transitions. Cap defaults to 2,000,000,000 bytes with a hard max of 10,000,000,000; LRU eviction; supervised writers; a 10 s watchdog that only marks cancelled writers overdue. Files live under `%LOCALAPPDATA%\Wallora\cache\`: `cache.lock`, `cache_index.db` (a SQLite index separate from `wallora.db`), `objects/` and `staging/`. An empty `cache.active` marker exists while the cache is open, and one found at startup means the last exit was not orderly, so all account-scoped entries are discarded (guest entries are kept). |
+| `services::session` | `SessionManager`: sign-in, identity verification, refresh, logout, account switching, 401 revocation, proxy preference. The only place that mutates session state. `restore_with_cache(storage, credentials, cache_sink)` takes a `SessionCacheSink` that is notified of every scope transition (restore, sign-in, sign-out, account switch, key revocation) and of account purges (including a 403 during account refresh), so the image cache can hide and delete the outgoing account's entries. The app still calls the plain `restore`; moving it to `restore_with_cache` is Task 5 work. |
+| `services::image_guard` | `ImageGuard`: per-class budgets. Thumbnail: encoded ≤ 2 MB, ≤ 1024 px per side. Preview: encoded ≤ 64 MB, ≤ 16,384 px per side, ≤ 150 MP. A header-only dimension check runs before decoding, with `image::Limits` as a second layer. Decode concurrency is `max(1, cores/2)`, and in-flight decoded bytes are budgeted (default 640 MiB). |
+| `services::cache` | `CacheStore`: one actor that serializes reads, writes, eviction and scope transitions. Cap defaults to 2,000,000,000 bytes with a hard max of 10,000,000,000; LRU eviction; supervised writers; a 10 s watchdog that only marks cancelled writers overdue. Files live under `%LOCALAPPDATA%\Wallora\cache\`: `cache.lock`, `cache_index.db` (a SQLite index separate from `wallora.db`), `objects/` and `staging/`. An empty `cache.active` marker exists while the cache is open, and one found at startup means the last exit was not orderly, so all account-scoped entries are discarded (guest entries are kept). The app does not open the cache yet: Task 5 wires it in at boot and must await `CacheStore::shutdown()` on window close. |
 | `storage` | `AppPaths`, SQLite store and migrations (schema version 2). |
 
 *Planned:* `download`, `library`, `history` services (Tasks 6, 8, 9).
@@ -45,7 +45,7 @@ Key properties, each covered by tests:
 
 ### Features
 
-`test-util` (non-default) exposes explicit test constructors and hooks. The integration tests `provider_contract`, `key_isolation`, `search_serialization` and `session` require it, as does `cache` on the Task 4 branch (`required-features = ["test-util"]` in `crates/wallora-core/Cargo.toml`); `image_guard` runs in the default lane. CI runs a second lane with `--features wallora-core/test-util`. It never enters the release dependency graph.
+`test-util` (non-default) exposes explicit test constructors and hooks. The integration tests `provider_contract`, `key_isolation`, `search_serialization` and `session` require it, as does `cache` (`required-features = ["test-util"]` in `crates/wallora-core/Cargo.toml`); `image_guard` runs in the default lane. CI runs a second lane with `--features wallora-core/test-util`. It never enters the release dependency graph.
 
 ## wallora-windows
 

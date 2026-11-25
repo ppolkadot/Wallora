@@ -38,5 +38,3 @@ Account collection item access and Favorites mapping are Task 6a evidence. Task 
 - Image safety and cache cap incl. staging (Task 4).
 - No-clobber publication and collisions (Tasks 6, 8).
 - Wallpaper undo and partial multi-monitor failure (Task 9).
-
-

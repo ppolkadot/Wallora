@@ -33,4 +33,3 @@ Reviewed feat/foundation at 9864e8ac705bb0770dc4761fcd97e302c84a58b0 against fd1
 Fixture behavior, Windows Credential Manager smoke and local milestone checks are reported by Gemini. The independent checks were source/control-flow inspection, git diff --check, and the isolated SQLite SQL reproduction. No live calls, OS vault operations, or Rust test reruns. No direct key leak was found in the normal key-field flow through request headers, SQLite fields or app logging. Origin checks, disabled API redirects, sensitive headers, sanitized native errors and unkeyed public lookup remain supported by the source.
 
 The owner-authorized Task 1 signed-in website audit and hosted CI deferrals, provisional Iced hardware decision before Task 5, Task 4 image-cache hookup, and Task 6a collection items/Favorites are tracked separately from Task 3 defects.
-
