@@ -63,6 +63,12 @@ impl ImageRequest {
         }
     }
 
+    pub fn thumbnail_url(raw: &str, scope: SessionScope) -> Result<Self, ImagePipelineError> {
+        let url = Url::parse(raw)
+            .map_err(|_| ImagePipelineError::Provider(ProviderError::OriginRejected))?;
+        Ok(Self::thumbnail(url, scope))
+    }
+
     pub fn preview(url: Url, scope: SessionScope) -> Self {
         Self {
             url,
@@ -306,4 +312,30 @@ impl<F: ImageFetcher> ImagePipeline<F> {
             recovered_from_corrupt_cache,
         })
     }
+}
+
+/// Fallback image load used when the disk cache is unavailable: fetches from the allowlisted
+/// image host, checks encoded size and header dimensions, and decodes under `guard`.
+pub async fn load_uncached<F: ImageFetcher>(
+    fetcher: &F,
+    guard: &ImageGuard,
+    request: ImageRequest,
+    cancel: CancelToken,
+) -> Result<LoadedImage, ImagePipelineError> {
+    let ImageRequest { url, class, scope } = request;
+    if cancel.is_cancelled() {
+        return Err(ImagePipelineError::Cancelled);
+    }
+
+    let bytes = cancellable(&cancel, fetcher.fetch(url, class)).await??;
+    ImageGuard::inspect_bytes(&bytes, class)?;
+    let image = cancellable(&cancel, guard.decode_bytes(bytes, class)).await??;
+
+    Ok(LoadedImage {
+        image,
+        scope,
+        source: ImageSource::Network,
+        stale: false,
+        recovered_from_corrupt_cache: false,
+    })
 }

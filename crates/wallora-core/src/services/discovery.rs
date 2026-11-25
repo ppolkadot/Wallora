@@ -225,8 +225,12 @@ pub struct DiscoveryController {
 
 impl DiscoveryController {
     pub fn new(scope: SessionScope, filters: DiscoveryFilters) -> Self {
+        Self::with_view(scope, DiscoveryView::Latest, filters)
+    }
+
+    pub fn with_view(scope: SessionScope, view: DiscoveryView, filters: DiscoveryFilters) -> Self {
         Self {
-            view: DiscoveryView::Latest,
+            view,
             terms: SearchTerms::default(),
             filters,
             scope,
@@ -240,6 +244,23 @@ impl DiscoveryController {
             seed: None,
             status: DiscoveryStatus::Idle,
         }
+    }
+
+    /// Resets the controller to `Idle` for a new session scope and defaults, bumping generation
+    /// and discarding any prior items, seed, or in-flight state.
+    pub fn reset_for_scope(
+        &mut self,
+        scope: SessionScope,
+        view: DiscoveryView,
+        filters: DiscoveryFilters,
+        clear_terms: bool,
+    ) {
+        self.view = view;
+        self.filters = filters;
+        if clear_terms {
+            self.terms = SearchTerms::default();
+        }
+        self.discard_for_scope(scope);
     }
 
     pub fn view(&self) -> DiscoveryView {

@@ -18,7 +18,7 @@ use wallora_core::services::cache::{
 };
 use wallora_core::services::{
     ImageFetcher, ImageGuard, ImageGuardConfig, ImageGuardError, ImagePipeline, ImagePipelineError,
-    ImageRequest, ImageSource,
+    ImageRequest, ImageSource, load_uncached,
 };
 
 struct TempDir(PathBuf);
@@ -638,4 +638,98 @@ async fn queued_fetch_responses_are_consumed_in_order() {
     );
     assert!(load(&pipeline, &url, guest(1)).await.is_ok());
     cache.shutdown().await;
+}
+
+#[test]
+fn thumbnail_url_rejects_unparseable_urls_and_accepts_valid_urls() {
+    let err = ImageRequest::thumbnail_url("not a valid url", guest(1)).unwrap_err();
+    assert_eq!(
+        err,
+        ImagePipelineError::Provider(ProviderError::OriginRejected)
+    );
+
+    let req = ImageRequest::thumbnail_url("https://th.wallhaven.cc/lg/ab/123.jpg", guest(1))
+        .expect("valid url");
+    assert_eq!(req.class, ImageClass::Thumbnail);
+    assert_eq!(req.scope, guest(1));
+}
+
+#[tokio::test]
+async fn load_uncached_decodes_valid_images_rejects_bombs_and_honors_cancellation() {
+    let fetcher = FakeFetcher::new(Ok(png(8, 6)));
+    let guard = ImageGuard::new();
+    let url = url("uncached-ok");
+
+    let loaded = load_uncached(
+        fetcher.as_ref(),
+        &guard,
+        ImageRequest::thumbnail(url.clone(), guest(1)),
+        CancelToken::new(),
+    )
+    .await
+    .expect("uncached load succeeds");
+    assert_eq!(loaded.source, ImageSource::Network);
+    assert!(!loaded.stale);
+    assert_eq!(loaded.image.dimensions(), (8, 6));
+    assert_eq!(fetcher.calls(), 1);
+
+    // Oversized dimensions are rejected before full decode.
+    fetcher.set_fallback(Ok(png(1025, 1)));
+    let err = load_uncached(
+        fetcher.as_ref(),
+        &guard,
+        ImageRequest::thumbnail(url.clone(), guest(1)),
+        CancelToken::new(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ImagePipelineError::Decode(
+                ImageGuardError::DimensionsExceeded { .. } | ImageGuardError::DecoderLimit(_)
+            )
+        ),
+        "{err:?}"
+    );
+
+    // Pre-cancelled token never touches the fetcher.
+    let before = fetcher.calls();
+    let cancelled = CancelToken::new();
+    cancelled.cancel();
+    let err = load_uncached(
+        fetcher.as_ref(),
+        &guard,
+        ImageRequest::thumbnail(url.clone(), guest(1)),
+        cancelled,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err, ImagePipelineError::Cancelled);
+    assert_eq!(fetcher.calls(), before);
+
+    // Mid-flight cancellation drops the in-flight fetch.
+    let gated_fetcher = FakeFetcher::new(Ok(png(4, 4)));
+    let gate = gated_fetcher.close_gate();
+    let token = CancelToken::new();
+    let task = {
+        let fetcher = Arc::clone(&gated_fetcher);
+        let guard = guard.clone();
+        let token = token.clone();
+        tokio::spawn(async move {
+            load_uncached(
+                fetcher.as_ref(),
+                &guard,
+                ImageRequest::thumbnail(url, guest(1)),
+                token,
+            )
+            .await
+        })
+    };
+    gated_fetcher.wait_until_entered().await;
+    token.cancel();
+    let err = task.await.unwrap().unwrap_err();
+    assert_eq!(err, ImagePipelineError::Cancelled);
+    assert_eq!(gated_fetcher.dropped_in_flight.load(Ordering::SeqCst), 1);
+    gate.add_permits(1);
 }

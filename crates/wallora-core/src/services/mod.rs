@@ -28,6 +28,7 @@ pub use image_guard::{
 };
 pub use image_pipeline::{
     ImageFetcher, ImagePipeline, ImagePipelineError, ImageRequest, ImageSource, LoadedImage,
+    load_uncached,
 };
 pub use session::{
     AccountRefreshPayload, CacheCapUpdateError, LogoutOutcome, NoticeLevel, ProxyUpdateError,

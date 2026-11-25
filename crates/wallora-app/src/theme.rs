@@ -1,5 +1,6 @@
 use iced::theme::Palette;
-use iced::{Color, Theme};
+use iced::widget::{button, container};
+use iced::{Background, Border, Color, Theme};
 
 /// Static Wallora color palette defined in the baseline specification.
 pub mod palette {
@@ -68,4 +69,48 @@ pub fn wallora_theme() -> Theme {
 
 pub fn surface_color() -> Color {
     palette::SURFACE
+}
+
+pub fn pill_button_style(active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |theme, status| {
+        let base = if active {
+            button::primary(theme, status)
+        } else {
+            button::secondary(theme, status)
+        };
+        button::Style {
+            background: Some(Background::Color(if active {
+                palette::ACCENT
+            } else {
+                surface_color()
+            })),
+            text_color: if active {
+                palette::CANVAS
+            } else {
+                palette::TEXT_PRIMARY
+            },
+            border: Border {
+                radius: 6.0.into(),
+                width: 1.0,
+                color: if active {
+                    palette::ACCENT
+                } else {
+                    palette::MUTED
+                },
+            },
+            ..base
+        }
+    }
+}
+
+pub fn card_style(border_color: Color, border_width: f32) -> impl Fn(&Theme) -> container::Style {
+    move |_theme| container::Style {
+        background: Some(Background::Color(surface_color())),
+        border: Border {
+            radius: 8.0.into(),
+            width: border_width,
+            color: border_color,
+        },
+        ..Default::default()
+    }
 }

@@ -5,6 +5,7 @@ mod cache_host;
 mod message;
 mod theme;
 mod views;
+mod widgets;
 
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -111,12 +112,13 @@ fn main() -> iced::Result {
 
     let boot_host = cache_host.clone();
     let result = iced::application(
-        move || WalloraApp::boot(paths.clone(), boot_host.clone()),
+        move || WalloraApp::boot_interactive(paths.clone(), boot_host.clone()),
         WalloraApp::update,
         WalloraApp::view,
     )
     .title(WalloraApp::title)
     .theme(WalloraApp::theme)
+    .subscription(WalloraApp::subscription)
     .window_size((1280.0, 800.0))
     .run();
 
