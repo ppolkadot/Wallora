@@ -929,6 +929,7 @@ pub struct WalloraApp {
     launch_browser: fn(&str) -> Result<(), String>,
     home: GalleryState,
     home_toplist_range: TopRange,
+    home_site_gaps_expanded: bool,
     search: GalleryState,
     search_query_input: String,
     search_atleast_input: String,
@@ -1104,6 +1105,7 @@ impl WalloraApp {
             launch_browser: wallora_windows::open_wallhaven_in_browser,
             home,
             home_toplist_range: defaults.toplist_range,
+            home_site_gaps_expanded: false,
             search,
             search_query_input: String::new(),
             search_atleast_input: String::new(),
@@ -2034,6 +2036,10 @@ impl WalloraApp {
                     None => Task::none(),
                 }
             }
+            Message::HomeToggleSiteGaps => {
+                self.home_site_gaps_expanded = !self.home_site_gaps_expanded;
+                Task::none()
+            }
             Message::SearchQueryChanged(query) => {
                 self.search_query_input = query;
                 Task::none()
@@ -2279,6 +2285,10 @@ impl WalloraApp {
             }
             Message::OpenUnsupportedFeature(feature) => {
                 self.open_wallhaven_url(feature.hand_off().url);
+                Task::none()
+            }
+            Message::OpenSiteGap(action) => {
+                self.open_wallhaven_url(action.hand_off().url);
                 Task::none()
             }
             Message::WindowResized(size) => self.handle_window_resized(size),
@@ -3794,6 +3804,7 @@ impl WalloraApp {
                 metrics: &self.home.metrics,
                 selected: self.home.selected,
                 is_guest,
+                site_gaps_expanded: self.home_site_gaps_expanded,
                 thumbnail_state: |wallpaper| self.home.thumbnail_state(&wallpaper.id),
             }),
             Route::Search => views::search::view(views::search::SearchViewState {
@@ -5281,6 +5292,77 @@ mod tests {
                 .message
                 .contains("browser launch blocked")
         );
+    }
+
+    #[test]
+    fn home_site_gap_handoffs_open_expected_urls_and_report_launch_errors() {
+        use wallora_core::services::SiteGapAction;
+
+        let paths = TestPaths::new();
+        let mut app = test_app(&paths);
+        static SITE_GAP_LAUNCHES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        SITE_GAP_LAUNCHES.lock().unwrap().clear();
+        app.launch_browser = |url| {
+            wallora_windows::validate_wallhaven_handoff_url(url)?;
+            SITE_GAP_LAUNCHES.lock().unwrap().push(url.to_string());
+            Ok(())
+        };
+
+        assert_eq!(app.route, Route::Home);
+        assert!(!app.home_site_gaps_expanded);
+        let initial_generation = app.home.controller.generation();
+        let initial_view = app.home.controller.view();
+        let _ = app.view();
+
+        assert_eq!(app.update(Message::HomeToggleSiteGaps).units(), 0);
+        assert!(app.home_site_gaps_expanded);
+        assert_eq!(app.home.controller.generation(), initial_generation);
+        assert_eq!(app.home.controller.view(), initial_view);
+        let _ = app.view();
+
+        for action in SiteGapAction::ALL {
+            assert_eq!(app.update(Message::OpenSiteGap(action)).units(), 0);
+        }
+        assert_eq!(
+            app.update(Message::OpenUnsupportedFeature(
+                UnsupportedFeature::HotSorting,
+            ))
+            .units(),
+            0
+        );
+        assert_eq!(
+            *SITE_GAP_LAUNCHES.lock().unwrap(),
+            vec![
+                "https://wallhaven.cc/".to_string(),
+                "https://wallhaven.cc/tags".to_string(),
+                "https://wallhaven.cc/untagged".to_string(),
+                "https://wallhaven.cc/upload".to_string(),
+                "https://wallhaven.cc/forums".to_string(),
+                "https://wallhaven.cc/hot".to_string(),
+            ]
+        );
+
+        assert_eq!(app.update(Message::HomeToggleSiteGaps).units(), 0);
+        assert!(!app.home_site_gaps_expanded);
+        let _ = app.view();
+
+        app.launch_browser = |_| Err("site gap browser blocked".into());
+        for action in [SiteGapAction::UploadWallpaper, SiteGapAction::Forums] {
+            app.session.set_notice(None);
+            let _ = app.update(Message::OpenSiteGap(action));
+            let notice = app
+                .session
+                .notice()
+                .expect("launch error should surface as session notice");
+            assert_eq!(notice.level, NoticeLevel::Warning);
+            assert!(
+                notice
+                    .message
+                    .contains("Could not open wallhaven.cc in browser:")
+            );
+            assert!(notice.message.contains("site gap browser blocked"));
+            assert_eq!(app.route, Route::Home);
+        }
     }
 
     #[test]

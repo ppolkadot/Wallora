@@ -10,7 +10,7 @@ use wallora_core::services::cache::{CacheError, CacheStats};
 use wallora_core::services::{
     AccountRefreshPayload, CollectionItemsResponse, CollectionListResponse,
     DetailUnsupportedAction, DownloadError, DownloadOutcome, ImagePipelineError, PageResponse,
-    SignInError, SignInProbe, TagMetadataResponse, UnsupportedFeature,
+    SignInError, SignInProbe, SiteGapAction, TagMetadataResponse, UnsupportedFeature,
 };
 
 use crate::widgets::gallery_grid::GridKey;
@@ -131,6 +131,7 @@ pub enum Message {
     HomeSelectToplist,
     HomeSelectRandom,
     HomeSelectTopRange(TopRange),
+    HomeToggleSiteGaps,
 
     // Search & filter bar
     SearchQueryChanged(String),
@@ -177,6 +178,7 @@ pub enum Message {
         id: WallpaperId,
     },
     OpenUnsupportedFeature(UnsupportedFeature),
+    OpenSiteGap(SiteGapAction),
     WindowResized(Size),
     RuntimeGalleryKey(GridKey),
     SearchKeyFocusChecked {
@@ -329,6 +331,7 @@ impl fmt::Debug for Message {
             Self::HomeSelectTopRange(range) => {
                 f.debug_tuple("HomeSelectTopRange").field(range).finish()
             }
+            Self::HomeToggleSiteGaps => f.write_str("HomeToggleSiteGaps"),
             Self::SearchQueryChanged(q) => f.debug_tuple("SearchQueryChanged").field(q).finish(),
             Self::SearchSubmit => f.write_str("SearchSubmit"),
             Self::SearchClear => f.write_str("SearchClear"),
@@ -407,6 +410,7 @@ impl fmt::Debug for Message {
                 .debug_tuple("OpenUnsupportedFeature")
                 .field(feature)
                 .finish(),
+            Self::OpenSiteGap(action) => f.debug_tuple("OpenSiteGap").field(action).finish(),
             Self::WindowResized(size) => f.debug_tuple("WindowResized").field(size).finish(),
             Self::RuntimeGalleryKey(key) => f.debug_tuple("RuntimeGalleryKey").field(key).finish(),
             Self::SearchKeyFocusChecked {

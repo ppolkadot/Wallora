@@ -1,10 +1,12 @@
 use iced::widget::{Id, button, container, row, text};
-use iced::{Alignment, Background, Border, Element, Length, widget::column};
+use iced::{Alignment, Element, Length, widget::column};
 use wallora_core::domain::{TopRange, Wallpaper};
-use wallora_core::services::{DiscoveryController, DiscoveryView, UnsupportedFeature};
+use wallora_core::services::{
+    DiscoveryController, DiscoveryView, SiteGapAction, UnsupportedFeature,
+};
 
 use crate::message::{GalleryKind, Message};
-use crate::theme::{palette, pill_button_style, surface_color};
+use crate::theme::{card_style, palette, pill_button_style};
 use crate::widgets::gallery_grid::{self, GalleryGridView, GridMetrics};
 use crate::widgets::thumbnail::ThumbnailViewState;
 
@@ -27,7 +29,31 @@ where
     pub metrics: &'a GridMetrics,
     pub selected: Option<usize>,
     pub is_guest: bool,
+    pub site_gaps_expanded: bool,
     pub thumbnail_state: F,
+}
+
+fn site_gap_card<'a>(
+    title: &'a str,
+    explanation: &'a str,
+    button_label: &'a str,
+    on_press: Message,
+) -> Element<'a, Message> {
+    container(
+        column![
+            text(title).size(13).color(palette::TEXT_PRIMARY),
+            text(explanation).size(11).color(palette::TEXT_SECONDARY),
+            button(text(button_label).size(12))
+                .padding([5, 10])
+                .on_press(on_press)
+                .style(pill_button_style(false)),
+        ]
+        .spacing(6),
+    )
+    .padding(10)
+    .width(Length::Fixed(290.0))
+    .style(card_style(palette::MUTED, 1.0))
+    .into()
 }
 
 pub fn view<'a, F>(state: HomeViewState<'a, F>) -> Element<'a, Message>
@@ -101,34 +127,6 @@ where
         header = header.push(range_row);
     }
 
-    let hot_handoff = UnsupportedFeature::HotSorting.hand_off();
-    let hot_notice = container(
-        row![
-            text(UnsupportedFeature::HotSorting.explanation())
-                .size(12)
-                .color(palette::TEXT_SECONDARY),
-            button(text(hot_handoff.label).size(12))
-                .padding([5, 12])
-                .on_press(Message::OpenUnsupportedFeature(
-                    UnsupportedFeature::HotSorting
-                )),
-        ]
-        .spacing(12)
-        .align_y(Alignment::Center),
-    )
-    .padding([8, 12])
-    .width(Length::Fill)
-    .style(|_| container::Style {
-        background: Some(Background::Color(surface_color())),
-        border: Border {
-            radius: 6.0.into(),
-            width: 1.0,
-            color: palette::MUTED,
-        },
-        ..Default::default()
-    });
-    header = header.push(hot_notice);
-
     let grid = gallery_grid::view(GalleryGridView {
         kind: GalleryKind::Home,
         scrollable_id: state.scrollable_id,
@@ -143,7 +141,63 @@ where
         thumbnail_state: state.thumbnail_state,
     });
 
-    column![header, grid]
+    let gaps_summary = if state.site_gaps_expanded {
+        "Website-only features with no public API route; open them in your browser."
+    } else {
+        "Hot · Homepage · Tag Directory · Few Tags / Untagged · Upload · Forums"
+    };
+    let toggle_label = if state.site_gaps_expanded {
+        "Hide links"
+    } else {
+        "Show links (6)"
+    };
+    let mut gaps_col = column![
+        row![
+            text("More on wallhaven.cc (API gaps)")
+                .size(12)
+                .color(palette::TEXT_PRIMARY),
+            text(gaps_summary)
+                .size(12)
+                .color(palette::TEXT_SECONDARY)
+                .width(Length::Fill),
+            button(text(toggle_label).size(12))
+                .padding([4, 10])
+                .on_press(Message::HomeToggleSiteGaps)
+                .style(pill_button_style(state.site_gaps_expanded)),
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center),
+    ]
+    .spacing(10);
+
+    if state.site_gaps_expanded {
+        let hot_handoff = UnsupportedFeature::HotSorting.hand_off();
+        let mut cards = row![site_gap_card(
+            UnsupportedFeature::HotSorting.title(),
+            UnsupportedFeature::HotSorting.explanation(),
+            hot_handoff.label,
+            Message::OpenUnsupportedFeature(UnsupportedFeature::HotSorting),
+        )]
+        .spacing(10);
+
+        for action in SiteGapAction::ALL {
+            cards = cards.push(site_gap_card(
+                action.title(),
+                action.explanation(),
+                action.label(),
+                Message::OpenSiteGap(action),
+            ));
+        }
+
+        gaps_col = gaps_col.push(cards.wrap().vertical_spacing(8));
+    }
+
+    let gaps_card = container(gaps_col)
+        .padding([8, 12])
+        .width(Length::Fill)
+        .style(card_style(palette::MUTED, 1.0));
+
+    column![header, grid, gaps_card]
         .spacing(14)
         .width(Length::Fill)
         .height(Length::Fill)

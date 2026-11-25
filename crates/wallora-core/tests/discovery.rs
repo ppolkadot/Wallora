@@ -4,15 +4,17 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use wallora_core::domain::{
-    Category, CategoryMask, CollectionSummary, CredentialStore, Dimensions,
+    Category, CategoryMask, CollectionSummary, CredentialStore, Dimensions, FileType,
     InMemoryCredentialStore, Purity, PurityMask, QueryBuilder, SearchMeta, SearchPage, SearchQuery,
     SearchTerms, SecretString, SessionKind, SessionScope, SortOrder, Sorting, Tag, Thumbs,
-    TopRange, UserSettings, UsernameVerification, Wallpaper, WallpaperId,
+    TopRange, UserSettings, UsernameVerification, WALLHAVEN_SETTINGS_URL, Wallpaper, WallpaperId,
 };
 use wallora_core::provider::{Provider, ProviderError};
 use wallora_core::services::{
-    ApplyOutcome, DiscoveryController, DiscoveryFilters, DiscoveryStatus, DiscoveryView,
-    PageRequest, SessionManager, SignInCommitOutcome, SignInProbe, fetch_page,
+    ApplyOutcome, CollectionUnsupportedAction, DetailUnsupportedAction, DiscoveryController,
+    DiscoveryFilters, DiscoveryStatus, DiscoveryView, OPEN_ON_WALLHAVEN_LABEL, PageRequest,
+    ProfileTagUnsupportedAction, SessionManager, SignInCommitOutcome, SignInProbe, SiteGapAction,
+    UnsupportedFeature, WALLHAVEN_TAGS_URL, fetch_page,
 };
 use wallora_core::storage::{SessionStorage, SqliteStore};
 
@@ -787,4 +789,197 @@ async fn items_are_unique_across_pages() {
     );
     let ids: Vec<&str> = c.items().iter().map(|w| w.id.as_str()).collect();
     assert_eq!(ids, vec!["a", "b", "c"]);
+}
+
+fn assert_valid_wallhaven_handoff_url(raw: &str) {
+    let parsed = url::Url::parse(raw).unwrap_or_else(|err| {
+        panic!("hand-off URL {raw:?} should parse: {err}");
+    });
+    assert_eq!(parsed.scheme(), "https", "must use HTTPS: {raw}");
+    assert_eq!(
+        parsed.host_str(),
+        Some("wallhaven.cc"),
+        "must target wallhaven.cc: {raw}"
+    );
+    assert_eq!(parsed.port(), None, "must use default port 443: {raw}");
+    assert!(
+        parsed.username().is_empty() && parsed.password().is_none(),
+        "must not embed credentials: {raw}"
+    );
+    assert!(
+        parsed.path().starts_with('/'),
+        "must have a root-relative path: {raw}"
+    );
+}
+
+#[test]
+fn all_parity_gap_handoffs_use_standard_label_and_strict_wallhaven_https_urls() {
+    for feature in UnsupportedFeature::ALL {
+        let hand_off = feature.hand_off();
+        assert_eq!(hand_off.label, OPEN_ON_WALLHAVEN_LABEL);
+        assert!(!feature.title().is_empty());
+        assert!(!feature.explanation().is_empty());
+        assert_valid_wallhaven_handoff_url(hand_off.url);
+    }
+    assert_eq!(
+        UnsupportedFeature::HotSorting.hand_off().url,
+        "https://wallhaven.cc/hot"
+    );
+    assert_eq!(
+        UnsupportedFeature::AiArtFilter.hand_off().url,
+        "https://wallhaven.cc/search"
+    );
+
+    let sample_id = WallpaperId::new("e8r2y8");
+    for action in DetailUnsupportedAction::ALL {
+        assert_eq!(action.label(), OPEN_ON_WALLHAVEN_LABEL);
+        assert!(!action.title().is_empty());
+        assert!(!action.explanation().is_empty());
+        let url = action.wallpaper_url(&sample_id).unwrap();
+        assert_eq!(url, "https://wallhaven.cc/w/e8r2y8");
+        assert_valid_wallhaven_handoff_url(&url);
+        for bad in ["", ".", "..", "../x", "a?b", "a b"] {
+            assert!(action.wallpaper_url(&WallpaperId::new(bad)).is_err());
+        }
+    }
+
+    for action in CollectionUnsupportedAction::ALL {
+        assert_eq!(action.label(), OPEN_ON_WALLHAVEN_LABEL);
+        assert!(!action.title().is_empty());
+        assert!(!action.explanation().is_empty());
+    }
+    let fav_url = CollectionUnsupportedAction::favorite_url(&sample_id).unwrap();
+    assert_eq!(fav_url, "https://wallhaven.cc/w/e8r2y8");
+    assert_valid_wallhaven_handoff_url(&fav_url);
+    for bad in ["", ".", "..", "../x", "a?b", "a b"] {
+        assert!(CollectionUnsupportedAction::favorite_url(&WallpaperId::new(bad)).is_err());
+    }
+    let manage_alice = CollectionUnsupportedAction::manage_collections_url(Some("alice"));
+    assert_eq!(manage_alice, "https://wallhaven.cc/user/alice/favorites");
+    assert_valid_wallhaven_handoff_url(&manage_alice);
+    for fallback_input in [None, Some("../bad")] {
+        let fallback = CollectionUnsupportedAction::manage_collections_url(fallback_input);
+        assert_eq!(fallback, "https://wallhaven.cc/");
+        assert_valid_wallhaven_handoff_url(&fallback);
+    }
+
+    for action in ProfileTagUnsupportedAction::ALL {
+        assert_eq!(action.label(), OPEN_ON_WALLHAVEN_LABEL);
+        assert!(!action.title().is_empty());
+        assert!(!action.explanation().is_empty());
+    }
+    let profile_url = ProfileTagUnsupportedAction::user_profile_url("artist_one").unwrap();
+    assert_eq!(profile_url, "https://wallhaven.cc/user/artist_one");
+    assert_valid_wallhaven_handoff_url(&profile_url);
+    assert!(ProfileTagUnsupportedAction::user_profile_url("../bad").is_err());
+
+    assert_eq!(
+        ProfileTagUnsupportedAction::tag_directory_url(),
+        WALLHAVEN_TAGS_URL
+    );
+    assert_eq!(WALLHAVEN_TAGS_URL, "https://wallhaven.cc/tags");
+    assert_valid_wallhaven_handoff_url(WALLHAVEN_TAGS_URL);
+    let tag_dir_hand_off = ProfileTagUnsupportedAction::tag_directory_hand_off();
+    assert_eq!(tag_dir_hand_off.label, OPEN_ON_WALLHAVEN_LABEL);
+    assert_eq!(tag_dir_hand_off.url, "https://wallhaven.cc/tags");
+
+    let mod_url = ProfileTagUnsupportedAction::tag_moderation_url(&sample_id).unwrap();
+    assert_eq!(mod_url, "https://wallhaven.cc/w/e8r2y8");
+    assert_valid_wallhaven_handoff_url(&mod_url);
+    for bad in ["", ".", "..", "../x", "a?b", "a b"] {
+        assert!(ProfileTagUnsupportedAction::tag_moderation_url(&WallpaperId::new(bad)).is_err());
+    }
+
+    for action in SiteGapAction::ALL {
+        let hand_off = action.hand_off();
+        assert_eq!(action.label(), OPEN_ON_WALLHAVEN_LABEL);
+        assert_eq!(hand_off.label, OPEN_ON_WALLHAVEN_LABEL);
+        assert_eq!(hand_off.url, action.url());
+        assert!(!action.title().is_empty());
+        assert!(!action.explanation().is_empty());
+        assert_valid_wallhaven_handoff_url(action.url());
+    }
+    assert_eq!(SiteGapAction::Homepage.url(), "https://wallhaven.cc/");
+    assert_eq!(SiteGapAction::TagDirectory.url(), WALLHAVEN_TAGS_URL);
+    assert_eq!(
+        SiteGapAction::UntaggedQueue.url(),
+        "https://wallhaven.cc/untagged"
+    );
+    assert_eq!(
+        SiteGapAction::UploadWallpaper.url(),
+        "https://wallhaven.cc/upload"
+    );
+    assert_eq!(SiteGapAction::Forums.url(), "https://wallhaven.cc/forums");
+
+    assert_eq!(WALLHAVEN_SETTINGS_URL, "https://wallhaven.cc/settings");
+    assert_valid_wallhaven_handoff_url(WALLHAVEN_SETTINGS_URL);
+}
+
+#[test]
+fn all_documented_search_syntax_operators_flow_through_discovery_controller() {
+    let mut c = DiscoveryController::with_view(
+        SessionScope::guest(1),
+        DiscoveryView::Search,
+        DiscoveryFilters::default(),
+    );
+
+    let cases = [
+        (QueryBuilder::new().tag("nature").unwrap().build(), "nature"),
+        (
+            QueryBuilder::new().tag("red hair").unwrap().build(),
+            "\"red hair\"",
+        ),
+        (
+            QueryBuilder::new()
+                .require_tag("landscape")
+                .unwrap()
+                .build(),
+            "+landscape",
+        ),
+        (
+            QueryBuilder::new().exclude_tag("city").unwrap().build(),
+            "-city",
+        ),
+        (
+            QueryBuilder::new().user("artist").unwrap().build(),
+            "@artist",
+        ),
+        (QueryBuilder::new().tag_id(42).build(), "id:42"),
+        (
+            QueryBuilder::new().file_type(FileType::Png).build(),
+            "type:png",
+        ),
+        (
+            QueryBuilder::new().file_type(FileType::Jpg).build(),
+            "type:jpg",
+        ),
+        (
+            QueryBuilder::new().like("abc123").unwrap().build(),
+            "like:abc123",
+        ),
+        (
+            QueryBuilder::new()
+                .tag("nature")
+                .unwrap()
+                .require_tag("landscape")
+                .unwrap()
+                .exclude_tag("city")
+                .unwrap()
+                .user("artist")
+                .unwrap()
+                .tag_id(42)
+                .file_type(FileType::Png)
+                .file_type(FileType::Jpg)
+                .like("abc123")
+                .unwrap()
+                .build(),
+            "nature +landscape -city @artist id:42 type:png type:jpg like:abc123",
+        ),
+    ];
+
+    for (terms, expected_q) in cases {
+        c.set_terms(terms);
+        let pairs = pair_map(&c.query_for_page(1));
+        assert_eq!(pairs.get("q").map(String::as_str), Some(expected_q));
+    }
 }

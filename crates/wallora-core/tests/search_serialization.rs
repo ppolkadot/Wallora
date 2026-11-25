@@ -3,8 +3,8 @@ use std::sync::Arc;
 use insta::assert_snapshot;
 use url::Url;
 use wallora_core::domain::{
-    AspectRatio, CategoryMask, Dimensions, InMemoryCredentialStore, PurityMask, RequestPriority,
-    SearchQuery, SessionScope, SortOrder, Sorting, TopRange,
+    AspectRatio, CategoryMask, Dimensions, FileType, InMemoryCredentialStore, PurityMask,
+    QueryBuilder, RequestPriority, SearchQuery, SessionScope, SortOrder, Sorting, TopRange,
 };
 use wallora_core::provider::{Provider, WallhavenClient, WallhavenClientConfig};
 use wiremock::matchers::{method, path};
@@ -170,4 +170,100 @@ async fn all_documented_sortings_and_top_ranges_serialize() {
 
     assert_snapshot!("documented_sortings", sortings.join("\n"));
     assert_snapshot!("documented_top_ranges", top_ranges.join("\n"));
+}
+
+#[tokio::test]
+async fn all_documented_search_syntax_operators_serialize_end_to_end() {
+    let server = server().await;
+
+    let cases = [
+        (
+            QueryBuilder::new().tag("nature").unwrap().build(),
+            "nature",
+            None,
+        ),
+        (
+            QueryBuilder::new().tag("red hair").unwrap().build(),
+            "\"red hair\"",
+            None,
+        ),
+        (
+            QueryBuilder::new()
+                .require_tag("landscape")
+                .unwrap()
+                .build(),
+            "+landscape",
+            Some("q=%2Blandscape"),
+        ),
+        (
+            QueryBuilder::new().exclude_tag("city").unwrap().build(),
+            "-city",
+            Some("q=-city"),
+        ),
+        (
+            QueryBuilder::new().user("artist").unwrap().build(),
+            "@artist",
+            Some("q=%40artist"),
+        ),
+        (
+            QueryBuilder::new().tag_id(42).build(),
+            "id:42",
+            Some("q=id%3A42"),
+        ),
+        (
+            QueryBuilder::new().file_type(FileType::Png).build(),
+            "type:png",
+            Some("q=type%3Apng"),
+        ),
+        (
+            QueryBuilder::new().file_type(FileType::Jpg).build(),
+            "type:jpg",
+            Some("q=type%3Ajpg"),
+        ),
+        (
+            QueryBuilder::new().like("abc123").unwrap().build(),
+            "like:abc123",
+            Some("q=like%3Aabc123"),
+        ),
+        (
+            QueryBuilder::new()
+                .tag("nature")
+                .unwrap()
+                .require_tag("landscape")
+                .unwrap()
+                .exclude_tag("city")
+                .unwrap()
+                .user("artist")
+                .unwrap()
+                .tag_id(42)
+                .file_type(FileType::Png)
+                .file_type(FileType::Jpg)
+                .like("abc123")
+                .unwrap()
+                .build(),
+            "nature +landscape -city @artist id:42 type:png type:jpg like:abc123",
+            None,
+        ),
+    ];
+
+    for (terms, expected_q, expected_raw_fragment) in cases {
+        let recorded = record_search(
+            &server,
+            SearchQuery {
+                q: terms.to_param(),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let decoded_q = recorded
+            .url
+            .query_pairs()
+            .find(|(key, _)| key == "q")
+            .map(|(_, value)| value.into_owned());
+        assert_eq!(decoded_q.as_deref(), Some(expected_q));
+        if let Some(fragment) = expected_raw_fragment {
+            assert_eq!(recorded.query(), fragment);
+        }
+    }
 }

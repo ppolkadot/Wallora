@@ -35,6 +35,21 @@ pub enum UnsupportedFeature {
     AiArtFilter,
 }
 
+/// Remaining website-only features without a documented public API route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SiteGapAction {
+    /// Website homepage curated sections, announcements, and site stats (`https://wallhaven.cc/`).
+    Homepage,
+    /// Website tag directory, categories, and directory sorts (`https://wallhaven.cc/tags`).
+    TagDirectory,
+    /// Website Few Tags / Untagged queue (`https://wallhaven.cc/untagged`).
+    UntaggedQueue,
+    /// Website wallpaper upload flow (`https://wallhaven.cc/upload`).
+    UploadWallpaper,
+    /// Website forums for reading and posting discussions (`https://wallhaven.cc/forums`).
+    Forums,
+}
+
 /// Unsupported wallpaper-detail actions that hand off to `https://wallhaven.cc/w/{id}`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DetailUnsupportedAction {
@@ -93,6 +108,13 @@ pub struct HandOff {
 impl UnsupportedFeature {
     pub const ALL: [Self; 2] = [Self::HotSorting, Self::AiArtFilter];
 
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::HotSorting => "Hot",
+            Self::AiArtFilter => "AI-Art Filter",
+        }
+    }
+
     pub fn hand_off(self) -> HandOff {
         HandOff {
             label: OPEN_ON_WALLHAVEN_LABEL,
@@ -110,6 +132,65 @@ impl UnsupportedFeature {
             }
             Self::AiArtFilter => {
                 "The AI-art filter has no documented API parameter. Set it on wallhaven.cc."
+            }
+        }
+    }
+}
+
+impl SiteGapAction {
+    pub const ALL: [Self; 5] = [
+        Self::Homepage,
+        Self::TagDirectory,
+        Self::UntaggedQueue,
+        Self::UploadWallpaper,
+        Self::Forums,
+    ];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Homepage => "Homepage",
+            Self::TagDirectory => "Tag Directory",
+            Self::UntaggedQueue => "Few Tags / Untagged",
+            Self::UploadWallpaper => "Upload",
+            Self::Forums => "Forums",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        OPEN_ON_WALLHAVEN_LABEL
+    }
+
+    pub fn url(self) -> &'static str {
+        match self {
+            Self::Homepage => "https://wallhaven.cc/",
+            Self::TagDirectory => "https://wallhaven.cc/tags",
+            Self::UntaggedQueue => "https://wallhaven.cc/untagged",
+            Self::UploadWallpaper => "https://wallhaven.cc/upload",
+            Self::Forums => "https://wallhaven.cc/forums",
+        }
+    }
+
+    pub fn hand_off(self) -> HandOff {
+        HandOff {
+            label: OPEN_ON_WALLHAVEN_LABEL,
+            url: self.url(),
+        }
+    }
+
+    pub fn explanation(self) -> &'static str {
+        match self {
+            Self::Homepage => {
+                "Curated homepage sections, announcements, and site stats have no public API route."
+            }
+            Self::TagDirectory => {
+                "Browse the full tag directory by category or sort on wallhaven.cc (no public API route)."
+            }
+            Self::UntaggedQueue => "The Few Tags / Untagged queue has no documented API route.",
+            Self::UploadWallpaper => {
+                "Uploading wallpapers is a website-only write action with no public API route."
+            }
+            Self::Forums => {
+                "Reading and posting in the Wallhaven forums has no documented API route."
             }
         }
     }
@@ -708,9 +789,19 @@ mod tests {
     fn hand_offs_are_labelled_and_point_at_the_website() {
         for feature in UnsupportedFeature::ALL {
             let hand_off = feature.hand_off();
-            assert_eq!(hand_off.label, "Open on wallhaven.cc");
+            assert_eq!(hand_off.label, OPEN_ON_WALLHAVEN_LABEL);
             assert!(hand_off.url.starts_with("https://wallhaven.cc/"));
+            assert!(!feature.title().is_empty());
             assert!(!feature.explanation().is_empty());
+        }
+        for action in SiteGapAction::ALL {
+            let hand_off = action.hand_off();
+            assert_eq!(action.label(), OPEN_ON_WALLHAVEN_LABEL);
+            assert_eq!(hand_off.label, OPEN_ON_WALLHAVEN_LABEL);
+            assert_eq!(hand_off.url, action.url());
+            assert!(hand_off.url.starts_with("https://wallhaven.cc/"));
+            assert!(!action.title().is_empty());
+            assert!(!action.explanation().is_empty());
         }
     }
 }

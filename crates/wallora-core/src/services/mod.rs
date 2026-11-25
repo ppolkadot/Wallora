@@ -28,8 +28,8 @@ pub use collections::{
 };
 pub use discovery::{
     ApplyOutcome, DetailUnsupportedAction, DiscoveryController, DiscoveryFilters, DiscoveryStatus,
-    DiscoveryView, HandOff, OPEN_ON_WALLHAVEN_LABEL, PageRequest, PageResponse, UnsupportedFeature,
-    fetch_page, selectable_purity,
+    DiscoveryView, HandOff, OPEN_ON_WALLHAVEN_LABEL, PageRequest, PageResponse, SiteGapAction,
+    UnsupportedFeature, fetch_page, selectable_purity,
 };
 pub use download::{
     DownloadError, DownloadFs, DownloadOutcome, DownloadProgress, DownloadRequest, FilePublisher,
