@@ -30,6 +30,7 @@ pub enum GridKey {
     PageDown,
     Home,
     End,
+    Activate,
 }
 
 impl GridKey {
@@ -43,6 +44,7 @@ impl GridKey {
             Key::Named(Named::PageDown) => Some(Self::PageDown),
             Key::Named(Named::Home) => Some(Self::Home),
             Key::Named(Named::End) => Some(Self::End),
+            Key::Named(Named::Enter) => Some(Self::Activate),
             _ => None,
         }
     }
@@ -164,10 +166,11 @@ impl GridMetrics {
         }
         let last = item_count - 1;
         let Some(curr) = current else {
-            return Some(match key {
-                GridKey::End => last,
-                _ => 0,
-            });
+            return match key {
+                GridKey::Activate => None,
+                GridKey::End => Some(last),
+                _ => Some(0),
+            };
         };
         let curr = curr.min(last);
         let cols = self.columns();
@@ -181,6 +184,7 @@ impl GridMetrics {
             GridKey::PageDown => (curr + page_step).min(last),
             GridKey::Home => 0,
             GridKey::End => last,
+            GridKey::Activate => curr,
         };
         Some(next)
     }

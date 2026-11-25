@@ -1,8 +1,10 @@
 //! Windows-specific platform integrations for Wallora.
 
 pub mod credentials;
+pub mod file_publish;
 
 pub use credentials::{DEFAULT_SERVICE_NAME, WindowsCredentialStore};
+pub use file_publish::WindowsFilePublisher;
 
 use url::Url;
 #[cfg(target_os = "windows")]

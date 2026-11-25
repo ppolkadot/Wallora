@@ -1,33 +1,37 @@
 use std::fmt;
+use std::path::PathBuf;
 
 use iced::Size;
 use wallora_core::domain::{
-    AccountId, Category, Purity, SessionScope, SortOrder, Sorting, TopRange, WallpaperId,
+    AccountId, Category, Purity, SessionScope, SortOrder, Sorting, TopRange, Wallpaper, WallpaperId,
 };
+use wallora_core::provider::ProviderError;
 use wallora_core::services::cache::{CacheError, CacheStats};
 use wallora_core::services::{
-    AccountRefreshPayload, ImagePipelineError, PageResponse, SignInError, SignInProbe,
-    UnsupportedFeature,
+    AccountRefreshPayload, DetailUnsupportedAction, DownloadError, DownloadOutcome,
+    ImagePipelineError, PageResponse, SignInError, SignInProbe, UnsupportedFeature,
 };
 
 use crate::widgets::gallery_grid::GridKey;
 use crate::widgets::thumbnail::LoadedThumbnail;
 
 /// Top-level navigation destinations in the shell.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Route {
     #[default]
     Home,
     Search,
+    Detail(WallpaperId),
     Account,
     Settings,
 }
 
 impl Route {
-    pub fn label(self) -> &'static str {
+    pub fn label(&self) -> &'static str {
         match self {
             Self::Home => "Home",
             Self::Search => "Search",
+            Self::Detail(_) => "Wallpaper Detail",
             Self::Account => "Account",
             Self::Settings => "Settings",
         }
@@ -39,6 +43,24 @@ impl Route {
 pub enum GalleryKind {
     Home,
     Search,
+}
+
+/// Identifies which detail URL was copied to the clipboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetailCopyTarget {
+    Page,
+    Original,
+    Short,
+}
+
+impl DetailCopyTarget {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Page => "page URL",
+            Self::Original => "original image URL",
+            Self::Short => "short URL",
+        }
+    }
 }
 
 /// UI selection state for the local proxy preference.
@@ -151,6 +173,55 @@ pub enum Message {
         key: GridKey,
         any_input_focused: bool,
     },
+
+    // Wallpaper detail & original download
+    DetailBack,
+    DetailRetryMetadata,
+    DetailMetadataLoaded {
+        op_id: u64,
+        scope: SessionScope,
+        id: WallpaperId,
+        result: Box<Result<Wallpaper, ProviderError>>,
+    },
+    DetailPreviewLoaded {
+        op_id: u64,
+        scope: SessionScope,
+        id: WallpaperId,
+        fallback_used: bool,
+        result: Result<LoadedThumbnail, ImagePipelineError>,
+    },
+    DetailRetryPreview,
+    DetailSelectTag {
+        id: u64,
+        name: String,
+    },
+    DetailMoreLikeThis(WallpaperId),
+    DetailCopyLink {
+        target: DetailCopyTarget,
+        url: String,
+    },
+    DetailOpenHandOff(DetailUnsupportedAction),
+    DetailDownloadOriginal,
+    DetailSavePathPicked {
+        op_id: u64,
+        scope: SessionScope,
+        id: WallpaperId,
+        path: Option<PathBuf>,
+    },
+    DetailDownloadProgress {
+        op_id: u64,
+        scope: SessionScope,
+        id: WallpaperId,
+        bytes_written: u64,
+        total_bytes: Option<u64>,
+    },
+    DetailDownloadFinished {
+        op_id: u64,
+        scope: SessionScope,
+        id: WallpaperId,
+        result: Result<DownloadOutcome, DownloadError>,
+    },
+    DetailCancelDownload,
 }
 
 impl fmt::Debug for Message {
@@ -295,6 +366,89 @@ impl fmt::Debug for Message {
                 .field("key", key)
                 .field("any_input_focused", any_input_focused)
                 .finish(),
+            Self::DetailBack => f.write_str("DetailBack"),
+            Self::DetailRetryMetadata => f.write_str("DetailRetryMetadata"),
+            Self::DetailMetadataLoaded {
+                op_id,
+                scope,
+                id,
+                result,
+            } => f
+                .debug_struct("DetailMetadataLoaded")
+                .field("op_id", op_id)
+                .field("scope", scope)
+                .field("id", id)
+                .field("ok", &result.is_ok())
+                .finish(),
+            Self::DetailPreviewLoaded {
+                op_id,
+                scope,
+                id,
+                fallback_used,
+                result,
+            } => f
+                .debug_struct("DetailPreviewLoaded")
+                .field("op_id", op_id)
+                .field("scope", scope)
+                .field("id", id)
+                .field("fallback_used", fallback_used)
+                .field("result", result)
+                .finish(),
+            Self::DetailRetryPreview => f.write_str("DetailRetryPreview"),
+            Self::DetailSelectTag { id, name } => f
+                .debug_struct("DetailSelectTag")
+                .field("id", id)
+                .field("name", name)
+                .finish(),
+            Self::DetailMoreLikeThis(id) => f.debug_tuple("DetailMoreLikeThis").field(id).finish(),
+            Self::DetailCopyLink { target, url } => f
+                .debug_struct("DetailCopyLink")
+                .field("target", target)
+                .field("url", url)
+                .finish(),
+            Self::DetailOpenHandOff(action) => {
+                f.debug_tuple("DetailOpenHandOff").field(action).finish()
+            }
+            Self::DetailDownloadOriginal => f.write_str("DetailDownloadOriginal"),
+            Self::DetailSavePathPicked {
+                op_id,
+                scope,
+                id,
+                path,
+            } => f
+                .debug_struct("DetailSavePathPicked")
+                .field("op_id", op_id)
+                .field("scope", scope)
+                .field("id", id)
+                .field("picked", &path.is_some())
+                .finish(),
+            Self::DetailDownloadProgress {
+                op_id,
+                scope,
+                id,
+                bytes_written,
+                total_bytes,
+            } => f
+                .debug_struct("DetailDownloadProgress")
+                .field("op_id", op_id)
+                .field("scope", scope)
+                .field("id", id)
+                .field("bytes_written", bytes_written)
+                .field("total_bytes", total_bytes)
+                .finish(),
+            Self::DetailDownloadFinished {
+                op_id,
+                scope,
+                id,
+                result,
+            } => f
+                .debug_struct("DetailDownloadFinished")
+                .field("op_id", op_id)
+                .field("scope", scope)
+                .field("id", id)
+                .field("ok", &result.is_ok())
+                .finish(),
+            Self::DetailCancelDownload => f.write_str("DetailCancelDownload"),
         }
     }
 }

@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 iced.workspace = true
+rfd.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-appender.workspace = true

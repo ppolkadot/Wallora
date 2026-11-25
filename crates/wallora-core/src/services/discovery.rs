@@ -35,6 +35,54 @@ pub enum UnsupportedFeature {
     AiArtFilter,
 }
 
+/// Unsupported wallpaper-detail actions that hand off to `https://wallhaven.cc/w/{id}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DetailUnsupportedAction {
+    /// Website Crop & Scale Download tool (no documented API route).
+    CropAndScale,
+    /// Website image-based "Search for similar" action (distinct from tag-based `like:ID`).
+    ImageSimilar,
+}
+
+impl DetailUnsupportedAction {
+    pub const ALL: [Self; 2] = [Self::CropAndScale, Self::ImageSimilar];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::CropAndScale => "Crop & Scale Download",
+            Self::ImageSimilar => "Search for similar from wallpaper image",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        OPEN_ON_WALLHAVEN_LABEL
+    }
+
+    pub fn explanation(self) -> &'static str {
+        match self {
+            Self::CropAndScale => {
+                "Crop & Scale is a website-only tool with no documented API route."
+            }
+            Self::ImageSimilar => {
+                "Image-based similarity search has no documented API route (use More like this for tag similarity)."
+            }
+        }
+    }
+
+    pub fn wallpaper_url(self, id: &WallpaperId) -> Result<String, &'static str> {
+        let raw = id.as_str();
+        if raw.is_empty()
+            || raw == "."
+            || raw == ".."
+            || raw.contains(['/', '\\', '?', '#', '@'])
+            || raw.chars().any(char::is_whitespace)
+        {
+            return Err("invalid wallpaper id for wallhaven.cc link");
+        }
+        Ok(format!("https://wallhaven.cc/w/{raw}"))
+    }
+}
+
 /// A labelled link that opens the website in the user's browser.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HandOff {

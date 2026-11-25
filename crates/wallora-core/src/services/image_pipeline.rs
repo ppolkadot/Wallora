@@ -76,6 +76,12 @@ impl ImageRequest {
             scope,
         }
     }
+
+    pub fn preview_url(raw: &str, scope: SessionScope) -> Result<Self, ImagePipelineError> {
+        let url = Url::parse(raw)
+            .map_err(|_| ImagePipelineError::Provider(ProviderError::OriginRejected))?;
+        Ok(Self::preview(url, scope))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

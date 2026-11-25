@@ -1,33 +1,41 @@
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 
+use iced::futures::SinkExt;
 use iced::task::Handle;
 use iced::widget::operation::{self, AbsoluteOffset};
 use iced::widget::{Id, button, column, container, image as iced_image, row, text};
 use iced::{Alignment, Background, Border, Element, Length, Size, Subscription, Task, Theme};
 use wallora_core::domain::{
     BrowseDefaults, CacheCapError, Category, CredentialStore, DEFAULT_CACHE_CAP_BYTES,
-    HARD_MAX_CACHE_CAP_BYTES, ProxyConfig, Purity, SearchTerms, SecretString, SessionKind,
-    SessionScope, Sorting, TopRange, WALLHAVEN_SETTINGS_URL, WallpaperId,
+    HARD_MAX_CACHE_CAP_BYTES, ProxyConfig, Purity, QueryToken, SearchTerms, SecretString,
+    SessionKind, SessionScope, Sorting, Thumbs, TopRange, WALLHAVEN_SETTINGS_URL, Wallpaper,
+    WallpaperId,
 };
-use wallora_core::provider::{WallhavenClient, WallhavenClientConfig};
+use wallora_core::provider::client::PREVIEW_BYTE_LIMIT;
+use wallora_core::provider::{Provider, ProviderError, WallhavenClient, WallhavenClientConfig};
 use wallora_core::services::cache::{
     CacheConfig, CacheError, CacheStats, CacheStore, CancelToken, NoopSessionCacheSink,
     SessionCacheSink,
 };
 use wallora_core::services::{
     ApplyOutcome, DiscoveryController, DiscoveryFilters, DiscoveryStatus, DiscoveryView,
-    ImageGuard, ImagePipeline, ImagePipelineError, ImageRequest, NoticeLevel, PageRequest,
-    SessionManager, SessionNotice, SignInCommitOutcome, SignInError, fetch_account_refresh,
-    fetch_page, load_uncached, probe_sign_in, selectable_purity,
+    DownloadError, DownloadRequest, FilePublisher, ImageGuard, ImageGuardError, ImagePipeline,
+    ImagePipelineError, ImageRequest, NoticeLevel, OriginalDownloader, PREVIEW_MAX_PIXELS,
+    PREVIEW_MAX_SIDE, PageRequest, ScopedResponse, SessionManager, SessionNotice,
+    SignInCommitOutcome, SignInError, fetch_account_refresh, fetch_page, load_uncached,
+    probe_sign_in, selectable_purity,
 };
 use wallora_core::storage::{AppPaths, SessionStorage, SqliteStore, StorageError};
-use wallora_windows::WindowsCredentialStore;
+use wallora_core::util::default_download_filename;
+use wallora_windows::{WindowsCredentialStore, WindowsFilePublisher};
 
 use crate::cache_host::CacheHost;
 use crate::message::{GalleryKind, Message, ProxyModeChoice, Route};
 use crate::theme::{palette, surface_color, wallora_theme};
 use crate::views;
+use crate::views::detail::{DetailDownloadView, DetailPreviewView, DetailViewState};
 use crate::views::search::{
     SearchInputIds, format_ratios, format_resolutions, parse_atleast_input, parse_color_input,
     parse_ratios_input, parse_resolutions_input,
@@ -358,6 +366,176 @@ fn gallery_keyboard_event(
     None
 }
 
+enum DetailMetadataState {
+    Loading {
+        summary: Option<Wallpaper>,
+        op_id: u64,
+        handle: Handle,
+    },
+    Loaded(Box<Wallpaper>),
+    Failed {
+        summary: Option<Wallpaper>,
+        error: ProviderError,
+    },
+}
+
+enum DetailPreviewState {
+    Idle,
+    Loading {
+        op_id: u64,
+        scope: SessionScope,
+        fallback_used: bool,
+        cancel: CancelToken,
+        handle: Handle,
+    },
+    Loaded {
+        handle: iced_image::Handle,
+        stale: bool,
+        fallback_used: bool,
+    },
+    Failed {
+        message: String,
+    },
+}
+
+enum DetailDownloadState {
+    Idle,
+    PickingLocation {
+        op_id: u64,
+        scope: SessionScope,
+        handle: Handle,
+    },
+    Downloading {
+        op_id: u64,
+        scope: SessionScope,
+        target: PathBuf,
+        bytes_written: u64,
+        total_bytes: Option<u64>,
+        cancel: CancelToken,
+        handle: Handle,
+    },
+    Saved {
+        path: PathBuf,
+        bytes_written: u64,
+        collision_renamed: bool,
+    },
+    Failed {
+        message: String,
+        part_path: Option<PathBuf>,
+    },
+}
+
+struct DetailState {
+    wallpaper_id: WallpaperId,
+    return_to: GalleryKind,
+    metadata: DetailMetadataState,
+    preview: DetailPreviewState,
+    download: DetailDownloadState,
+    copy_feedback: Option<String>,
+}
+
+impl DetailState {
+    fn wallpaper(&self) -> Option<&Wallpaper> {
+        match &self.metadata {
+            DetailMetadataState::Loaded(wallpaper) => Some(wallpaper),
+            DetailMetadataState::Loading { summary, .. }
+            | DetailMetadataState::Failed { summary, .. } => summary.as_ref(),
+        }
+    }
+
+    fn full_wallpaper(&self) -> Option<&Wallpaper> {
+        match &self.metadata {
+            DetailMetadataState::Loaded(wallpaper) => Some(wallpaper),
+            _ => None,
+        }
+    }
+
+    fn cancel_preview(&mut self) {
+        if let DetailPreviewState::Loading { cancel, handle, .. } = &self.preview {
+            cancel.cancel();
+            handle.abort();
+        }
+        self.preview = DetailPreviewState::Idle;
+    }
+
+    fn cancel_all(&mut self) {
+        if let DetailMetadataState::Loading { handle, .. } = &self.metadata {
+            handle.abort();
+        }
+        self.cancel_preview();
+        match &self.download {
+            DetailDownloadState::PickingLocation { handle, .. } => handle.abort(),
+            DetailDownloadState::Downloading { cancel, handle, .. } => {
+                cancel.cancel();
+                handle.abort();
+            }
+            DetailDownloadState::Idle
+            | DetailDownloadState::Saved { .. }
+            | DetailDownloadState::Failed { .. } => {}
+        }
+        self.download = DetailDownloadState::Idle;
+    }
+}
+
+fn preview_exceeds_budget(wallpaper: &Wallpaper) -> bool {
+    let pixels = u64::from(wallpaper.dimension_x).saturating_mul(u64::from(wallpaper.dimension_y));
+    wallpaper.file_size > PREVIEW_BYTE_LIMIT as u64
+        || wallpaper.dimension_x > PREVIEW_MAX_SIDE
+        || wallpaper.dimension_y > PREVIEW_MAX_SIDE
+        || pixels > PREVIEW_MAX_PIXELS
+}
+
+fn is_preview_budget_error(error: &ImagePipelineError) -> bool {
+    matches!(
+        error,
+        ImagePipelineError::Provider(ProviderError::ImageTooLarge { .. })
+            | ImagePipelineError::Decode(
+                ImageGuardError::EncodedTooLarge { .. }
+                    | ImageGuardError::DimensionsExceeded { .. }
+                    | ImageGuardError::MegapixelsExceeded { .. }
+                    | ImageGuardError::DecodedBudgetExceeded { .. }
+            )
+    )
+}
+
+fn select_fallback_preview_url(thumbs: &Thumbs) -> &str {
+    if !thumbs.original.is_empty() {
+        thumbs.original.as_str()
+    } else if !thumbs.large.is_empty() {
+        thumbs.large.as_str()
+    } else {
+        thumbs.small.as_str()
+    }
+}
+
+fn detail_keyboard_event(
+    event: iced::Event,
+    status: iced::event::Status,
+    _window: iced::window::Id,
+) -> Option<Message> {
+    if status == iced::event::Status::Captured {
+        return None;
+    }
+    if let iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, modifiers, .. }) = event
+        && !modifiers.control()
+        && !modifiers.alt()
+        && !modifiers.logo()
+        && key == iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape)
+    {
+        return Some(Message::DetailBack);
+    }
+    None
+}
+
+async fn pick_download_destination(default_name: String) -> Option<PathBuf> {
+    rfd::AsyncFileDialog::new()
+        .set_title("Save original wallpaper")
+        .set_file_name(default_name)
+        .save_file()
+        .await
+        .map(|handle| handle.path().to_path_buf())
+}
+
 pub struct WalloraApp {
     route: Route,
     paths: AppPaths,
@@ -374,6 +552,7 @@ pub struct WalloraApp {
     cache: Option<CacheStore>,
     image_guard: ImageGuard,
     thumbnail_loader: ThumbnailLoader,
+    file_publisher: Arc<dyn FilePublisher>,
     cache_cap_input: String,
     cache_cap_feedback: Option<(bool, String)>,
     cache_cap_in_flight: Option<u64>,
@@ -390,6 +569,7 @@ pub struct WalloraApp {
     search_filter_error: Option<String>,
     search_filters_expanded: bool,
     search_input_ids: SearchInputIds,
+    detail: Option<DetailState>,
 }
 
 fn cache_open_warning(error: &CacheError) -> &'static str {
@@ -537,6 +717,7 @@ impl WalloraApp {
             cache,
             image_guard,
             thumbnail_loader,
+            file_publisher: Arc::new(WindowsFilePublisher),
             cache_cap_input,
             cache_cap_feedback: None,
             cache_cap_in_flight: None,
@@ -553,6 +734,7 @@ impl WalloraApp {
             search_filter_error: None,
             search_filters_expanded: true,
             search_input_ids: SearchInputIds::new(),
+            detail: None,
         };
 
         let startup_task = app.spawn_active_account_refresh(true);
@@ -582,10 +764,14 @@ impl WalloraApp {
 
     pub fn subscription(&self) -> Subscription<Message> {
         let resize = iced::window::resize_events().map(|(_id, size)| Message::WindowResized(size));
-        if matches!(self.route, Route::Home | Route::Search) {
-            Subscription::batch([resize, iced::event::listen_with(gallery_keyboard_event)])
-        } else {
-            resize
+        match self.route {
+            Route::Home | Route::Search => {
+                Subscription::batch([resize, iced::event::listen_with(gallery_keyboard_event)])
+            }
+            Route::Detail(_) => {
+                Subscription::batch([resize, iced::event::listen_with(detail_keyboard_event)])
+            }
+            Route::Account | Route::Settings => resize,
         }
     }
 
@@ -607,7 +793,7 @@ impl WalloraApp {
         match self.route {
             Route::Home => Some(GalleryKind::Home),
             Route::Search => Some(GalleryKind::Search),
-            Route::Account | Route::Settings => None,
+            Route::Detail(_) | Route::Account | Route::Settings => None,
         }
     }
 
@@ -670,7 +856,7 @@ impl WalloraApp {
         let kind = match route {
             Route::Home => GalleryKind::Home,
             Route::Search => GalleryKind::Search,
-            Route::Account | Route::Settings => return Task::none(),
+            Route::Detail(_) | Route::Account | Route::Settings => return Task::none(),
         };
         let gallery = self.gallery_mut(kind);
         if *gallery.controller.status() == DiscoveryStatus::Idle && !gallery.controller.is_loading()
@@ -679,6 +865,23 @@ impl WalloraApp {
             self.spawn_page_request(kind, req)
         } else {
             self.sync_gallery_thumbnails(kind)
+        }
+    }
+
+    fn clear_detail(&mut self) {
+        if let Some(mut detail) = self.detail.take() {
+            detail.cancel_all();
+        }
+    }
+
+    fn clear_detail_and_return_to_gallery(&mut self) {
+        let return_to = self.detail.as_ref().map(|d| d.return_to);
+        self.clear_detail();
+        if matches!(self.route, Route::Detail(_)) {
+            self.route = match return_to.unwrap_or(GalleryKind::Home) {
+                GalleryKind::Home => Route::Home,
+                GalleryKind::Search => Route::Search,
+            };
         }
     }
 
@@ -716,6 +919,7 @@ impl WalloraApp {
             op.handle.abort();
         }
         self.cancel_sign_in();
+        self.clear_detail_and_return_to_gallery();
 
         let scope = self.session.scope();
         let defaults = self.session.browse_defaults();
@@ -741,7 +945,7 @@ impl WalloraApp {
         );
         self.sync_search_inputs_to_defaults(&defaults);
 
-        Some(self.ensure_route_loaded(self.route))
+        Some(self.ensure_route_loaded(self.route.clone()))
     }
 
     fn apply_updated_browse_defaults(&mut self, defaults: &BrowseDefaults) -> Task<Message> {
@@ -828,17 +1032,17 @@ impl WalloraApp {
             Message::Navigate(route) => {
                 if self.route != route {
                     tracing::info!(?route, "navigated view");
-                    let previous_route = self.route;
-                    self.route = route;
+                    let previous_route = std::mem::replace(&mut self.route, route.clone());
                     match previous_route {
                         Route::Home => self.home.cancel_in_flight_thumbnails(),
                         Route::Search => self.search.cancel_in_flight_thumbnails(),
+                        Route::Detail(_) => self.clear_detail(),
                         Route::Account | Route::Settings => {}
                     }
                     return match route {
                         Route::Home | Route::Search => self.ensure_route_loaded(route),
                         Route::Settings => self.request_cache_stats(),
-                        Route::Account => Task::none(),
+                        Route::Detail(_) | Route::Account => Task::none(),
                     };
                 }
                 Task::none()
@@ -1149,6 +1353,11 @@ impl WalloraApp {
                 let len = self.gallery(kind).controller.items().len();
                 if index < len {
                     self.gallery_mut(kind).selected = Some(index);
+                    if let Some(wallpaper) =
+                        self.gallery(kind).controller.items().get(index).cloned()
+                    {
+                        return self.open_detail(wallpaper.id.clone(), Some(wallpaper), kind);
+                    }
                 }
                 Task::none()
             }
@@ -1321,7 +1530,7 @@ impl WalloraApp {
                         }
                     })
                 }
-                Route::Account | Route::Settings => Task::none(),
+                Route::Detail(_) | Route::Account | Route::Settings => Task::none(),
             },
             Message::SearchKeyFocusChecked {
                 key,
@@ -1333,6 +1542,554 @@ impl WalloraApp {
                     Task::none()
                 }
             }
+            Message::DetailBack => self.detail_back(),
+            Message::DetailRetryMetadata => self.retry_detail_metadata(),
+            Message::DetailMetadataLoaded {
+                op_id,
+                scope,
+                id,
+                result,
+            } => {
+                let matches_in_flight = self.detail.as_ref().is_some_and(|d| {
+                    d.wallpaper_id == id
+                        && matches!(
+                            &d.metadata,
+                            DetailMetadataState::Loading { op_id: active_op, .. }
+                                if *active_op == op_id
+                        )
+                });
+                if !matches_in_flight {
+                    return Task::none();
+                }
+                let previous = self.session.scope();
+                match self.session.handle_provider_result(&scope, *result) {
+                    ScopedResponse::Stale => Task::none(),
+                    ScopedResponse::Revoked(_) => self
+                        .retire_changed_scope(&previous)
+                        .unwrap_or_else(Task::none),
+                    ScopedResponse::Ready(Ok(wallpaper)) => {
+                        if let Some(detail) = &mut self.detail {
+                            detail.metadata = DetailMetadataState::Loaded(Box::new(wallpaper));
+                        }
+                        self.spawn_detail_preview(false)
+                    }
+                    ScopedResponse::Ready(Err(error)) => {
+                        if let Some(detail) = &mut self.detail {
+                            let summary = detail.wallpaper().cloned();
+                            detail.metadata = DetailMetadataState::Failed { summary, error };
+                        }
+                        Task::none()
+                    }
+                }
+            }
+            Message::DetailPreviewLoaded {
+                op_id,
+                scope,
+                id,
+                fallback_used,
+                result,
+            } => {
+                if scope != self.session.scope() {
+                    return Task::none();
+                }
+                let matches_in_flight = self.detail.as_ref().is_some_and(|d| {
+                    d.wallpaper_id == id
+                        && matches!(
+                            &d.preview,
+                            DetailPreviewState::Loading {
+                                op_id: active_op,
+                                scope: active_scope,
+                                ..
+                            } if *active_op == op_id && *active_scope == scope
+                        )
+                });
+                if !matches_in_flight {
+                    return Task::none();
+                }
+                match result {
+                    Ok(loaded) => {
+                        if let Some(detail) = &mut self.detail {
+                            detail.preview = DetailPreviewState::Loaded {
+                                handle: loaded.handle,
+                                stale: loaded.stale,
+                                fallback_used,
+                            };
+                        }
+                        Task::none()
+                    }
+                    Err(ImagePipelineError::Cancelled | ImagePipelineError::ScopeChanged) => {
+                        if let Some(detail) = &mut self.detail {
+                            detail.preview = DetailPreviewState::Idle;
+                        }
+                        Task::none()
+                    }
+                    Err(err) if !fallback_used && is_preview_budget_error(&err) => {
+                        self.spawn_detail_preview(true)
+                    }
+                    Err(err) => {
+                        if let Some(detail) = &mut self.detail {
+                            detail.preview = DetailPreviewState::Failed {
+                                message: thumbnail_error_message(&err),
+                            };
+                        }
+                        Task::none()
+                    }
+                }
+            }
+            Message::DetailRetryPreview => self.spawn_detail_preview(false),
+            Message::DetailSelectTag { id, .. } => {
+                self.open_search_with_query(QueryToken::tag_id(id).render())
+            }
+            Message::DetailMoreLikeThis(id) => {
+                let query = QueryToken::like(id.as_str())
+                    .map(|token| token.render())
+                    .unwrap_or_else(|_| format!("like:{}", id.as_str()));
+                self.open_search_with_query(query)
+            }
+            Message::DetailCopyLink { target, url } => {
+                if let Some(detail) = &mut self.detail {
+                    detail.copy_feedback = Some(format!("Copied {} to clipboard.", target.label()));
+                }
+                iced::clipboard::write(url)
+            }
+            Message::DetailOpenHandOff(action) => {
+                if let Some(detail) = &self.detail {
+                    match action.wallpaper_url(&detail.wallpaper_id) {
+                        Ok(url) => self.open_wallhaven_url(&url),
+                        Err(err) => {
+                            self.session.set_notice(Some(SessionNotice::warning(err)));
+                        }
+                    }
+                }
+                Task::none()
+            }
+            Message::DetailDownloadOriginal => self.start_detail_save_dialog(),
+            Message::DetailSavePathPicked {
+                op_id,
+                scope,
+                id,
+                path,
+            } => self.start_detail_download(op_id, scope, id, path),
+            Message::DetailDownloadProgress {
+                op_id,
+                scope,
+                id,
+                bytes_written,
+                total_bytes,
+            } => {
+                if scope == self.session.scope()
+                    && let Some(detail) = &mut self.detail
+                    && detail.wallpaper_id == id
+                    && let DetailDownloadState::Downloading {
+                        op_id: active_op,
+                        scope: active_scope,
+                        bytes_written: current_written,
+                        total_bytes: current_total,
+                        ..
+                    } = &mut detail.download
+                    && *active_op == op_id
+                    && *active_scope == scope
+                {
+                    *current_written = bytes_written;
+                    *current_total = total_bytes;
+                }
+                Task::none()
+            }
+            Message::DetailDownloadFinished {
+                op_id,
+                scope,
+                id,
+                result,
+            } => {
+                if scope != self.session.scope() {
+                    return Task::none();
+                }
+                let matches_downloading = self.detail.as_ref().is_some_and(|d| {
+                    d.wallpaper_id == id
+                        && matches!(
+                            &d.download,
+                            DetailDownloadState::Downloading {
+                                op_id: active_op,
+                                scope: active_scope,
+                                ..
+                            } if *active_op == op_id && *active_scope == scope
+                        )
+                });
+                if !matches_downloading {
+                    return Task::none();
+                }
+                if let Some(detail) = &mut self.detail {
+                    detail.download = match result {
+                        Ok(outcome) => DetailDownloadState::Saved {
+                            path: outcome.path,
+                            bytes_written: outcome.bytes_written,
+                            collision_renamed: outcome.collision_renamed,
+                        },
+                        Err(DownloadError::Cancelled { .. }) => DetailDownloadState::Idle,
+                        Err(err) => DetailDownloadState::Failed {
+                            message: err.user_message(),
+                            part_path: err.part_path().map(PathBuf::from),
+                        },
+                    };
+                }
+                Task::none()
+            }
+            Message::DetailCancelDownload => {
+                self.cancel_detail_download();
+                Task::none()
+            }
+        }
+    }
+
+    fn spawn_wallpaper_fetch(
+        &self,
+        id: WallpaperId,
+        op_id: u64,
+        scope: SessionScope,
+    ) -> (Task<Message>, Handle) {
+        let client = Arc::clone(&self.client);
+        let msg_scope = scope.clone();
+        let msg_id = id.clone();
+        let (task, handle) = Task::perform(
+            async move { client.wallpaper(id, scope).await },
+            move |result| Message::DetailMetadataLoaded {
+                op_id,
+                scope: msg_scope,
+                id: msg_id,
+                result: Box::new(result),
+            },
+        )
+        .abortable();
+        (task, handle)
+    }
+
+    fn open_detail(
+        &mut self,
+        id: WallpaperId,
+        summary: Option<Wallpaper>,
+        return_to: GalleryKind,
+    ) -> Task<Message> {
+        self.clear_detail();
+        match return_to {
+            GalleryKind::Home => self.home.cancel_in_flight_thumbnails(),
+            GalleryKind::Search => self.search.cancel_in_flight_thumbnails(),
+        }
+        self.route = Route::Detail(id.clone());
+        let op_id = self.allocate_op_id();
+        let scope = self.session.scope();
+        let (task, handle) = self.spawn_wallpaper_fetch(id.clone(), op_id, scope);
+        self.detail = Some(DetailState {
+            wallpaper_id: id,
+            return_to,
+            metadata: DetailMetadataState::Loading {
+                summary,
+                op_id,
+                handle: handle.abort_on_drop(),
+            },
+            preview: DetailPreviewState::Idle,
+            download: DetailDownloadState::Idle,
+            copy_feedback: None,
+        });
+        task
+    }
+
+    fn detail_back(&mut self) -> Task<Message> {
+        let return_to = self
+            .detail
+            .as_ref()
+            .map_or(GalleryKind::Home, |d| d.return_to);
+        self.clear_detail();
+        self.route = match return_to {
+            GalleryKind::Home => Route::Home,
+            GalleryKind::Search => Route::Search,
+        };
+
+        let scroll_y = self.gallery(return_to).metrics.scroll_y;
+        let scroll_task = if scroll_y > 0.0 {
+            operation::scroll_to(
+                self.gallery(return_to).scrollable_id.clone(),
+                AbsoluteOffset {
+                    x: Some(0.0),
+                    y: Some(scroll_y),
+                },
+            )
+        } else {
+            Task::none()
+        };
+        let thumb_task = self.sync_gallery_thumbnails(return_to);
+        if scroll_task.units() == 0 {
+            thumb_task
+        } else if thumb_task.units() == 0 {
+            scroll_task
+        } else {
+            Task::batch([scroll_task, thumb_task])
+        }
+    }
+
+    fn retry_detail_metadata(&mut self) -> Task<Message> {
+        let Some(detail) = &self.detail else {
+            return Task::none();
+        };
+        let summary = detail.wallpaper().cloned();
+        let id = detail.wallpaper_id.clone();
+        let op_id = self.allocate_op_id();
+        let scope = self.session.scope();
+        let (task, handle) = self.spawn_wallpaper_fetch(id, op_id, scope);
+        if let Some(detail) = &mut self.detail {
+            if let DetailMetadataState::Loading { handle: old, .. } = &detail.metadata {
+                old.abort();
+            }
+            detail.metadata = DetailMetadataState::Loading {
+                summary,
+                op_id,
+                handle: handle.abort_on_drop(),
+            };
+        }
+        task
+    }
+
+    fn spawn_detail_preview(&mut self, force_fallback: bool) -> Task<Message> {
+        let Some(detail) = &self.detail else {
+            return Task::none();
+        };
+        let Some(wallpaper) = detail.wallpaper().cloned() else {
+            return Task::none();
+        };
+        let fallback_used = force_fallback || preview_exceeds_budget(&wallpaper);
+        let raw_url = if fallback_used {
+            select_fallback_preview_url(&wallpaper.thumbs)
+        } else if !wallpaper.path.is_empty() {
+            wallpaper.path.as_str()
+        } else {
+            select_fallback_preview_url(&wallpaper.thumbs)
+        };
+        let scope = self.session.scope();
+        let request = match ImageRequest::preview_url(raw_url, scope.clone()) {
+            Ok(req) => req,
+            Err(err) => {
+                if let Some(detail) = &mut self.detail {
+                    detail.cancel_preview();
+                    detail.preview = DetailPreviewState::Failed {
+                        message: thumbnail_error_message(&err),
+                    };
+                }
+                return Task::none();
+            }
+        };
+
+        let op_id = self.allocate_op_id();
+        let cancel = CancelToken::new();
+        let cancel_for_task = cancel.clone();
+        let loader = self.thumbnail_loader.clone();
+        let id = wallpaper.id.clone();
+        let msg_scope = scope.clone();
+
+        let (task, handle) = Task::perform(
+            async move { loader.load(request, cancel_for_task).await },
+            move |result| Message::DetailPreviewLoaded {
+                op_id,
+                scope: msg_scope,
+                id,
+                fallback_used,
+                result,
+            },
+        )
+        .abortable();
+
+        if let Some(detail) = &mut self.detail {
+            detail.cancel_preview();
+            detail.preview = DetailPreviewState::Loading {
+                op_id,
+                scope,
+                fallback_used,
+                cancel,
+                handle: handle.abort_on_drop(),
+            };
+        }
+        task
+    }
+
+    fn open_search_with_query(&mut self, query: String) -> Task<Message> {
+        self.clear_detail();
+        self.route = Route::Search;
+        let defaults = self.session.browse_defaults();
+        let default_filters = DiscoveryFilters::from_defaults(&defaults);
+        self.search_query_input = query.clone();
+        self.search_atleast_input.clear();
+        self.search_resolutions_input = format_resolutions(&defaults.resolutions);
+        self.search_ratios_input = format_ratios(&defaults.aspect_ratios);
+        self.search_colors_input.clear();
+        self.search_filter_error = None;
+
+        let terms_req = self.search.controller.set_terms(SearchTerms::raw(query));
+        let filters_req = self.search.controller.set_filters(default_filters);
+        let req = filters_req
+            .or(terms_req)
+            .unwrap_or_else(|| self.search.controller.refresh());
+        self.reload_gallery(GalleryKind::Search, req)
+    }
+
+    fn start_detail_save_dialog(&mut self) -> Task<Message> {
+        let Some(detail) = &self.detail else {
+            return Task::none();
+        };
+        if matches!(
+            detail.download,
+            DetailDownloadState::PickingLocation { .. } | DetailDownloadState::Downloading { .. }
+        ) {
+            return Task::none();
+        }
+        let Some(wallpaper) = detail.full_wallpaper() else {
+            return Task::none();
+        };
+        let default_name = default_download_filename(wallpaper);
+        let id = detail.wallpaper_id.clone();
+        let op_id = self.allocate_op_id();
+        let scope = self.session.scope();
+        let msg_scope = scope.clone();
+
+        let (task, handle) = Task::perform(pick_download_destination(default_name), move |path| {
+            Message::DetailSavePathPicked {
+                op_id,
+                scope: msg_scope,
+                id,
+                path,
+            }
+        })
+        .abortable();
+
+        if let Some(detail) = &mut self.detail {
+            detail.download = DetailDownloadState::PickingLocation {
+                op_id,
+                scope,
+                handle: handle.abort_on_drop(),
+            };
+        }
+        task
+    }
+
+    fn start_detail_download(
+        &mut self,
+        op_id: u64,
+        scope: SessionScope,
+        id: WallpaperId,
+        path: Option<PathBuf>,
+    ) -> Task<Message> {
+        if scope != self.session.scope() {
+            return Task::none();
+        }
+        let matches_picking = self.detail.as_ref().is_some_and(|d| {
+            d.wallpaper_id == id
+                && matches!(
+                    &d.download,
+                    DetailDownloadState::PickingLocation {
+                        op_id: active_op,
+                        scope: active_scope,
+                        ..
+                    } if *active_op == op_id && *active_scope == scope
+                )
+        });
+        if !matches_picking {
+            return Task::none();
+        }
+
+        let Some(destination) = path else {
+            if let Some(detail) = &mut self.detail {
+                detail.download = DetailDownloadState::Idle;
+            }
+            return Task::none();
+        };
+
+        let request = {
+            let Some(detail) = &self.detail else {
+                return Task::none();
+            };
+            let Some(wallpaper) = detail.full_wallpaper().or_else(|| detail.wallpaper()) else {
+                return Task::none();
+            };
+            match DownloadRequest::for_wallpaper(wallpaper, destination.clone()) {
+                Ok(req) => req,
+                Err(err) => {
+                    if let Some(detail) = &mut self.detail {
+                        detail.download = DetailDownloadState::Failed {
+                            message: err.user_message(),
+                            part_path: err.part_path().map(PathBuf::from),
+                        };
+                    }
+                    return Task::none();
+                }
+            }
+        };
+
+        let dl_op_id = self.allocate_op_id();
+        let total_bytes = request.expected_file_size;
+        let cancel = CancelToken::new();
+        let cancel_for_task = cancel.clone();
+        let downloader = OriginalDownloader::new(
+            Arc::clone(&self.client),
+            self.image_guard.clone(),
+            Arc::clone(&self.file_publisher),
+        );
+        let msg_scope = scope.clone();
+        let msg_id = id.clone();
+
+        let (task, handle) = Task::stream(iced::stream::channel(
+            16,
+            move |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
+                let (prog_tx, mut prog_rx) = tokio::sync::mpsc::unbounded_channel();
+                let download_fut =
+                    downloader.download_with_progress(request, cancel_for_task, Some(prog_tx));
+                tokio::pin!(download_fut);
+
+                let result = loop {
+                    tokio::select! {
+                        res = &mut download_fut => break res,
+                        Some(prog) = prog_rx.recv() => {
+                            let _ = output.try_send(Message::DetailDownloadProgress {
+                                op_id: dl_op_id,
+                                scope: msg_scope.clone(),
+                                id: msg_id.clone(),
+                                bytes_written: prog.bytes_written,
+                                total_bytes: prog.total_bytes,
+                            });
+                        }
+                    }
+                };
+
+                let _ = output
+                    .send(Message::DetailDownloadFinished {
+                        op_id: dl_op_id,
+                        scope: msg_scope,
+                        id: msg_id,
+                        result,
+                    })
+                    .await;
+            },
+        ))
+        .abortable();
+
+        if let Some(detail) = &mut self.detail {
+            detail.download = DetailDownloadState::Downloading {
+                op_id: dl_op_id,
+                scope,
+                target: destination,
+                bytes_written: 0,
+                total_bytes,
+                cancel,
+                handle: handle.abort_on_drop(),
+            };
+        }
+        task
+    }
+
+    fn cancel_detail_download(&mut self) {
+        let Some(detail) = &mut self.detail else {
+            return;
+        };
+        if let DetailDownloadState::Downloading { cancel, handle, .. } = &detail.download {
+            cancel.cancel();
+            handle.abort();
+            detail.download = DetailDownloadState::Idle;
         }
     }
 
@@ -1354,6 +2111,14 @@ impl WalloraApp {
     }
 
     fn apply_gallery_key(&mut self, kind: GalleryKind, key: GridKey) -> Task<Message> {
+        if key == GridKey::Activate {
+            if let Some(idx) = self.gallery(kind).selected
+                && let Some(wallpaper) = self.gallery(kind).controller.items().get(idx).cloned()
+            {
+                return self.open_detail(wallpaper.id.clone(), Some(wallpaper), kind);
+            }
+            return Task::none();
+        }
         let len = self.gallery(kind).controller.items().len();
         let next = self
             .gallery(kind)
@@ -1580,6 +2345,79 @@ impl WalloraApp {
         }
     }
 
+    fn detail_view_state(&self, is_guest: bool) -> DetailViewState<'_> {
+        let Some(detail) = &self.detail else {
+            unreachable!("Route::Detail always holds DetailState");
+        };
+        let (metadata_loading, metadata_error) = match &detail.metadata {
+            DetailMetadataState::Loading { .. } => (true, None),
+            DetailMetadataState::Loaded(_) => (false, None),
+            DetailMetadataState::Failed { error, .. } => (false, Some(error)),
+        };
+        let preview = match &detail.preview {
+            DetailPreviewState::Idle => DetailPreviewView::Loading {
+                fallback_used: false,
+            },
+            DetailPreviewState::Loading { fallback_used, .. } => DetailPreviewView::Loading {
+                fallback_used: *fallback_used,
+            },
+            DetailPreviewState::Loaded {
+                handle,
+                stale,
+                fallback_used,
+            } => DetailPreviewView::Loaded {
+                handle,
+                stale: *stale,
+                fallback_used: *fallback_used,
+            },
+            DetailPreviewState::Failed { message } => DetailPreviewView::Failed {
+                message: message.as_str(),
+            },
+        };
+        let download = match &detail.download {
+            DetailDownloadState::Idle => DetailDownloadView::Idle,
+            DetailDownloadState::PickingLocation { .. } => DetailDownloadView::PickingLocation,
+            DetailDownloadState::Downloading {
+                target,
+                bytes_written,
+                total_bytes,
+                ..
+            } => DetailDownloadView::Downloading {
+                target: target.as_path(),
+                bytes_written: *bytes_written,
+                total_bytes: *total_bytes,
+            },
+            DetailDownloadState::Saved {
+                path,
+                bytes_written,
+                collision_renamed,
+            } => DetailDownloadView::Saved {
+                path: path.as_path(),
+                bytes_written: *bytes_written,
+                collision_renamed: *collision_renamed,
+            },
+            DetailDownloadState::Failed { message, part_path } => DetailDownloadView::Failed {
+                message: message.as_str(),
+                part_path: part_path.as_deref(),
+            },
+        };
+        let wallpaper = detail.wallpaper();
+        let default_filename = detail.full_wallpaper().map(default_download_filename);
+        DetailViewState {
+            wallpaper_id: &detail.wallpaper_id,
+            return_to: detail.return_to,
+            metadata_loading,
+            metadata_error,
+            wallpaper,
+            has_full_metadata: detail.full_wallpaper().is_some(),
+            is_guest,
+            preview,
+            download,
+            default_filename,
+            copy_feedback: detail.copy_feedback.as_deref(),
+        }
+    }
+
     pub fn view(&self) -> Element<'_, Message> {
         let nav_buttons = [Route::Home, Route::Search, Route::Account, Route::Settings]
             .into_iter()
@@ -1587,7 +2425,7 @@ impl WalloraApp {
                 let active = self.route == route;
                 let btn = button(text(route.label()).size(14))
                     .padding([8, 16])
-                    .on_press(Message::Navigate(route))
+                    .on_press(Message::Navigate(route.clone()))
                     .style(move |theme, status| {
                         let base = if active {
                             button::primary(theme, status)
@@ -1654,7 +2492,7 @@ impl WalloraApp {
         let scope = self.session.scope();
         let is_guest = matches!(scope.kind, SessionKind::Guest);
         let selectable = selectable_purity(&scope, self.session.user_settings());
-        let body = match self.route {
+        let body = match &self.route {
             Route::Home => views::home::view(views::home::HomeViewState {
                 controller: &self.home.controller,
                 scrollable_id: &self.home.scrollable_id,
@@ -1680,6 +2518,7 @@ impl WalloraApp {
                 selected: self.search.selected,
                 thumbnail_state: |wallpaper| self.search.thumbnail_state(&wallpaper.id),
             }),
+            Route::Detail(_) => views::detail::view(self.detail_view_state(is_guest)),
             Route::Account => views::account::view(views::account::AccountViewState {
                 session: &self.session,
                 username_input: &self.username_input,
@@ -1741,8 +2580,11 @@ mod tests {
     use wallora_core::provider::{ImageClass, ProviderError};
     use wallora_core::services::cache::{CacheConnectivity, CacheKey, crc32_ieee};
     use wallora_core::services::{
-        AccountRefreshPayload, PageResponse, SignInProbe, UnsupportedFeature,
+        AccountRefreshPayload, DetailUnsupportedAction, DownloadOutcome, PageResponse, SignInProbe,
+        UnsupportedFeature,
     };
+
+    use crate::message::DetailCopyTarget;
 
     struct TestPaths(AppPaths);
 
@@ -3202,5 +4044,601 @@ mod tests {
             .expect("uncached cancel task");
         assert_eq!(err, ImagePipelineError::Cancelled);
         second_host.shutdown();
+    }
+
+    fn sample_detail_wallpaper(id: &str, purity: Purity) -> Wallpaper {
+        let mut wp = sample_wallpaper(id, purity);
+        wp.short_url = Some(format!("https://whvn.cc/{id}"));
+        wp.uploader = Some(wallora_core::domain::Uploader {
+            username: "artist_one".to_string(),
+            group: "Moderator".to_string(),
+            avatar: None,
+        });
+        wp.source = "https://example.invalid/art".to_string();
+        wp.colors = vec!["#1e1c1a".to_string(), "#f37316".to_string()];
+        wp.file_size = 524_288;
+        wp.file_type = "image/png".to_string();
+        wp.path = format!("https://w.wallhaven.cc/full/ab/wallhaven-{id}.png");
+        wp.tags = vec![wallora_core::domain::Tag {
+            id: 42,
+            name: "landscape".to_string(),
+            alias: String::new(),
+            category_id: 2,
+            category: "Nature".to_string(),
+            purity: Purity::Sfw,
+            created_at: "2020-01-01 00:00:00".to_string(),
+        }];
+        wp
+    }
+
+    #[test]
+    fn detail_opens_via_click_and_enter_and_back_preserves_gallery_state() {
+        let paths = TestPaths::new();
+        let mut app = test_app(&paths);
+        assert!(app.ensure_route_loaded(Route::Home).units() > 0);
+        let _ = deliver_page(
+            &mut app,
+            GalleryKind::Home,
+            1,
+            Ok(sample_page(&["d1", "d2"], 1, 2, None)),
+        );
+        let _ = deliver_thumb(
+            &mut app,
+            GalleryKind::Home,
+            "d1",
+            Ok(sample_loaded_thumb(false)),
+        );
+        app.home.metrics.scroll_y = 240.0;
+
+        // Pressing Enter with no selection does nothing.
+        assert_eq!(
+            app.update(Message::RuntimeGalleryKey(GridKey::Activate))
+                .units(),
+            0
+        );
+        assert_eq!(app.route, Route::Home);
+
+        // Clicking tile 1 opens Detail and retains return_to = Home.
+        assert!(
+            app.update(Message::GallerySelectTile {
+                kind: GalleryKind::Home,
+                index: 1,
+            })
+            .units()
+                > 0
+        );
+        assert_eq!(app.route, Route::Detail(WallpaperId::new("d2")));
+        assert_eq!(app.home.selected, Some(1));
+        assert!(app.detail.is_some());
+
+        // Back restores Home with items, scroll offset, selected index, and cached thumbnail intact.
+        let back_task = app.update(Message::DetailBack);
+        assert!(back_task.units() > 0);
+        assert_eq!(app.route, Route::Home);
+        assert!(app.detail.is_none());
+        assert_eq!(app.home.controller.items().len(), 2);
+        assert_eq!(app.home.metrics.scroll_y, 240.0);
+        assert_eq!(app.home.selected, Some(1));
+        assert!(matches!(
+            app.home.thumbnails.get(&WallpaperId::new("d1")),
+            Some(ThumbnailEntry::Loaded { .. })
+        ));
+
+        // Search gallery: focused input suppresses Enter; unfocused Enter opens Detail for selected tile.
+        assert!(app.update(Message::Navigate(Route::Search)).units() > 0);
+        let _ = deliver_page(
+            &mut app,
+            GalleryKind::Search,
+            1,
+            Ok(sample_page(&["s1", "s2"], 1, 1, None)),
+        );
+        app.search.selected = Some(0);
+        assert_eq!(
+            app.update(Message::SearchKeyFocusChecked {
+                key: GridKey::Activate,
+                any_input_focused: true,
+            })
+            .units(),
+            0
+        );
+        assert_eq!(app.route, Route::Search);
+
+        assert!(
+            app.update(Message::SearchKeyFocusChecked {
+                key: GridKey::Activate,
+                any_input_focused: false,
+            })
+            .units()
+                > 0
+        );
+        assert_eq!(app.route, Route::Detail(WallpaperId::new("s1")));
+        let _ = app.update(Message::DetailBack);
+        assert_eq!(app.route, Route::Search);
+    }
+
+    #[test]
+    fn detail_metadata_stale_dropping_guest_401_and_preview_fallback_work() {
+        let paths = TestPaths::new();
+        let mut app = test_app(&paths);
+        assert!(app.ensure_route_loaded(Route::Home).units() > 0);
+        let _ = deliver_page(
+            &mut app,
+            GalleryKind::Home,
+            1,
+            Ok(sample_page(&["m1"], 1, 1, None)),
+        );
+
+        assert!(
+            app.update(Message::GallerySelectTile {
+                kind: GalleryKind::Home,
+                index: 0,
+            })
+            .units()
+                > 0
+        );
+        let op_id = match &app.detail.as_ref().unwrap().metadata {
+            DetailMetadataState::Loading { op_id, .. } => *op_id,
+            _ => panic!("expected loading metadata"),
+        };
+        let scope = app.session.scope();
+        let full = sample_detail_wallpaper("m1", Purity::Sfw);
+
+        // Stale op_id and stale scope are dropped cleanly.
+        let _ = app.update(Message::DetailMetadataLoaded {
+            op_id: op_id + 99,
+            scope: scope.clone(),
+            id: WallpaperId::new("m1"),
+            result: Box::new(Ok(full.clone())),
+        });
+        assert!(matches!(
+            app.detail.as_ref().unwrap().metadata,
+            DetailMetadataState::Loading { .. }
+        ));
+        let _ = app.update(Message::DetailMetadataLoaded {
+            op_id,
+            scope: SessionScope::guest(scope.generation + 5),
+            id: WallpaperId::new("m1"),
+            result: Box::new(Ok(full.clone())),
+        });
+        assert!(matches!(
+            app.detail.as_ref().unwrap().metadata,
+            DetailMetadataState::Loading { .. }
+        ));
+
+        // Delivering valid full metadata starts preview loading and renders cleanly.
+        assert!(
+            app.update(Message::DetailMetadataLoaded {
+                op_id,
+                scope: scope.clone(),
+                id: WallpaperId::new("m1"),
+                result: Box::new(Ok(full.clone())),
+            })
+            .units()
+                > 0
+        );
+        assert!(app.detail.as_ref().unwrap().full_wallpaper().is_some());
+        let (preview_op, fallback_used) = match &app.detail.as_ref().unwrap().preview {
+            DetailPreviewState::Loading {
+                op_id,
+                fallback_used,
+                ..
+            } => (*op_id, *fallback_used),
+            _ => panic!("expected preview loading"),
+        };
+        assert!(!fallback_used);
+        let _ = app.view();
+
+        // Reactive preview budget error falls back to thumbnail preview.
+        assert!(
+            app.update(Message::DetailPreviewLoaded {
+                op_id: preview_op,
+                scope: scope.clone(),
+                id: WallpaperId::new("m1"),
+                fallback_used: false,
+                result: Err(ImagePipelineError::Provider(ProviderError::ImageTooLarge {
+                    limit: PREVIEW_BYTE_LIMIT,
+                })),
+            })
+            .units()
+                > 0
+        );
+        let fallback_op = match &app.detail.as_ref().unwrap().preview {
+            DetailPreviewState::Loading {
+                op_id,
+                fallback_used: true,
+                ..
+            } => *op_id,
+            _ => panic!("expected fallback preview loading"),
+        };
+        let _ = app.update(Message::DetailPreviewLoaded {
+            op_id: fallback_op,
+            scope: scope.clone(),
+            id: WallpaperId::new("m1"),
+            fallback_used: true,
+            result: Ok(sample_loaded_thumb(false)),
+        });
+        assert!(matches!(
+            app.detail.as_ref().unwrap().preview,
+            DetailPreviewState::Loaded {
+                fallback_used: true,
+                ..
+            }
+        ));
+        let _ = app.view();
+
+        // Proactive preview budget check uses fallback immediately when file_size > 64 MB.
+        let mut oversized = full;
+        oversized.file_size = (PREVIEW_BYTE_LIMIT as u64) + 1;
+        let _ = app.update(Message::DetailRetryMetadata);
+        let retry_op = match &app.detail.as_ref().unwrap().metadata {
+            DetailMetadataState::Loading { op_id, .. } => *op_id,
+            _ => panic!("expected loading metadata on retry"),
+        };
+        let _ = app.update(Message::DetailMetadataLoaded {
+            op_id: retry_op,
+            scope: scope.clone(),
+            id: WallpaperId::new("m1"),
+            result: Box::new(Ok(oversized)),
+        });
+        assert!(matches!(
+            app.detail.as_ref().unwrap().preview,
+            DetailPreviewState::Loading {
+                fallback_used: true,
+                ..
+            }
+        ));
+
+        // Guest 401 surfaces upstream's error without revoking Guest session.
+        let _ = app.update(Message::DetailRetryMetadata);
+        let nsfw_op = match &app.detail.as_ref().unwrap().metadata {
+            DetailMetadataState::Loading { op_id, .. } => *op_id,
+            _ => panic!("expected loading metadata"),
+        };
+        let _ = app.update(Message::DetailMetadataLoaded {
+            op_id: nsfw_op,
+            scope: scope.clone(),
+            id: WallpaperId::new("m1"),
+            result: Box::new(Err(ProviderError::Unauthorized)),
+        });
+        assert_eq!(app.session.scope(), scope);
+        assert!(matches!(
+            app.detail.as_ref().unwrap().metadata,
+            DetailMetadataState::Failed {
+                error: ProviderError::Unauthorized,
+                ..
+            }
+        ));
+        let _ = app.view();
+    }
+
+    #[test]
+    fn detail_scope_transitions_and_401_revocation_clear_state_and_cancel_tasks() {
+        let paths = TestPaths::new();
+        let mut app = test_app(&paths);
+        sign_in(&mut app, "alice");
+        assert_eq!(*app.home.controller.status(), DiscoveryStatus::Loading);
+        let _ = deliver_page(
+            &mut app,
+            GalleryKind::Home,
+            1,
+            Ok(sample_page(&["a1"], 1, 1, None)),
+        );
+
+        let _ = app.update(Message::GallerySelectTile {
+            kind: GalleryKind::Home,
+            index: 0,
+        });
+        let scope = app.session.scope();
+        let meta_op = match &app.detail.as_ref().unwrap().metadata {
+            DetailMetadataState::Loading { op_id, .. } => *op_id,
+            _ => panic!("expected metadata loading"),
+        };
+        let _ = app.update(Message::DetailMetadataLoaded {
+            op_id: meta_op,
+            scope: scope.clone(),
+            id: WallpaperId::new("a1"),
+            result: Box::new(Ok(sample_detail_wallpaper("a1", Purity::Sfw))),
+        });
+        let preview_cancel = match &app.detail.as_ref().unwrap().preview {
+            DetailPreviewState::Loading { cancel, .. } => cancel.clone(),
+            _ => panic!("expected preview loading"),
+        };
+
+        // SignOut cancels preview task, drops Detail state/texture, and exits Detail route.
+        let _ = app.update(Message::SignOut);
+        assert!(preview_cancel.is_cancelled());
+        assert!(app.detail.is_none());
+        assert_eq!(app.route, Route::Home);
+        assert_eq!(app.session.scope().kind, SessionKind::Guest);
+
+        // Account 401 revocation during Detail metadata load clears Detail and bumps generation.
+        sign_in(&mut app, "bob");
+        let _ = deliver_page(
+            &mut app,
+            GalleryKind::Home,
+            1,
+            Ok(sample_page(&["b1"], 1, 1, None)),
+        );
+        let _ = app.update(Message::GallerySelectTile {
+            kind: GalleryKind::Home,
+            index: 0,
+        });
+        let bob_scope = app.session.scope();
+        let bob_op = match &app.detail.as_ref().unwrap().metadata {
+            DetailMetadataState::Loading { op_id, .. } => *op_id,
+            _ => panic!("expected metadata loading"),
+        };
+        let _ = app.update(Message::DetailMetadataLoaded {
+            op_id: bob_op,
+            scope: bob_scope.clone(),
+            id: WallpaperId::new("b1"),
+            result: Box::new(Err(ProviderError::Unauthorized)),
+        });
+        assert_eq!(app.session.scope().kind, SessionKind::Guest);
+        assert!(app.session.scope().generation > bob_scope.generation);
+        assert!(app.detail.is_none());
+        assert_eq!(app.route, Route::Home);
+    }
+
+    #[test]
+    fn detail_tag_like_copy_handoff_and_download_lifecycle_work() {
+        let paths = TestPaths::new();
+        let mut app = test_app(&paths);
+        static DETAIL_LAUNCHES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        DETAIL_LAUNCHES.lock().unwrap().clear();
+        app.launch_browser = |url| {
+            wallora_windows::validate_wallhaven_handoff_url(url)?;
+            DETAIL_LAUNCHES.lock().unwrap().push(url.to_string());
+            Ok(())
+        };
+
+        assert!(app.ensure_route_loaded(Route::Home).units() > 0);
+        let _ = deliver_page(
+            &mut app,
+            GalleryKind::Home,
+            1,
+            Ok(sample_page(&["z9k2"], 1, 1, None)),
+        );
+        let _ = app.update(Message::GallerySelectTile {
+            kind: GalleryKind::Home,
+            index: 0,
+        });
+        let scope = app.session.scope();
+        let meta_op = match &app.detail.as_ref().unwrap().metadata {
+            DetailMetadataState::Loading { op_id, .. } => *op_id,
+            _ => panic!("expected metadata loading"),
+        };
+        let wp = sample_detail_wallpaper("z9k2", Purity::Sfw);
+        let _ = app.update(Message::DetailMetadataLoaded {
+            op_id: meta_op,
+            scope: scope.clone(),
+            id: WallpaperId::new("z9k2"),
+            result: Box::new(Ok(wp.clone())),
+        });
+
+        // Copy links (page, original, short) emit clipboard tasks and confirmation text.
+        for (target, url, expected_text) in [
+            (
+                DetailCopyTarget::Page,
+                wp.url.clone(),
+                "Copied page URL to clipboard.",
+            ),
+            (
+                DetailCopyTarget::Original,
+                wp.path.clone(),
+                "Copied original image URL to clipboard.",
+            ),
+            (
+                DetailCopyTarget::Short,
+                wp.short_url.clone().unwrap(),
+                "Copied short URL to clipboard.",
+            ),
+        ] {
+            let task = app.update(Message::DetailCopyLink { target, url });
+            assert!(task.units() > 0);
+            assert_eq!(
+                app.detail.as_ref().unwrap().copy_feedback.as_deref(),
+                Some(expected_text)
+            );
+        }
+
+        // Crop & Scale and image-similar hand-offs open https://wallhaven.cc/w/z9k2.
+        for action in DetailUnsupportedAction::ALL {
+            assert_eq!(action.label(), "Open on wallhaven.cc");
+            let _ = app.update(Message::DetailOpenHandOff(action));
+        }
+        assert_eq!(
+            *DETAIL_LAUNCHES.lock().unwrap(),
+            vec![
+                "https://wallhaven.cc/w/z9k2".to_string(),
+                "https://wallhaven.cc/w/z9k2".to_string(),
+            ]
+        );
+
+        // Download flow: pick cancelled -> Idle; pick accepted -> progress -> saved (incl. collision note).
+        assert!(app.update(Message::DetailDownloadOriginal).units() > 0);
+        let pick_op = match &app.detail.as_ref().unwrap().download {
+            DetailDownloadState::PickingLocation { op_id, .. } => *op_id,
+            _ => panic!("expected PickingLocation"),
+        };
+        let _ = app.update(Message::DetailSavePathPicked {
+            op_id: pick_op,
+            scope: scope.clone(),
+            id: WallpaperId::new("z9k2"),
+            path: None,
+        });
+        assert!(matches!(
+            app.detail.as_ref().unwrap().download,
+            DetailDownloadState::Idle
+        ));
+
+        assert!(app.update(Message::DetailDownloadOriginal).units() > 0);
+        let pick_op2 = match &app.detail.as_ref().unwrap().download {
+            DetailDownloadState::PickingLocation { op_id, .. } => *op_id,
+            _ => panic!("expected PickingLocation"),
+        };
+        let chosen = paths.0.local_dir.join("wallhaven-z9k2.png");
+        assert!(
+            app.update(Message::DetailSavePathPicked {
+                op_id: pick_op2,
+                scope: scope.clone(),
+                id: WallpaperId::new("z9k2"),
+                path: Some(chosen.clone()),
+            })
+            .units()
+                > 0
+        );
+        let dl_op = match &app.detail.as_ref().unwrap().download {
+            DetailDownloadState::Downloading { op_id, .. } => *op_id,
+            _ => panic!("expected Downloading"),
+        };
+        let _ = app.update(Message::DetailDownloadProgress {
+            op_id: dl_op,
+            scope: scope.clone(),
+            id: WallpaperId::new("z9k2"),
+            bytes_written: 1024,
+            total_bytes: Some(524_288),
+        });
+        let _ = app.view();
+
+        let renamed = paths.0.local_dir.join("wallhaven-z9k2 (1).png");
+        let _ = app.update(Message::DetailDownloadFinished {
+            op_id: dl_op,
+            scope: scope.clone(),
+            id: WallpaperId::new("z9k2"),
+            result: Ok(DownloadOutcome {
+                path: renamed.clone(),
+                bytes_written: 524_288,
+                dimensions: (1920, 1080),
+                collision_renamed: true,
+            }),
+        });
+        assert!(matches!(
+            &app.detail.as_ref().unwrap().download,
+            DetailDownloadState::Saved {
+                path,
+                collision_renamed: true,
+                ..
+            } if *path == renamed
+        ));
+        let _ = app.view();
+
+        // Download failure keeps actionable message and partial path visible, and Cancel resets to Idle.
+        assert!(app.update(Message::DetailDownloadOriginal).units() > 0);
+        let pick_op3 = match &app.detail.as_ref().unwrap().download {
+            DetailDownloadState::PickingLocation { op_id, .. } => *op_id,
+            _ => panic!("expected PickingLocation"),
+        };
+        let _ = app.update(Message::DetailSavePathPicked {
+            op_id: pick_op3,
+            scope: scope.clone(),
+            id: WallpaperId::new("z9k2"),
+            path: Some(chosen.clone()),
+        });
+        let dl_op3 = match &app.detail.as_ref().unwrap().download {
+            DetailDownloadState::Downloading { op_id, .. } => *op_id,
+            _ => panic!("expected Downloading"),
+        };
+        let dl_cancel = match &app.detail.as_ref().unwrap().download {
+            DetailDownloadState::Downloading { cancel, .. } => cancel.clone(),
+            _ => panic!("expected cancel token"),
+        };
+        let _ = app.update(Message::DetailCancelDownload);
+        assert!(dl_cancel.is_cancelled());
+        assert!(matches!(
+            app.detail.as_ref().unwrap().download,
+            DetailDownloadState::Idle
+        ));
+        // Stale completion after cancel is dropped cleanly.
+        let _ = app.update(Message::DetailDownloadFinished {
+            op_id: dl_op3,
+            scope: scope.clone(),
+            id: WallpaperId::new("z9k2"),
+            result: Err(DownloadError::DiskFull {
+                detail: "disk full".to_string(),
+                part_path: Some(paths.0.local_dir.join(".z9k2.part")),
+            }),
+        });
+        assert!(matches!(
+            app.detail.as_ref().unwrap().download,
+            DetailDownloadState::Idle
+        ));
+
+        // Active download failure renders error and .part path cleanly.
+        let _ = app.update(Message::DetailDownloadOriginal);
+        let pick_op4 = match &app.detail.as_ref().unwrap().download {
+            DetailDownloadState::PickingLocation { op_id, .. } => *op_id,
+            _ => panic!("expected PickingLocation"),
+        };
+        let _ = app.update(Message::DetailSavePathPicked {
+            op_id: pick_op4,
+            scope: scope.clone(),
+            id: WallpaperId::new("z9k2"),
+            path: Some(chosen),
+        });
+        let dl_op4 = match &app.detail.as_ref().unwrap().download {
+            DetailDownloadState::Downloading { op_id, .. } => *op_id,
+            _ => panic!("expected Downloading"),
+        };
+        let part_file = paths.0.local_dir.join(".wallhaven-z9k2.png.abc.part");
+        let _ = app.update(Message::DetailDownloadFinished {
+            op_id: dl_op4,
+            scope,
+            id: WallpaperId::new("z9k2"),
+            result: Err(DownloadError::DiskFull {
+                detail: "disk full".to_string(),
+                part_path: Some(part_file.clone()),
+            }),
+        });
+        assert!(matches!(
+            &app.detail.as_ref().unwrap().download,
+            DetailDownloadState::Failed {
+                part_path: Some(p),
+                ..
+            } if *p == part_file
+        ));
+        let _ = app.view();
+
+        // Tag click navigates to Search with id:{tag.id}.
+        assert!(
+            app.update(Message::DetailSelectTag {
+                id: 42,
+                name: "landscape".to_string(),
+            })
+            .units()
+                > 0
+        );
+        assert_eq!(app.route, Route::Search);
+        assert!(app.detail.is_none());
+        assert_eq!(app.search_query_input, "id:42");
+        assert_eq!(
+            app.search.controller.query_for_page(1).q.as_deref(),
+            Some("id:42")
+        );
+
+        // Open Detail from Search and click More like this -> navigates to Search with like:{id}.
+        let _ = deliver_page(
+            &mut app,
+            GalleryKind::Search,
+            1,
+            Ok(sample_page(&["z9k2"], 1, 1, None)),
+        );
+        let _ = app.update(Message::GallerySelectTile {
+            kind: GalleryKind::Search,
+            index: 0,
+        });
+        assert_eq!(app.route, Route::Detail(WallpaperId::new("z9k2")));
+        assert!(
+            app.update(Message::DetailMoreLikeThis(WallpaperId::new("z9k2")))
+                .units()
+                > 0
+        );
+        assert_eq!(app.route, Route::Search);
+        assert!(app.detail.is_none());
+        assert_eq!(app.search_query_input, "like:z9k2");
+        assert_eq!(
+            app.search.controller.query_for_page(1).q.as_deref(),
+            Some("like:z9k2")
+        );
     }
 }

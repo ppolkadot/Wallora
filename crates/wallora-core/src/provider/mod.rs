@@ -14,8 +14,8 @@ use crate::domain::{
 };
 
 pub use client::{
-    IMAGE_IN_FLIGHT_CAP, ImageClass, WALLHAVEN_API_BASE, WALLORA_USER_AGENT, WallhavenClient,
-    WallhavenClientConfig,
+    IMAGE_IN_FLIGHT_CAP, ImageClass, OriginalImageStream, WALLHAVEN_API_BASE, WALLORA_USER_AGENT,
+    WallhavenClient, WallhavenClientConfig,
 };
 pub use error::ProviderError;
 pub use origin::{OriginPolicy, authorize, authorize_secret, same_origin};

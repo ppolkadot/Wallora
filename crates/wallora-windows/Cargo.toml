@@ -19,6 +19,7 @@ url.workspace = true
 wallora-core = { path = "../wallora-core" }
 windows = { workspace = true, features = [
     "Win32_Foundation",
+    "Win32_Storage_FileSystem",
     "Win32_System_ProcessStatus",
     "Win32_System_Threading",
     "Win32_UI_Shell",

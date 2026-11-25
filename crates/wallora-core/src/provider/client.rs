@@ -251,11 +251,37 @@ enum RequestAuth {
 
 struct WallhavenClientInner {
     transport: RwLock<HttpTransport>,
-    image_sem: Semaphore,
+    image_sem: Arc<Semaphore>,
     pacer: ApiPacer,
     credentials: Arc<dyn CredentialStore>,
     config: WallhavenClientConfig,
     next_probe_id: AtomicU64,
+}
+
+/// Streaming response handle for full-resolution original downloads.
+///
+/// Shares the client's 6-slot image-host semaphore for the lifetime of the stream and relies on
+/// the image client's 120-second idle-read timeout without thumbnail/preview byte ceilings.
+pub struct OriginalImageStream {
+    response: reqwest::Response,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl OriginalImageStream {
+    pub fn content_length(&self) -> Option<u64> {
+        self.response.content_length()
+    }
+
+    pub async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, ProviderError> {
+        loop {
+            match self.response.chunk().await {
+                Ok(Some(chunk)) if chunk.is_empty() => continue,
+                Ok(Some(chunk)) => return Ok(Some(chunk.to_vec())),
+                Ok(None) => return Ok(None),
+                Err(err) => return Err(map_image_transport_error(&err)),
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -278,7 +304,7 @@ impl WallhavenClient {
         Ok(Self {
             inner: Arc::new(WallhavenClientInner {
                 transport: RwLock::new(transport),
-                image_sem: Semaphore::new(IMAGE_IN_FLIGHT_CAP),
+                image_sem: Arc::new(Semaphore::new(IMAGE_IN_FLIGHT_CAP)),
                 pacer: ApiPacer::new(),
                 credentials,
                 config,
@@ -322,6 +348,17 @@ impl WallhavenClient {
         self.inner.image_sem.available_permits()
     }
 
+    fn validate_image_url(&self, url: &Url) -> Result<(), ProviderError> {
+        if url.scheme() != "https" && url.scheme() != "http" {
+            return Err(ProviderError::OriginRejected);
+        }
+        if !self.inner.config.image_origin.is_authorized_image_url(url) {
+            tracing::warn!("blocked image request failing origin policy");
+            return Err(ProviderError::OriginRejected);
+        }
+        Ok(())
+    }
+
     /// Fetches a bounded encoded thumbnail or preview from an allowlisted image host without
     /// API credentials, using same-origin redirects and the dedicated in-flight cap (6).
     /// The class's overall deadline bounds the send plus the whole body read.
@@ -330,19 +367,11 @@ impl WallhavenClient {
         url: &Url,
         class: ImageClass,
     ) -> Result<Vec<u8>, ProviderError> {
-        if url.scheme() != "https" && url.scheme() != "http" {
-            return Err(ProviderError::OriginRejected);
-        }
-        if !self.inner.config.image_origin.is_authorized_image_url(url) {
-            tracing::warn!("blocked image request failing origin policy");
-            return Err(ProviderError::OriginRejected);
-        }
+        self.validate_image_url(url)?;
 
         let limit = class.byte_limit();
-        let _permit = self
-            .inner
-            .image_sem
-            .acquire()
+        let _permit = Arc::clone(&self.inner.image_sem)
+            .acquire_owned()
             .await
             .map_err(|_| ProviderError::Busy)?;
 
@@ -355,6 +384,40 @@ impl WallhavenClient {
             Ok(result) => result,
             Err(_) => Err(ProviderError::Timeout),
         }
+    }
+
+    /// Opens a streaming download for a full-resolution original wallpaper without sending API
+    /// credentials or `Referer`, sharing the 6-slot image semaphore and enforcing same-origin
+    /// redirects and the 120 s idle-read timeout without thumbnail/preview byte caps.
+    pub async fn open_original_stream(
+        &self,
+        url: &Url,
+    ) -> Result<OriginalImageStream, ProviderError> {
+        self.validate_image_url(url)?;
+
+        let permit = Arc::clone(&self.inner.image_sem)
+            .acquire_owned()
+            .await
+            .map_err(|_| ProviderError::Busy)?;
+
+        let image_client = self.inner.image_client()?;
+        let resp = match image_client.get(url.clone()).send().await {
+            Ok(resp) => resp,
+            Err(err) => return Err(map_image_transport_error(&err)),
+        };
+
+        let status = resp.status();
+        if status.is_redirection() {
+            return Err(ProviderError::OriginRejected);
+        }
+        if !status.is_success() {
+            return Err(map_non_success_status(status, None));
+        }
+
+        Ok(OriginalImageStream {
+            response: resp,
+            _permit: permit,
+        })
     }
 
     async fn fetch_image_body(&self, url: &Url, limit: usize) -> Result<Vec<u8>, ProviderError> {

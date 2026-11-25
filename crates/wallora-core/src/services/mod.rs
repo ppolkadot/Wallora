@@ -2,6 +2,7 @@
 
 pub mod cache;
 pub mod discovery;
+pub mod download;
 pub mod image_guard;
 pub mod image_pipeline;
 pub mod session;
@@ -17,9 +18,14 @@ pub use cache::{
 };
 
 pub use discovery::{
-    ApplyOutcome, DiscoveryController, DiscoveryFilters, DiscoveryStatus, DiscoveryView, HandOff,
-    OPEN_ON_WALLHAVEN_LABEL, PageRequest, PageResponse, UnsupportedFeature, fetch_page,
-    selectable_purity,
+    ApplyOutcome, DetailUnsupportedAction, DiscoveryController, DiscoveryFilters, DiscoveryStatus,
+    DiscoveryView, HandOff, OPEN_ON_WALLHAVEN_LABEL, PageRequest, PageResponse, UnsupportedFeature,
+    fetch_page, selectable_purity,
+};
+pub use download::{
+    DownloadError, DownloadFs, DownloadOutcome, DownloadProgress, DownloadRequest, FilePublisher,
+    HardLinkFilePublisher, OriginalChunkFuture, OriginalChunkStream, OriginalDownloader,
+    OriginalFetcher, PartWriter, PublishError, RealDownloadFs,
 };
 pub use image_guard::{
     DEFAULT_DECODED_BYTES_BUDGET, DecodedImage, ImageBudget, ImageGuard, ImageGuardConfig,
