@@ -203,34 +203,36 @@ Status: landed in `main` with the review fixes applied. The base commits `aecdb8
 
 ### Task 5: Discovery and search (v0.4)
 
-- [ ] Tests: request generation ids drop superseded responses; duplicate page fetches de-duplicated; infinite scroll stops at `last_page`; random keeps `seed` across pages; typed query builder round-trips syntax tokens and passes raw text unchanged.
-- [ ] Views: homepage sections, Latest, Toplist (+range), Random, Search — matching audited defaults and order. Filter bar: categories, purity (selectable levels follow upstream rules for the session), resolutions/atleast, ratios, colors, sorting/order.
-- [ ] **Hot** and the **AI-art filter** ship only when their matrix rows have **both** behavior evidence (1b checks pass) **and** authorization evidence (upstream documentation or explicit permission) covering the route *and the specific parameter value* (`sorting=hot`, the AI filter parameter). Otherwise they remain gaps with a labelled browser hand-off.
-- [ ] Gallery: virtualized grid from spike; thumbnails through `ImageGuard` + `CacheStore`; cancel on scroll-away; loading/empty/error states with retry; keyboard focus.
-- [ ] Gate: tests green; manual side-by-side with the website per view. Commit `feat: discovery and search`.
+Status: landed in `main` as `2802703` (`feat: discovery and search`), with the query builder, discovery controller and image pipeline in `09edb43`. The app now opens the cache at boot and awaits `CacheStore::shutdown()` on window close.
+
+- [x] Tests: request generation ids drop superseded responses; duplicate page fetches de-duplicated; infinite scroll stops at `last_page`; random keeps `seed` across pages; typed query builder round-trips syntax tokens and passes raw text unchanged.
+- [x] Views: Latest, Toplist (+range), Random, Search — matching audited defaults and order. Filter bar: categories, purity (selectable levels follow upstream rules for the session), resolutions/atleast, ratios, colors, sorting/order. Curated homepage sections stay a documented gap with the Home hand-off.
+- [x] **Hot** and the **AI-art filter** ship only when their matrix rows have **both** behavior evidence (1b checks pass) **and** authorization evidence (upstream documentation or explicit permission) covering the route *and the specific parameter value* (`sorting=hot`, the AI filter parameter). Otherwise they remain gaps with a labelled browser hand-off.
+- [x] Gallery: virtualized grid from spike; thumbnails through `ImageGuard` + `CacheStore`; cancel on scroll-away; loading/empty/error states with retry; keyboard focus.
+- [ ] Gate: automated tests green and `feat: discovery and search` committed. The manual side-by-side website check per view is still pending and runs under Task 7.
 
 ### Task 6: Detail page and original downloads (v0.5)
 
-- [ ] Tests: detail metadata (tags, uploader, source, purity, dimensions, file size/type, counts); `like:` similar search; tag → search; crop/scale per audit disposition; original download byte-exact (length = API `file_size`, decodes under preview budget, dimensions match); reserved names (`CON`, `NUL`, `COM1`, trailing dots/spaces), path separators and `..` in any server-derived name; zero disk space; interruption leaves only a partial; **collision tests**: target exists before start, target created during download, two downloads of the same id concurrently.
-- [ ] Save: partial at `<dir>\.<name>.<uuid>.part` (same directory, unique); publish with `MoveFileExW` **without** `MOVEFILE_REPLACE_EXISTING` (fails if target exists) → retry with ` (n)` suffix; never overwrite. Default name `wallhaven-{id}.{ext}` from the API path's extension. Native save dialog via `rfd`.
-- [ ] Copy-link actions (page URL, original URL, short URL if provided).
-- [ ] Gate: `cargo test -p wallora-core --test downloads` + proptests green. Commit `feat: wallpaper details and original saves`.
+- [x] Tests: detail metadata (tags, uploader, source, purity, dimensions, file size/type, counts); `like:` similar search; tag → search; crop/scale per audit disposition; original download byte-exact (length = API `file_size`, decodes under preview budget, dimensions match); reserved names (`CON`, `NUL`, `COM1`, trailing dots/spaces), path separators and `..` in any server-derived name; zero disk space; interruption leaves only a partial; **collision tests**: target exists before start, target created during download, two downloads of the same id concurrently.
+- [x] Save: partial at `<dir>\.<name>.<uuid>.part` (same directory, unique); publish with `MoveFileExW` **without** `MOVEFILE_REPLACE_EXISTING` (fails if target exists) → retry with ` (n)` suffix; never overwrite. Default name `wallhaven-{id}.{ext}` from the API path's extension. Native save dialog via `rfd`.
+- [x] Copy-link actions (page URL, original URL, short URL if provided).
+- [x] Gate: `cargo test -p wallora-core --test downloads` + proptests green. Commit `feat: wallpaper details and original saves` (`24912ad`).
 
 ### Task 6a: Collections — read (v0.6)
 
-- [ ] Add `Provider::collections` / `collection_items`. Own collection items only when the account's username is `verified` (or an authorized account-bound route exists per the matrix); for accepted-but-unverified sessions (`unverifiable-private`, `unverifiable-empty`, `inconclusive`) show the authenticated list with an explanation that items need a verified username. (`mismatch` never reaches this view — it refuses sign-in in Task 3.) Other users' public collections; pagination with purity param. Tests: private collection as guest (upstream denies), empty collection, each non-verified identity state blocks items but not the list.
-- [ ] Favorites: label a collection "Favorites" only if Task 1b confirmed the mapping for **this** `AccountId` (stable id, present when empty) and the username is verified. If the mapping is `unresolved`, show collections by their upstream names only and keep the matrix row unresolved.
-- [ ] Writes (favorite add/remove, collection CRUD, privacy) shown as disabled with labelled "Open on wallhaven.cc" hand-off unless the matrix lists a supported route. No local shadow state that looks synced.
-- [ ] Commit `feat: read upstream collections`.
+- [x] Add `Provider::collections` / `collection_items`. Own collection items only when the account's username is `verified` (or an authorized account-bound route exists per the matrix); for accepted-but-unverified sessions (`unverifiable-private`, `unverifiable-empty`, `inconclusive`) show the authenticated list with an explanation that items need a verified username. (`mismatch` never reaches this view — it refuses sign-in in Task 3.) Other users' public collections; pagination with purity param. Tests: private collection as guest (upstream denies), empty collection, each non-verified identity state blocks items but not the list.
+- [x] Favorites: label a collection "Favorites" only if Task 1b confirmed the mapping for **this** `AccountId` (stable id, present when empty) and the username is verified. If the mapping is `unresolved`, show collections by their upstream names only and keep the matrix row unresolved.
+- [x] Writes (favorite add/remove, collection CRUD, privacy) shown as disabled with labelled "Open on wallhaven.cc" hand-off unless the matrix lists a supported route. No local shadow state that looks synced.
+- [x] Commit `feat: read upstream collections` (`6679674`).
 
 ### Task 6b: Profiles and tags (v0.7)
 
-- [ ] Add `Provider::tag`. Uploader view via `@user` search; tag pages; tag navigation. Commit `feat: profiles and tags`.
+- [x] Add `Provider::tag`. Uploader view via `@user` search; tag pages; tag navigation. Commit `feat: profiles and tags` (`b093b21`).
 
 ### Task 6c: Remaining matrix rows (v0.8–v0.9)
 
-- [ ] One test-first commit per row with a supported route (tests: denied roles, validation errors, refresh-after-write, mutation failure). Rows without a route get disposition `gap` + hand-off where useful.
-- [ ] Gate: every row has a disposition and, where implemented, a test. Commit `docs: resolve parity inventory`.
+- [x] One test-first commit per row with a supported route (tests: denied roles, validation errors, refresh-after-write, mutation failure). Rows without a route get disposition `gap` + hand-off where useful. The final hand-offs landed as `7a33d3d` (`feat: complete parity gap browser hand-offs`).
+- [x] Gate: every row has a disposition and, where implemented, a test. Commit `docs: resolve parity inventory`.
 
 ### Task 7: v1.0 release gate
 

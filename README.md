@@ -4,18 +4,18 @@
 
 Wallora is an independent, open-source desktop client written in Rust. It is **not affiliated with, endorsed by, or sponsored by Wallhaven**. "Wallhaven" and `wallhaven.cc` belong to their respective owners. Wallora uses only the public, documented Wallhaven API and follows its published rate limit.
 
-## Status: pre-release (v0.1.x)
+## Status: pre-release (v0.9)
 
-Wallora is under active development and is **not usable as a wallpaper browser yet**. The native shell, the Wallhaven API client, account sign-in, and the guarded image pipeline and scoped cache are built. Browsing, the gallery, downloads and wallpaper control are still to come.
+Wallora is under active development and is **pre-release**. The native shell, the Wallhaven API client, account sign-in, the guarded image pipeline and scoped cache, the discovery/search gallery, wallpaper details and original downloads, read-only collections, and profiles/tags are built. The v1.0 release gate (manual parity walkthrough, installer checks, signing) and Windows 10 verification are still open.
 
 | Area | State |
 | --- | --- |
 | Windows shell (Iced), navigation, settings, MSI packaging | Built |
 | Provider client: search and wallpaper requests, pacing, retries, API-key isolation | Built |
 | Accounts: API-key sign-in, Windows Credential Manager, account switching, local proxy setting | Built |
-| Image pipeline and scoped thumbnail cache | Built in the core library; app integration arrives with Task 5 |
-| Discovery and search UI, wallpaper details, original downloads | Planned |
-| Collections (read-only), profiles, tags | Planned |
+| Image pipeline and scoped thumbnail cache | Built and opened at app boot, with a persisted cap |
+| Discovery and search gallery, wallpaper details, original downloads | Built |
+| Collections (read-only), profiles, tags, API-gap browser hand-offs | Built |
 | Wallpaper control, history, adaptive themes, rotation, tray | Planned, after 1.0 |
 
 Wallora 1.0 means *complete for supported routes*: Wallhaven's public API is read-only, so actions it cannot do (favoriting, collection edits, uploads, comments, forums) are documented gaps and open on `wallhaven.cc` in your browser through a labelled **Open on wallhaven.cc** hand-off. See [the parity matrix](docs/parity-matrix.md) and [scope decisions](docs/decisions.md).

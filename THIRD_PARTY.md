@@ -6,7 +6,7 @@ Wallora itself is MIT-licensed ([LICENSE](LICENSE)). This file lists what it bui
 cargo deny --locked list --layout crate --format json
 ```
 
-Generated 2026-11-23 from `Cargo.lock` at `main` (`3b782aa`); `url` and `form_urlencoded` were updated 2026-11-25. It covers the whole workspace graph, including the unshipped `spikes/iced-gallery` crate and build-time crates, so it over-approximates what the installer ships. Where a crate offers several licences (`A OR B`), you may use it under any one of them. `cargo deny check` enforces the allow-list in `deny.toml` in CI.
+Generated 2026-11-23 from `Cargo.lock` at `main` (`3b782aa`); `url` and `form_urlencoded` were updated 2026-11-25, and `rfd`/`objc2-uniform-type-identifiers` were added with Task 6. It covers the whole workspace graph, including the unshipped `spikes/iced-gallery` crate and build-time crates, so it over-approximates what the installer ships. Where a crate offers several licences (`A OR B`), you may use it under any one of them. `cargo deny check` enforces the allow-list in `deny.toml` in CI.
 
 ## Font
 
@@ -21,12 +21,12 @@ Generated 2026-11-23 from `Cargo.lock` at `main` (`3b782aa`); `url` and `form_ur
 
 ## Rust crates
 
-368 registry crates. Licence summary:
+370 registry crates. Licence summary:
 
 | Licence expression | Crates |
 | --- | ---: |
 | MIT OR Apache-2.0 | 193 |
-| MIT | 73 |
+| MIT | 74 |
 | Apache-2.0 OR MIT | 23 |
 | Unicode-3.0 | 18 |
 | Apache-2.0 | 8 |
@@ -34,7 +34,7 @@ Generated 2026-11-23 from `Cargo.lock` at `main` (`3b782aa`); `url` and `form_ur
 | MIT OR Apache-2.0 OR Zlib | 7 |
 | BSD-2-Clause | 6 |
 | Unlicense OR MIT | 4 |
-| Zlib OR Apache-2.0 OR MIT | 3 |
+| Zlib OR Apache-2.0 OR MIT | 4 |
 | Zlib | 3 |
 | ISC | 3 |
 | BSL-1.0 | 2 |
@@ -240,6 +240,7 @@ Generated 2026-11-23 from `Cargo.lock` at `main` (`3b782aa`); `url` and `form_ur
 | num-integer | 0.1.47 | MIT OR Apache-2.0 |
 | num-rational | 0.4.2 | MIT OR Apache-2.0 |
 | num-traits | 0.2.19 | MIT OR Apache-2.0 |
+| objc2-uniform-type-identifiers | 0.3.2 | Zlib OR Apache-2.0 OR MIT |
 | once_cell | 1.21.4 | MIT OR Apache-2.0 |
 | option-ext | 0.2.0 | MPL-2.0 |
 | ordered-float | 5.5.1 | MIT |
@@ -275,6 +276,7 @@ Generated 2026-11-23 from `Cargo.lock` at `main` (`3b782aa`); `url` and `form_ur
 | regex-syntax | 0.8.12 | MIT OR Apache-2.0 |
 | renderdoc-sys | 1.1.0 | MIT OR Apache-2.0 |
 | reqwest | 0.12.28 | MIT OR Apache-2.0 |
+| rfd | 0.18.0 | MIT |
 | rgb | 0.8.53 | MIT |
 | ring | 0.17.14 | Apache-2.0 OR ISC |
 | rusqlite | 0.43.0 | MIT |
