@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use url::Url;
 use wallora_core::domain::{
-    AccountId, Category, CredentialStore, InMemoryCredentialStore, Purity, QueryEcho,
-    RequestPriority, SearchQuery, SecretString, SessionScope, WallpaperId,
+    AccountId, Category, CollectionSummary, CredentialStore, InMemoryCredentialStore, Purity,
+    PurityMask, QueryEcho, RequestPriority, SearchQuery, SecretString, SessionScope, WallpaperId,
 };
 use wallora_core::provider::{
     Provider, ProviderError, WALLORA_USER_AGENT, WallhavenClient, WallhavenClientConfig,
@@ -20,6 +20,7 @@ const FIXTURE_WALLPAPER_MINIMAL_EXTRA: &str = include_str!("fixtures/wallpaper_m
 const FIXTURE_SEARCH_PAGE: &str = include_str!("fixtures/search_page.json");
 const FIXTURE_SEARCH_TAG_META: &str = include_str!("fixtures/search_tag_meta.json");
 const FIXTURE_SEARCH_RANDOM_META: &str = include_str!("fixtures/search_random_meta.json");
+const FIXTURE_COLLECTIONS: &str = include_str!("fixtures/collections.json");
 const FIXTURE_ERROR_UNAUTHORIZED: &str = include_str!("fixtures/error_unauthorized.json");
 const COALESCE_KEY: &str = "wh_coalesce_scope_key_12345";
 
@@ -734,5 +735,233 @@ async fn separate_session_scopes_do_not_coalesce() {
     assert_eq!(
         keyed, 2,
         "only the two account-scoped requests may carry the API key header"
+    );
+}
+
+#[tokio::test]
+async fn collections_endpoint_handles_guest_keyed_empty_validation_and_errors() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/collections/alice"))
+        .and(|req: &Request| !req.headers.contains_key("x-api-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(FIXTURE_COLLECTIONS))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/collections/bob"))
+        .and(header("x-api-key", COALESCE_KEY))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"data":[]}"#))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/collections/err401"))
+        .respond_with(ResponseTemplate::new(401).set_body_string(FIXTURE_ERROR_UNAUTHORIZED))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/collections/err403"))
+        .respond_with(ResponseTemplate::new(403))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/collections/err404"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let (client, account) = keyed_client(&server, "acct-collections");
+
+    let guest_list = client
+        .collections("alice".to_string(), SessionScope::guest(1))
+        .await
+        .expect("guest public collections decode");
+    assert_eq!(
+        guest_list,
+        vec![CollectionSummary {
+            id: 1,
+            label: "Default".to_string(),
+            views: 0,
+            public: true,
+            count: 0,
+        }]
+    );
+
+    let keyed_empty = client
+        .collections("bob".to_string(), SessionScope::account(account, 1))
+        .await
+        .expect("empty collections list decodes");
+    assert!(keyed_empty.is_empty());
+
+    assert_eq!(
+        client
+            .collections("err401".to_string(), SessionScope::guest(1))
+            .await,
+        Err(ProviderError::Unauthorized)
+    );
+    assert_eq!(
+        client
+            .collections("err403".to_string(), SessionScope::guest(1))
+            .await,
+        Err(ProviderError::Forbidden)
+    );
+    assert_eq!(
+        client
+            .collections("err404".to_string(), SessionScope::guest(1))
+            .await,
+        Err(ProviderError::NotFound)
+    );
+
+    let before_invalid = server.received_requests().await.unwrap().len();
+    for invalid in ["", "   ", ".", "..", "a/b", "a?x=1", "a#b"] {
+        assert_eq!(
+            client
+                .collections(invalid.to_string(), SessionScope::guest(1))
+                .await,
+            Err(ProviderError::NotFound),
+            "invalid username {invalid:?}"
+        );
+    }
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        before_invalid,
+        "invalid usernames must never hit the network"
+    );
+}
+
+#[tokio::test]
+async fn collection_items_endpoint_serializes_query_and_maps_denials() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/collections/alice/42"))
+        .and(|req: &Request| req.url.query().is_none() && !req.headers.contains_key("x-api-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(FIXTURE_SEARCH_PAGE))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/collections/bob/77"))
+        .and(query_param("purity", "111"))
+        .and(query_param("page", "2"))
+        .and(header("x-api-key", COALESCE_KEY))
+        .and(|req: &Request| req.url.query() == Some("purity=111&page=2"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(
+                serde_json::json!({
+                    "data": [],
+                    "meta": {
+                        "current_page": 2,
+                        "last_page": 2,
+                        "per_page": 24,
+                        "total": 0
+                    }
+                })
+                .to_string(),
+            ),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/collections/alice/901"))
+        .respond_with(ResponseTemplate::new(401).set_body_string(FIXTURE_ERROR_UNAUTHORIZED))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/collections/alice/903"))
+        .respond_with(ResponseTemplate::new(403))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/collections/alice/904"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let (client, account) = keyed_client(&server, "acct-collection-items");
+
+    let guest_items = client
+        .collection_items("alice".to_string(), 42, None, None, SessionScope::guest(1))
+        .await
+        .expect("guest collection items decode");
+    assert_eq!(guest_items.data.len(), 2);
+
+    let keyed_empty = client
+        .collection_items(
+            "bob".to_string(),
+            77,
+            Some(PurityMask::ALL),
+            Some(2),
+            SessionScope::account(account, 1),
+        )
+        .await
+        .expect("keyed empty collection items decode");
+    assert!(keyed_empty.data.is_empty());
+    assert_eq!(keyed_empty.meta.current_page, 2);
+
+    assert_eq!(
+        client
+            .collection_items(
+                "alice".to_string(),
+                901,
+                Some(PurityMask::SFW_ONLY),
+                None,
+                SessionScope::guest(1),
+            )
+            .await,
+        Err(ProviderError::Unauthorized)
+    );
+    assert_eq!(
+        client
+            .collection_items(
+                "alice".to_string(),
+                903,
+                Some(PurityMask::SFW_ONLY),
+                None,
+                SessionScope::guest(1),
+            )
+            .await,
+        Err(ProviderError::Forbidden)
+    );
+    assert_eq!(
+        client
+            .collection_items(
+                "alice".to_string(),
+                904,
+                Some(PurityMask::SFW_ONLY),
+                None,
+                SessionScope::guest(1),
+            )
+            .await,
+        Err(ProviderError::NotFound)
+    );
+
+    let before_invalid = server.received_requests().await.unwrap().len();
+    assert_eq!(
+        client
+            .collection_items("../bad".to_string(), 1, None, None, SessionScope::guest(1))
+            .await,
+        Err(ProviderError::NotFound)
+    );
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        before_invalid
     );
 }

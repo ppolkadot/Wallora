@@ -1,6 +1,7 @@
 //! Application services built on top of core domain, provider, and storage contracts.
 
 pub mod cache;
+pub mod collections;
 pub mod discovery;
 pub mod download;
 pub mod image_guard;
@@ -17,6 +18,13 @@ pub use cache::{
     SystemCacheClock, WATCHDOG_TIMEOUT, validate_cache_cap,
 };
 
+pub use collections::{
+    CollectionItemsRequest, CollectionItemsResponse, CollectionListOutcome, CollectionListRequest,
+    CollectionListResponse, CollectionListStatus, CollectionSource, CollectionUnsupportedAction,
+    CollectionsController, FavoritesMapping, OwnAccountState, OwnCollectionsListStatus,
+    OwnItemsBlockedReason, SelectedCollection, display_collection_label, fetch_collection_items,
+    fetch_user_collections,
+};
 pub use discovery::{
     ApplyOutcome, DetailUnsupportedAction, DiscoveryController, DiscoveryFilters, DiscoveryStatus,
     DiscoveryView, HandOff, OPEN_ON_WALLHAVEN_LABEL, PageRequest, PageResponse, UnsupportedFeature,

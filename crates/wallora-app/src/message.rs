@@ -8,8 +8,9 @@ use wallora_core::domain::{
 use wallora_core::provider::ProviderError;
 use wallora_core::services::cache::{CacheError, CacheStats};
 use wallora_core::services::{
-    AccountRefreshPayload, DetailUnsupportedAction, DownloadError, DownloadOutcome,
-    ImagePipelineError, PageResponse, SignInError, SignInProbe, UnsupportedFeature,
+    AccountRefreshPayload, CollectionItemsResponse, CollectionListResponse,
+    DetailUnsupportedAction, DownloadError, DownloadOutcome, ImagePipelineError, PageResponse,
+    SignInError, SignInProbe, UnsupportedFeature,
 };
 
 use crate::widgets::gallery_grid::GridKey;
@@ -21,6 +22,7 @@ pub enum Route {
     #[default]
     Home,
     Search,
+    Collections,
     Detail(WallpaperId),
     Account,
     Settings,
@@ -31,6 +33,7 @@ impl Route {
         match self {
             Self::Home => "Home",
             Self::Search => "Search",
+            Self::Collections => "Collections",
             Self::Detail(_) => "Wallpaper Detail",
             Self::Account => "Account",
             Self::Settings => "Settings",
@@ -43,6 +46,7 @@ impl Route {
 pub enum GalleryKind {
     Home,
     Search,
+    Collections,
 }
 
 /// Identifies which detail URL was copied to the clipboard.
@@ -222,6 +226,22 @@ pub enum Message {
         result: Result<DownloadOutcome, DownloadError>,
     },
     DetailCancelDownload,
+    DetailOpenFavoriteHandOff,
+
+    // Collections (read-only)
+    CollectionsSelectOwn(u64),
+    CollectionsUsernameChanged(String),
+    CollectionsLoadUser,
+    CollectionsRetryUserList,
+    CollectionsUserListLoaded(Box<CollectionListResponse>),
+    CollectionsSelectUserCollection(u64),
+    CollectionsTogglePurity(Purity),
+    CollectionsItemsPageLoaded(Box<CollectionItemsResponse>),
+    CollectionsKeyFocusChecked {
+        key: GridKey,
+        input_focused: bool,
+    },
+    CollectionsOpenManageHandOff,
 }
 
 impl fmt::Debug for Message {
@@ -449,6 +469,42 @@ impl fmt::Debug for Message {
                 .field("ok", &result.is_ok())
                 .finish(),
             Self::DetailCancelDownload => f.write_str("DetailCancelDownload"),
+            Self::DetailOpenFavoriteHandOff => f.write_str("DetailOpenFavoriteHandOff"),
+            Self::CollectionsSelectOwn(id) => {
+                f.debug_tuple("CollectionsSelectOwn").field(id).finish()
+            }
+            Self::CollectionsUsernameChanged(username) => f
+                .debug_tuple("CollectionsUsernameChanged")
+                .field(username)
+                .finish(),
+            Self::CollectionsLoadUser => f.write_str("CollectionsLoadUser"),
+            Self::CollectionsRetryUserList => f.write_str("CollectionsRetryUserList"),
+            Self::CollectionsUserListLoaded(response) => f
+                .debug_struct("CollectionsUserListLoaded")
+                .field("generation", &response.generation)
+                .field("username", &response.username)
+                .field("ok", &response.result.is_ok())
+                .finish(),
+            Self::CollectionsSelectUserCollection(id) => f
+                .debug_tuple("CollectionsSelectUserCollection")
+                .field(id)
+                .finish(),
+            Self::CollectionsTogglePurity(purity) => f
+                .debug_tuple("CollectionsTogglePurity")
+                .field(purity)
+                .finish(),
+            Self::CollectionsItemsPageLoaded(response) => f
+                .debug_struct("CollectionsItemsPageLoaded")
+                .field("generation", &response.generation)
+                .field("page", &response.page)
+                .field("ok", &response.result.is_ok())
+                .finish(),
+            Self::CollectionsKeyFocusChecked { key, input_focused } => f
+                .debug_struct("CollectionsKeyFocusChecked")
+                .field("key", key)
+                .field("input_focused", input_focused)
+                .finish(),
+            Self::CollectionsOpenManageHandOff => f.write_str("CollectionsOpenManageHandOff"),
         }
     }
 }

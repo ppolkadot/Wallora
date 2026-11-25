@@ -10,9 +10,9 @@ use tokio::sync::Semaphore;
 use url::Url;
 
 use crate::domain::{
-    CollectionSummary, CredentialStore, ProxyConfig, ProxyError, RequestPriority, SearchPage,
-    SearchQuery, SecretString, SessionKind, SessionScope, UserSettings, Wallpaper, WallpaperId,
-    validate_username,
+    CollectionSummary, CredentialStore, ProxyConfig, ProxyError, PurityMask, RequestPriority,
+    SearchPage, SearchQuery, SecretString, SessionKind, SessionScope, UserSettings, Wallpaper,
+    WallpaperId, validate_username,
 };
 use crate::provider::Provider;
 use crate::provider::api::{
@@ -807,6 +807,66 @@ impl Provider for WallhavenClient {
             )
             .await?;
             decode_collections_response(&bytes)
+        }
+    }
+
+    fn collections(
+        &self,
+        username: String,
+        scope: SessionScope,
+    ) -> impl Future<Output = Result<Vec<CollectionSummary>, ProviderError>> + Send + 'static {
+        let inner = Arc::clone(&self.inner);
+        async move {
+            let clean = validate_username(&username).map_err(|_| ProviderError::NotFound)?;
+            let url = inner.build_api_url(&["collections", &clean])?;
+            let bytes = WallhavenClientInner::execute_paced_get(
+                inner,
+                url,
+                RequestAuth::Scope(scope),
+                RequestPriority::Interactive,
+                ApiResponse::Json,
+            )
+            .await?;
+            decode_collections_response(&bytes)
+        }
+    }
+
+    fn collection_items(
+        &self,
+        username: String,
+        collection_id: u64,
+        purity: Option<PurityMask>,
+        page: Option<u32>,
+        scope: SessionScope,
+    ) -> impl Future<Output = Result<SearchPage, ProviderError>> + Send + 'static {
+        let inner = Arc::clone(&self.inner);
+        async move {
+            let clean = validate_username(&username).map_err(|_| ProviderError::NotFound)?;
+            let id_segment = collection_id.to_string();
+            let mut url = inner.build_api_url(&["collections", &clean, &id_segment])?;
+            if purity.is_some() || page.is_some() {
+                let mut query_mut = url.query_pairs_mut();
+                if let Some(purity) = purity {
+                    query_mut.append_pair("purity", &purity.to_param());
+                }
+                if let Some(page) = page {
+                    query_mut.append_pair("page", &page.to_string());
+                }
+            }
+            let priority = if page.is_none_or(|p| p <= 1) {
+                RequestPriority::Interactive
+            } else {
+                RequestPriority::Visible
+            };
+            let bytes = WallhavenClientInner::execute_paced_get(
+                inner,
+                url,
+                RequestAuth::Scope(scope),
+                priority,
+                ApiResponse::Json,
+            )
+            .await?;
+            decode_search_response(&bytes)
         }
     }
 }

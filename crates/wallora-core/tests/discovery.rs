@@ -103,6 +103,26 @@ impl Provider for FakeProvider {
     {
         std::future::ready(Err(ProviderError::NotFound))
     }
+
+    fn collections(
+        &self,
+        _username: String,
+        _scope: SessionScope,
+    ) -> impl std::future::Future<Output = Result<Vec<CollectionSummary>, ProviderError>> + Send + 'static
+    {
+        std::future::ready(Err(ProviderError::NotFound))
+    }
+
+    fn collection_items(
+        &self,
+        _username: String,
+        _collection_id: u64,
+        _purity: Option<PurityMask>,
+        _page: Option<u32>,
+        _scope: SessionScope,
+    ) -> impl std::future::Future<Output = Result<SearchPage, ProviderError>> + Send + 'static {
+        std::future::ready(Err(ProviderError::NotFound))
+    }
 }
 
 fn wallpaper(id: &str, purity: Purity) -> Wallpaper {

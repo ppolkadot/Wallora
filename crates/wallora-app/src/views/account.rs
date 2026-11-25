@@ -3,8 +3,8 @@ use iced::{Alignment, Background, Border, Element, Length};
 use wallora_core::domain::SecretString;
 use wallora_core::services::SessionManager;
 
-use crate::message::Message;
-use crate::theme::{palette, surface_color};
+use crate::message::{Message, Route};
+use crate::theme::{palette, pill_button_style, surface_color};
 
 pub struct AccountViewState<'a> {
     pub session: &'a SessionManager,
@@ -85,9 +85,18 @@ pub fn view<'a>(state: AccountViewState<'a>) -> Element<'a, Message> {
 
         // Authenticated own collections list (names, counts, visibility only).
         card = card.push(
-            text("Own collections (list only)")
-                .size(16)
-                .color(palette::TEXT_PRIMARY),
+            row![
+                text("Own collections (list only)")
+                    .size(16)
+                    .color(palette::TEXT_PRIMARY)
+                    .width(Length::Fill),
+                button(text("Open Collections").size(12))
+                    .padding([5, 12])
+                    .on_press(Message::Navigate(Route::Collections))
+                    .style(pill_button_style(false)),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
         );
         match state.session.own_collections() {
             Some([]) => {
@@ -120,7 +129,7 @@ pub fn view<'a>(state: AccountViewState<'a>) -> Element<'a, Message> {
         }
         if !account.verification.can_access_own_collection_items() {
             card = card.push(
-                text("Own collection items and Favorites mapping require a verified username (Task 6a).")
+                text("Own collection items and Favorites mapping require a verified username.")
                     .size(12)
                     .color(palette::MUTED),
             );

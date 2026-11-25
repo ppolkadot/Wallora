@@ -6,10 +6,10 @@ use iced::widget::{
 use iced::{Alignment, Background, Border, Color, ContentFit, Element, Length};
 use wallora_core::domain::{Category, Purity, Wallpaper, WallpaperId};
 use wallora_core::provider::ProviderError;
-use wallora_core::services::DetailUnsupportedAction;
+use wallora_core::services::{CollectionUnsupportedAction, DetailUnsupportedAction};
 
 use crate::message::{DetailCopyTarget, GalleryKind, Message, Route};
-use crate::theme::{card_style, palette, pill_button_style};
+use crate::theme::{card_style, disabled_button_style, palette, pill_button_style};
 
 const BYTES_PER_GB: u64 = 1_000_000_000;
 const BYTES_PER_MB: u64 = 1_000_000;
@@ -107,6 +107,7 @@ pub fn view<'a>(state: DetailViewState<'a>) -> Element<'a, Message> {
     let back_label = match state.return_to {
         GalleryKind::Home => "Back to Home",
         GalleryKind::Search => "Back to Search",
+        GalleryKind::Collections => "Back to Collections",
     };
 
     let mut refresh_btn = button(
@@ -514,6 +515,27 @@ fn build_actions_card<'a>(
     if let Some(feedback) = state.copy_feedback {
         col = col.push(text(feedback).size(12).color(palette::SUCCESS));
     }
+
+    col = col.push(
+        column![
+            row![
+                button(text("Favorite / Unfavorite (API read-only)").size(12))
+                    .padding([6, 12])
+                    .style(disabled_button_style()),
+                button(text(CollectionUnsupportedAction::FavoriteToggle.label()).size(12))
+                    .padding([6, 12])
+                    .on_press(Message::DetailOpenFavoriteHandOff)
+                    .style(pill_button_style(false)),
+            ]
+            .spacing(8)
+            .wrap()
+            .vertical_spacing(6),
+            text(CollectionUnsupportedAction::FavoriteToggle.explanation())
+                .size(11)
+                .color(palette::TEXT_SECONDARY),
+        ]
+        .spacing(6),
+    );
 
     container(col)
         .padding(14)

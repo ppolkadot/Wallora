@@ -20,12 +20,14 @@ use wallora_core::services::cache::{
     SessionCacheSink,
 };
 use wallora_core::services::{
-    ApplyOutcome, DiscoveryController, DiscoveryFilters, DiscoveryStatus, DiscoveryView,
-    DownloadError, DownloadRequest, FilePublisher, ImageGuard, ImageGuardError, ImagePipeline,
-    ImagePipelineError, ImageRequest, NoticeLevel, OriginalDownloader, PREVIEW_MAX_PIXELS,
-    PREVIEW_MAX_SIDE, PageRequest, ScopedResponse, SessionManager, SessionNotice,
-    SignInCommitOutcome, SignInError, fetch_account_refresh, fetch_page, load_uncached,
-    probe_sign_in, selectable_purity,
+    ApplyOutcome, CollectionItemsRequest, CollectionListOutcome, CollectionListRequest,
+    CollectionUnsupportedAction, CollectionsController, DiscoveryController, DiscoveryFilters,
+    DiscoveryStatus, DiscoveryView, DownloadError, DownloadRequest, FilePublisher, ImageGuard,
+    ImageGuardError, ImagePipeline, ImagePipelineError, ImageRequest, NoticeLevel,
+    OriginalDownloader, PREVIEW_MAX_PIXELS, PREVIEW_MAX_SIDE, PageRequest, ScopedResponse,
+    SessionManager, SessionNotice, SignInCommitOutcome, SignInError, fetch_account_refresh,
+    fetch_collection_items, fetch_page, fetch_user_collections, load_uncached, probe_sign_in,
+    selectable_purity,
 };
 use wallora_core::storage::{AppPaths, SessionStorage, SqliteStore, StorageError};
 use wallora_core::util::default_download_filename;
@@ -35,6 +37,7 @@ use crate::cache_host::CacheHost;
 use crate::message::{GalleryKind, Message, ProxyModeChoice, Route};
 use crate::theme::{palette, surface_color, wallora_theme};
 use crate::views;
+use crate::views::collections::COLLECTIONS_SIDEBAR_WIDTH;
 use crate::views::detail::{DetailDownloadView, DetailPreviewView, DetailViewState};
 use crate::views::search::{
     SearchInputIds, format_ratios, format_resolutions, parse_atleast_input, parse_color_input,
@@ -120,6 +123,226 @@ enum ThumbnailEntry {
     },
 }
 
+struct InFlightCollectionList {
+    generation: u64,
+    scope: SessionScope,
+    handle: Handle,
+}
+
+fn entry_thumbnail_state<'a>(
+    thumbnails: &'a HashMap<WallpaperId, ThumbnailEntry>,
+    id: &WallpaperId,
+) -> ThumbnailViewState<'a> {
+    match thumbnails.get(id) {
+        Some(ThumbnailEntry::Loaded { handle, stale }) => ThumbnailViewState::Loaded {
+            handle,
+            stale: *stale,
+        },
+        Some(ThumbnailEntry::Failed { message }) => ThumbnailViewState::Failed {
+            message: message.as_str(),
+        },
+        Some(ThumbnailEntry::InFlight { .. }) | None => ThumbnailViewState::Loading,
+    }
+}
+
+fn abort_in_flight_thumbnails(thumbnails: &mut HashMap<WallpaperId, ThumbnailEntry>) {
+    thumbnails.retain(|_, entry| match entry {
+        ThumbnailEntry::InFlight { cancel, handle, .. } => {
+            cancel.cancel();
+            handle.abort();
+            false
+        }
+        ThumbnailEntry::Loaded { .. } | ThumbnailEntry::Failed { .. } => true,
+    });
+}
+
+fn evict_excess_loaded_thumbnails(
+    thumbnails: &mut HashMap<WallpaperId, ThumbnailEntry>,
+    items: &[Wallpaper],
+    visible_range: &std::ops::Range<usize>,
+) {
+    let mut loaded_count = thumbnails
+        .values()
+        .filter(|e| matches!(e, ThumbnailEntry::Loaded { .. }))
+        .count();
+    if loaded_count <= MAX_RESIDENT_THUMBNAILS {
+        return;
+    }
+
+    let mid = (visible_range.start + visible_range.end) / 2;
+    let mut candidates: Vec<(usize, WallpaperId)> = items
+        .iter()
+        .enumerate()
+        .filter(|(idx, w)| {
+            !visible_range.contains(idx)
+                && matches!(thumbnails.get(&w.id), Some(ThumbnailEntry::Loaded { .. }))
+        })
+        .map(|(idx, w)| (idx.abs_diff(mid), w.id.clone()))
+        .collect();
+    candidates.sort_by_key(|a| std::cmp::Reverse(a.0));
+
+    for (_, id) in candidates {
+        if loaded_count <= MAX_RESIDENT_THUMBNAILS {
+            break;
+        }
+        if matches!(thumbnails.get(&id), Some(ThumbnailEntry::Loaded { .. })) {
+            thumbnails.remove(&id);
+            loaded_count -= 1;
+        }
+    }
+}
+
+struct ThumbnailSyncTarget<'a> {
+    kind: GalleryKind,
+    items: &'a [Wallpaper],
+    generation: u64,
+    scope: SessionScope,
+    metrics: &'a GridMetrics,
+    thumbnails: &'a mut HashMap<WallpaperId, ThumbnailEntry>,
+}
+
+fn sync_gallery_visible_thumbnails(
+    target: ThumbnailSyncTarget<'_>,
+    loader: &ThumbnailLoader,
+    thumb_size: &str,
+) -> Task<Message> {
+    let ThumbnailSyncTarget {
+        kind,
+        items,
+        generation,
+        scope,
+        metrics,
+        thumbnails,
+    } = target;
+    if items.is_empty() {
+        abort_in_flight_thumbnails(thumbnails);
+        return Task::none();
+    }
+
+    let visible_range = metrics.visible_item_range(items.len());
+    let visible_ids: HashSet<WallpaperId> = items[visible_range.clone()]
+        .iter()
+        .map(|w| w.id.clone())
+        .collect();
+
+    // Cancel and remove any in-flight thumbnails outside the visible + overscan window or
+    // belonging to an older scope/generation.
+    thumbnails.retain(|id, entry| match entry {
+        ThumbnailEntry::InFlight {
+            generation: g,
+            scope: s,
+            cancel,
+            handle,
+        } if *g != generation || *s != scope || !visible_ids.contains(id) => {
+            cancel.cancel();
+            handle.abort();
+            false
+        }
+        _ => true,
+    });
+
+    evict_excess_loaded_thumbnails(thumbnails, items, &visible_range);
+
+    let mut tasks = Vec::new();
+    for wallpaper in &items[visible_range] {
+        if thumbnails.contains_key(&wallpaper.id) {
+            continue;
+        }
+        let raw_url = select_thumbnail_url(&wallpaper.thumbs, thumb_size);
+        let request = match ImageRequest::thumbnail_url(raw_url, scope.clone()) {
+            Ok(req) => req,
+            Err(err) => {
+                thumbnails.insert(
+                    wallpaper.id.clone(),
+                    ThumbnailEntry::Failed {
+                        message: thumbnail_error_message(&err),
+                    },
+                );
+                continue;
+            }
+        };
+
+        let cancel = CancelToken::new();
+        let cancel_for_task = cancel.clone();
+        let loader = loader.clone();
+        let id = wallpaper.id.clone();
+        let msg_id = id.clone();
+        let msg_scope = scope.clone();
+
+        let (task, handle) = Task::perform(
+            async move { loader.load(request, cancel_for_task).await },
+            move |result| Message::ThumbnailLoaded {
+                kind,
+                generation,
+                scope: msg_scope,
+                id: msg_id,
+                result,
+            },
+        )
+        .abortable();
+
+        thumbnails.insert(
+            id,
+            ThumbnailEntry::InFlight {
+                generation,
+                scope: scope.clone(),
+                cancel,
+                handle: handle.abort_on_drop(),
+            },
+        );
+        tasks.push(task);
+    }
+
+    Task::batch(tasks)
+}
+
+fn apply_thumbnail_loaded(
+    current_scope: &SessionScope,
+    target_generation: u64,
+    generation: u64,
+    scope: SessionScope,
+    id: WallpaperId,
+    result: Result<LoadedThumbnail, ImagePipelineError>,
+    thumbnails: &mut HashMap<WallpaperId, ThumbnailEntry>,
+) {
+    if &scope != current_scope || generation != target_generation {
+        return;
+    }
+    let matches_in_flight = matches!(
+        thumbnails.get(&id),
+        Some(ThumbnailEntry::InFlight {
+            generation: g,
+            scope: s,
+            ..
+        }) if *g == generation && *s == scope
+    );
+    if !matches_in_flight {
+        return;
+    }
+    match result {
+        Ok(loaded) => {
+            thumbnails.insert(
+                id,
+                ThumbnailEntry::Loaded {
+                    handle: loaded.handle,
+                    stale: loaded.stale,
+                },
+            );
+        }
+        Err(ImagePipelineError::Cancelled | ImagePipelineError::ScopeChanged) => {
+            thumbnails.remove(&id);
+        }
+        Err(err) => {
+            thumbnails.insert(
+                id,
+                ThumbnailEntry::Failed {
+                    message: thumbnail_error_message(&err),
+                },
+            );
+        }
+    }
+}
+
 struct GalleryState {
     kind: GalleryKind,
     controller: DiscoveryController,
@@ -144,27 +367,11 @@ impl GalleryState {
     }
 
     fn thumbnail_state(&self, id: &WallpaperId) -> ThumbnailViewState<'_> {
-        match self.thumbnails.get(id) {
-            Some(ThumbnailEntry::Loaded { handle, stale }) => ThumbnailViewState::Loaded {
-                handle,
-                stale: *stale,
-            },
-            Some(ThumbnailEntry::Failed { message }) => ThumbnailViewState::Failed {
-                message: message.as_str(),
-            },
-            Some(ThumbnailEntry::InFlight { .. }) | None => ThumbnailViewState::Loading,
-        }
+        entry_thumbnail_state(&self.thumbnails, id)
     }
 
     fn cancel_in_flight_thumbnails(&mut self) {
-        self.thumbnails.retain(|_, entry| match entry {
-            ThumbnailEntry::InFlight { cancel, handle, .. } => {
-                cancel.cancel();
-                handle.abort();
-                false
-            }
-            ThumbnailEntry::Loaded { .. } | ThumbnailEntry::Failed { .. } => true,
-        });
+        abort_in_flight_thumbnails(&mut self.thumbnails);
     }
 
     fn clear_all_work(&mut self) {
@@ -206,44 +413,95 @@ impl GalleryState {
             .reset_for_scope(scope, view, filters, clear_terms);
     }
 
-    fn evict_excess_loaded(&mut self, visible_range: &std::ops::Range<usize>) {
-        let mut loaded_count = self
-            .thumbnails
-            .values()
-            .filter(|e| matches!(e, ThumbnailEntry::Loaded { .. }))
-            .count();
-        if loaded_count <= MAX_RESIDENT_THUMBNAILS {
-            return;
-        }
+    fn sync_visible_thumbnails(
+        &mut self,
+        loader: &ThumbnailLoader,
+        thumb_size: &str,
+    ) -> Task<Message> {
+        let generation = self.controller.generation();
+        let scope = self.controller.scope().clone();
+        sync_gallery_visible_thumbnails(
+            ThumbnailSyncTarget {
+                kind: self.kind,
+                items: self.controller.items(),
+                generation,
+                scope,
+                metrics: &self.metrics,
+                thumbnails: &mut self.thumbnails,
+            },
+            loader,
+            thumb_size,
+        )
+    }
+}
 
-        let items = self.controller.items();
-        let mid = (visible_range.start + visible_range.end) / 2;
-        let mut candidates: Vec<(usize, WallpaperId)> = items
-            .iter()
-            .enumerate()
-            .filter(|(idx, w)| {
-                !visible_range.contains(idx)
-                    && matches!(
-                        self.thumbnails.get(&w.id),
-                        Some(ThumbnailEntry::Loaded { .. })
-                    )
-            })
-            .map(|(idx, w)| (idx.abs_diff(mid), w.id.clone()))
-            .collect();
-        candidates.sort_by_key(|a| std::cmp::Reverse(a.0));
+struct CollectionsState {
+    controller: CollectionsController,
+    scrollable_id: Id,
+    metrics: GridMetrics,
+    selected: Option<usize>,
+    list_in_flight: Option<InFlightCollectionList>,
+    page_in_flight: Option<InFlightPage>,
+    thumbnails: HashMap<WallpaperId, ThumbnailEntry>,
+}
 
-        for (_, id) in candidates {
-            if loaded_count <= MAX_RESIDENT_THUMBNAILS {
-                break;
-            }
-            if matches!(
-                self.thumbnails.get(&id),
-                Some(ThumbnailEntry::Loaded { .. })
-            ) {
-                self.thumbnails.remove(&id);
-                loaded_count -= 1;
-            }
+impl CollectionsState {
+    fn new(controller: CollectionsController) -> Self {
+        let mut metrics = GridMetrics::default();
+        metrics.set_window_size(
+            (metrics.window_width - COLLECTIONS_SIDEBAR_WIDTH - 16.0).max(320.0),
+            800.0,
+        );
+        Self {
+            controller,
+            scrollable_id: Id::unique(),
+            metrics,
+            selected: None,
+            list_in_flight: None,
+            page_in_flight: None,
+            thumbnails: HashMap::new(),
         }
+    }
+
+    fn thumbnail_state(&self, id: &WallpaperId) -> ThumbnailViewState<'_> {
+        entry_thumbnail_state(&self.thumbnails, id)
+    }
+
+    fn cancel_in_flight_thumbnails(&mut self) {
+        abort_in_flight_thumbnails(&mut self.thumbnails);
+    }
+
+    fn clear_items_work(&mut self) {
+        if let Some(op) = self.page_in_flight.take() {
+            op.handle.abort();
+        }
+        self.cancel_in_flight_thumbnails();
+        self.thumbnails.clear();
+        self.selected = None;
+        self.metrics.scroll_y = 0.0;
+    }
+
+    fn clear_items_for_reload(&mut self) -> Task<Message> {
+        let was_scrolled = self.metrics.scroll_y > 0.0;
+        self.clear_items_work();
+        if was_scrolled {
+            operation::scroll_to(
+                self.scrollable_id.clone(),
+                AbsoluteOffset {
+                    x: Some(0.0),
+                    y: Some(0.0),
+                },
+            )
+        } else {
+            Task::none()
+        }
+    }
+
+    fn clear_all_work(&mut self) {
+        if let Some(op) = self.list_in_flight.take() {
+            op.handle.abort();
+        }
+        self.clear_items_work();
     }
 
     fn sync_visible_thumbnails(
@@ -251,91 +509,20 @@ impl GalleryState {
         loader: &ThumbnailLoader,
         thumb_size: &str,
     ) -> Task<Message> {
-        let items_len = self.controller.items().len();
-        if items_len == 0 {
-            self.cancel_in_flight_thumbnails();
-            return Task::none();
-        }
-
-        let visible_range = self.metrics.visible_item_range(items_len);
-        let generation = self.controller.generation();
+        let generation = self.controller.items_generation();
         let scope = self.controller.scope().clone();
-
-        let visible_ids: HashSet<WallpaperId> = self.controller.items()[visible_range.clone()]
-            .iter()
-            .map(|w| w.id.clone())
-            .collect();
-
-        // Cancel and remove any in-flight thumbnails outside the visible + overscan window or
-        // belonging to an older scope/generation.
-        self.thumbnails.retain(|id, entry| match entry {
-            ThumbnailEntry::InFlight {
-                generation: g,
-                scope: s,
-                cancel,
-                handle,
-            } if *g != generation || *s != scope || !visible_ids.contains(id) => {
-                cancel.cancel();
-                handle.abort();
-                false
-            }
-            _ => true,
-        });
-
-        self.evict_excess_loaded(&visible_range);
-
-        let mut tasks = Vec::new();
-        for wallpaper in &self.controller.items()[visible_range] {
-            if self.thumbnails.contains_key(&wallpaper.id) {
-                continue;
-            }
-            let raw_url = select_thumbnail_url(&wallpaper.thumbs, thumb_size);
-            let request = match ImageRequest::thumbnail_url(raw_url, scope.clone()) {
-                Ok(req) => req,
-                Err(err) => {
-                    self.thumbnails.insert(
-                        wallpaper.id.clone(),
-                        ThumbnailEntry::Failed {
-                            message: thumbnail_error_message(&err),
-                        },
-                    );
-                    continue;
-                }
-            };
-
-            let cancel = CancelToken::new();
-            let cancel_for_task = cancel.clone();
-            let loader = loader.clone();
-            let kind = self.kind;
-            let id = wallpaper.id.clone();
-            let msg_id = id.clone();
-            let msg_scope = scope.clone();
-
-            let (task, handle) = Task::perform(
-                async move { loader.load(request, cancel_for_task).await },
-                move |result| Message::ThumbnailLoaded {
-                    kind,
-                    generation,
-                    scope: msg_scope,
-                    id: msg_id,
-                    result,
-                },
-            )
-            .abortable();
-
-            self.thumbnails.insert(
-                id,
-                ThumbnailEntry::InFlight {
-                    generation,
-                    scope: scope.clone(),
-                    cancel,
-                    handle: handle.abort_on_drop(),
-                },
-            );
-            tasks.push(task);
-        }
-
-        Task::batch(tasks)
+        sync_gallery_visible_thumbnails(
+            ThumbnailSyncTarget {
+                kind: GalleryKind::Collections,
+                items: self.controller.items(),
+                generation,
+                scope,
+                metrics: &self.metrics,
+                thumbnails: &mut self.thumbnails,
+            },
+            loader,
+            thumb_size,
+        )
     }
 }
 
@@ -569,6 +756,10 @@ pub struct WalloraApp {
     search_filter_error: Option<String>,
     search_filters_expanded: bool,
     search_input_ids: SearchInputIds,
+    collections: CollectionsState,
+    collections_username_input: String,
+    collections_username_input_id: Id,
+    collections_username_error: Option<String>,
     detail: Option<DetailState>,
 }
 
@@ -698,6 +889,7 @@ impl WalloraApp {
                 DiscoveryFilters::from_defaults(&defaults),
             ),
         );
+        let collections = CollectionsState::new(CollectionsController::from_session(&session));
         let search_resolutions_input = format_resolutions(&defaults.resolutions);
         let search_ratios_input = format_ratios(&defaults.aspect_ratios);
 
@@ -734,6 +926,10 @@ impl WalloraApp {
             search_filter_error: None,
             search_filters_expanded: true,
             search_input_ids: SearchInputIds::new(),
+            collections,
+            collections_username_input: String::new(),
+            collections_username_input_id: Id::unique(),
+            collections_username_error: None,
             detail: None,
         };
 
@@ -765,7 +961,7 @@ impl WalloraApp {
     pub fn subscription(&self) -> Subscription<Message> {
         let resize = iced::window::resize_events().map(|(_id, size)| Message::WindowResized(size));
         match self.route {
-            Route::Home | Route::Search => {
+            Route::Home | Route::Search | Route::Collections => {
                 Subscription::batch([resize, iced::event::listen_with(gallery_keyboard_event)])
             }
             Route::Detail(_) => {
@@ -779,6 +975,7 @@ impl WalloraApp {
         match kind {
             GalleryKind::Home => &self.home,
             GalleryKind::Search => &self.search,
+            GalleryKind::Collections => unreachable!("Collections uses CollectionsState"),
         }
     }
 
@@ -786,6 +983,7 @@ impl WalloraApp {
         match kind {
             GalleryKind::Home => &mut self.home,
             GalleryKind::Search => &mut self.search,
+            GalleryKind::Collections => unreachable!("Collections uses CollectionsState"),
         }
     }
 
@@ -793,7 +991,86 @@ impl WalloraApp {
         match self.route {
             Route::Home => Some(GalleryKind::Home),
             Route::Search => Some(GalleryKind::Search),
+            Route::Collections => Some(GalleryKind::Collections),
             Route::Detail(_) | Route::Account | Route::Settings => None,
+        }
+    }
+
+    fn gallery_items(&self, kind: GalleryKind) -> &[Wallpaper] {
+        match kind {
+            GalleryKind::Home => self.home.controller.items(),
+            GalleryKind::Search => self.search.controller.items(),
+            GalleryKind::Collections => self.collections.controller.items(),
+        }
+    }
+
+    fn gallery_selected(&self, kind: GalleryKind) -> Option<usize> {
+        match kind {
+            GalleryKind::Home => self.home.selected,
+            GalleryKind::Search => self.search.selected,
+            GalleryKind::Collections => self.collections.selected,
+        }
+    }
+
+    fn set_gallery_selected(&mut self, kind: GalleryKind, selected: Option<usize>) {
+        match kind {
+            GalleryKind::Home => self.home.selected = selected,
+            GalleryKind::Search => self.search.selected = selected,
+            GalleryKind::Collections => self.collections.selected = selected,
+        }
+    }
+
+    fn gallery_metrics(&self, kind: GalleryKind) -> &GridMetrics {
+        match kind {
+            GalleryKind::Home => &self.home.metrics,
+            GalleryKind::Search => &self.search.metrics,
+            GalleryKind::Collections => &self.collections.metrics,
+        }
+    }
+
+    fn gallery_metrics_mut(&mut self, kind: GalleryKind) -> &mut GridMetrics {
+        match kind {
+            GalleryKind::Home => &mut self.home.metrics,
+            GalleryKind::Search => &mut self.search.metrics,
+            GalleryKind::Collections => &mut self.collections.metrics,
+        }
+    }
+
+    fn gallery_scrollable_id(&self, kind: GalleryKind) -> &Id {
+        match kind {
+            GalleryKind::Home => &self.home.scrollable_id,
+            GalleryKind::Search => &self.search.scrollable_id,
+            GalleryKind::Collections => &self.collections.scrollable_id,
+        }
+    }
+
+    fn gallery_generation_and_thumbnails_mut(
+        &mut self,
+        kind: GalleryKind,
+    ) -> (u64, &mut HashMap<WallpaperId, ThumbnailEntry>) {
+        match kind {
+            GalleryKind::Home => (self.home.controller.generation(), &mut self.home.thumbnails),
+            GalleryKind::Search => (
+                self.search.controller.generation(),
+                &mut self.search.thumbnails,
+            ),
+            GalleryKind::Collections => (
+                self.collections.controller.items_generation(),
+                &mut self.collections.thumbnails,
+            ),
+        }
+    }
+
+    fn spawn_next_gallery_page(&mut self, kind: GalleryKind) -> Option<Task<Message>> {
+        match kind {
+            GalleryKind::Home | GalleryKind::Search => {
+                let req = self.gallery_mut(kind).controller.request_next_page()?;
+                Some(self.spawn_page_request(kind, req))
+            }
+            GalleryKind::Collections => {
+                let req = self.collections.controller.request_next_page()?;
+                Some(self.spawn_collection_items_request(req))
+            }
         }
     }
 
@@ -848,14 +1125,80 @@ impl WalloraApp {
     fn sync_gallery_thumbnails(&mut self, kind: GalleryKind) -> Task<Message> {
         let thumb_size = self.session.browse_defaults().thumb_size;
         let loader = self.thumbnail_loader.clone();
-        self.gallery_mut(kind)
-            .sync_visible_thumbnails(&loader, &thumb_size)
+        match kind {
+            GalleryKind::Home => self.home.sync_visible_thumbnails(&loader, &thumb_size),
+            GalleryKind::Search => self.search.sync_visible_thumbnails(&loader, &thumb_size),
+            GalleryKind::Collections => self
+                .collections
+                .sync_visible_thumbnails(&loader, &thumb_size),
+        }
+    }
+
+    fn spawn_collection_list_request(&mut self, request: CollectionListRequest) -> Task<Message> {
+        let client = Arc::clone(&self.client);
+        let generation = request.generation;
+        let scope = request.scope.clone();
+
+        if let Some(prev) = self.collections.list_in_flight.take() {
+            prev.handle.abort();
+        }
+
+        let (task, handle) = Task::perform(
+            async move { fetch_user_collections(client.as_ref(), request).await },
+            |response| Message::CollectionsUserListLoaded(Box::new(response)),
+        )
+        .abortable();
+
+        self.collections.list_in_flight = Some(InFlightCollectionList {
+            generation,
+            scope,
+            handle: handle.abort_on_drop(),
+        });
+        task
+    }
+
+    fn spawn_collection_items_request(&mut self, request: CollectionItemsRequest) -> Task<Message> {
+        let client = Arc::clone(&self.client);
+        let generation = request.generation;
+        let scope = request.scope.clone();
+        let page = request.page;
+
+        if let Some(prev) = self.collections.page_in_flight.take() {
+            prev.handle.abort();
+        }
+
+        let (task, handle) = Task::perform(
+            async move { fetch_collection_items(client.as_ref(), request).await },
+            |response| Message::CollectionsItemsPageLoaded(Box::new(response)),
+        )
+        .abortable();
+
+        self.collections.page_in_flight = Some(InFlightPage {
+            generation,
+            scope,
+            page,
+            handle: handle.abort_on_drop(),
+        });
+        task
+    }
+
+    fn reload_collections_items(&mut self, request: CollectionItemsRequest) -> Task<Message> {
+        let scroll_task = self.collections.clear_items_for_reload();
+        let fetch_task = self.spawn_collection_items_request(request);
+        if scroll_task.units() == 0 {
+            fetch_task
+        } else {
+            Task::batch([scroll_task, fetch_task])
+        }
     }
 
     fn ensure_route_loaded(&mut self, route: Route) -> Task<Message> {
         let kind = match route {
             Route::Home => GalleryKind::Home,
             Route::Search => GalleryKind::Search,
+            Route::Collections => {
+                return self.sync_gallery_thumbnails(GalleryKind::Collections);
+            }
             Route::Detail(_) | Route::Account | Route::Settings => return Task::none(),
         };
         let gallery = self.gallery_mut(kind);
@@ -881,6 +1224,7 @@ impl WalloraApp {
             self.route = match return_to.unwrap_or(GalleryKind::Home) {
                 GalleryKind::Home => Route::Home,
                 GalleryKind::Search => Route::Search,
+                GalleryKind::Collections => Route::Collections,
             };
         }
     }
@@ -944,6 +1288,11 @@ impl WalloraApp {
             true,
         );
         self.sync_search_inputs_to_defaults(&defaults);
+
+        self.collections.clear_all_work();
+        self.collections.controller.sync_session(&self.session);
+        self.collections_username_input.clear();
+        self.collections_username_error = None;
 
         Some(self.ensure_route_loaded(self.route.clone()))
     }
@@ -1036,11 +1385,14 @@ impl WalloraApp {
                     match previous_route {
                         Route::Home => self.home.cancel_in_flight_thumbnails(),
                         Route::Search => self.search.cancel_in_flight_thumbnails(),
+                        Route::Collections => self.collections.cancel_in_flight_thumbnails(),
                         Route::Detail(_) => self.clear_detail(),
                         Route::Account | Route::Settings => {}
                     }
                     return match route {
-                        Route::Home | Route::Search => self.ensure_route_loaded(route),
+                        Route::Home | Route::Search | Route::Collections => {
+                            self.ensure_route_loaded(route)
+                        }
                         Route::Settings => self.request_cache_stats(),
                         Route::Detail(_) | Route::Account => Task::none(),
                     };
@@ -1133,6 +1485,9 @@ impl WalloraApp {
                     self.session.apply_refresh(payload);
                     if let Some(task) = self.retire_changed_scope(&previous) {
                         return task;
+                    }
+                    if self.collections.controller.sync_session(&self.session) {
+                        self.collections.clear_items_work();
                     }
                     let next_defaults = self.session.browse_defaults();
                     if next_defaults != prev_defaults {
@@ -1339,25 +1694,37 @@ impl WalloraApp {
                 self.search_filter_error = None;
                 Task::none()
             }
-            Message::GalleryRefresh(kind) => {
-                let req = self.gallery_mut(kind).controller.refresh();
-                self.reload_gallery(kind, req)
-            }
-            Message::GalleryRetry(kind) => {
-                let Some(req) = self.gallery_mut(kind).controller.retry() else {
-                    return Task::none();
-                };
-                self.spawn_page_request(kind, req)
-            }
-            Message::GallerySelectTile { kind, index } => {
-                let len = self.gallery(kind).controller.items().len();
-                if index < len {
-                    self.gallery_mut(kind).selected = Some(index);
-                    if let Some(wallpaper) =
-                        self.gallery(kind).controller.items().get(index).cloned()
-                    {
-                        return self.open_detail(wallpaper.id.clone(), Some(wallpaper), kind);
+            Message::GalleryRefresh(kind) => match kind {
+                GalleryKind::Home | GalleryKind::Search => {
+                    let req = self.gallery_mut(kind).controller.refresh();
+                    self.reload_gallery(kind, req)
+                }
+                GalleryKind::Collections => {
+                    if let Some(req) = self.collections.controller.refresh_items() {
+                        self.reload_collections_items(req)
+                    } else {
+                        Task::none()
                     }
+                }
+            },
+            Message::GalleryRetry(kind) => match kind {
+                GalleryKind::Home | GalleryKind::Search => {
+                    let Some(req) = self.gallery_mut(kind).controller.retry() else {
+                        return Task::none();
+                    };
+                    self.spawn_page_request(kind, req)
+                }
+                GalleryKind::Collections => {
+                    let Some(req) = self.collections.controller.retry_items() else {
+                        return Task::none();
+                    };
+                    self.spawn_collection_items_request(req)
+                }
+            },
+            Message::GallerySelectTile { kind, index } => {
+                if let Some(wallpaper) = self.gallery_items(kind).get(index).cloned() {
+                    self.set_gallery_selected(kind, Some(index));
+                    return self.open_detail(wallpaper.id.clone(), Some(wallpaper), kind);
                 }
                 Task::none()
             }
@@ -1368,27 +1735,21 @@ impl WalloraApp {
                 viewport_height,
                 content_height,
             } => {
-                let (near_bottom, next_req) = {
-                    let gallery = self.gallery_mut(kind);
-                    gallery
-                        .metrics
-                        .update_scroll(offset_y, viewport_width, viewport_height);
-                    let len = gallery.controller.items().len();
-                    let near_bottom = gallery.metrics.is_near_bottom(len, Some(content_height));
-                    let next_req = if near_bottom {
-                        gallery.controller.request_next_page()
-                    } else {
-                        None
-                    };
-                    (near_bottom, next_req)
+                let near_bottom = {
+                    let metrics = self.gallery_metrics_mut(kind);
+                    metrics.update_scroll(offset_y, viewport_width, viewport_height);
+                    let len = self.gallery_items(kind).len();
+                    self.gallery_metrics(kind)
+                        .is_near_bottom(len, Some(content_height))
                 };
-                let _ = near_bottom;
+                let next_task = if near_bottom {
+                    self.spawn_next_gallery_page(kind)
+                } else {
+                    None
+                };
                 let thumb_task = self.sync_gallery_thumbnails(kind);
-                match next_req {
-                    Some(req) => {
-                        let page_task = self.spawn_page_request(kind, req);
-                        Task::batch([thumb_task, page_task])
-                    }
+                match next_task {
+                    Some(page_task) => Task::batch([thumb_task, page_task]),
                     None => thumb_task,
                 }
             }
@@ -1407,6 +1768,7 @@ impl WalloraApp {
                         .search
                         .controller
                         .apply_response(&mut self.session, response),
+                    GalleryKind::Collections => return Task::none(),
                 };
                 match outcome {
                     ApplyOutcome::Stale => Task::none(),
@@ -1456,55 +1818,26 @@ impl WalloraApp {
                 id,
                 result,
             } => {
-                if scope != self.session.scope() {
-                    return Task::none();
-                }
-                let gallery = self.gallery_mut(kind);
-                if generation != gallery.controller.generation() {
-                    return Task::none();
-                }
-                let matches_in_flight = matches!(
-                    gallery.thumbnails.get(&id),
-                    Some(ThumbnailEntry::InFlight {
-                        generation: g,
-                        scope: s,
-                        ..
-                    }) if *g == generation && *s == scope
+                let current_scope = self.session.scope();
+                let (target_generation, thumbnails) =
+                    self.gallery_generation_and_thumbnails_mut(kind);
+                apply_thumbnail_loaded(
+                    &current_scope,
+                    target_generation,
+                    generation,
+                    scope,
+                    id,
+                    result,
+                    thumbnails,
                 );
-                if !matches_in_flight {
-                    return Task::none();
-                }
-                match result {
-                    Ok(loaded) => {
-                        gallery.thumbnails.insert(
-                            id,
-                            ThumbnailEntry::Loaded {
-                                handle: loaded.handle,
-                                stale: loaded.stale,
-                            },
-                        );
-                    }
-                    Err(ImagePipelineError::Cancelled | ImagePipelineError::ScopeChanged) => {
-                        gallery.thumbnails.remove(&id);
-                    }
-                    Err(err) => {
-                        gallery.thumbnails.insert(
-                            id,
-                            ThumbnailEntry::Failed {
-                                message: thumbnail_error_message(&err),
-                            },
-                        );
-                    }
-                }
                 Task::none()
             }
             Message::RetryThumbnail { kind, id } => {
-                let should_retry = matches!(
-                    self.gallery(kind).thumbnails.get(&id),
-                    Some(ThumbnailEntry::Failed { .. })
-                );
+                let (_, thumbnails) = self.gallery_generation_and_thumbnails_mut(kind);
+                let should_retry =
+                    matches!(thumbnails.get(&id), Some(ThumbnailEntry::Failed { .. }));
                 if should_retry {
-                    self.gallery_mut(kind).thumbnails.remove(&id);
+                    thumbnails.remove(&id);
                     return self.sync_gallery_thumbnails(kind);
                 }
                 Task::none()
@@ -1530,6 +1863,13 @@ impl WalloraApp {
                         }
                     })
                 }
+                Route::Collections => operation::is_focused(
+                    self.collections_username_input_id.clone(),
+                )
+                .map(move |input_focused| Message::CollectionsKeyFocusChecked {
+                    key,
+                    input_focused,
+                }),
                 Route::Detail(_) | Route::Account | Route::Settings => Task::none(),
             },
             Message::SearchKeyFocusChecked {
@@ -1538,6 +1878,13 @@ impl WalloraApp {
             } => {
                 if !any_input_focused && self.route == Route::Search {
                     self.apply_gallery_key(GalleryKind::Search, key)
+                } else {
+                    Task::none()
+                }
+            }
+            Message::CollectionsKeyFocusChecked { key, input_focused } => {
+                if !input_focused && self.route == Route::Collections {
+                    self.apply_gallery_key(GalleryKind::Collections, key)
                 } else {
                     Task::none()
                 }
@@ -1738,6 +2085,164 @@ impl WalloraApp {
                 self.cancel_detail_download();
                 Task::none()
             }
+            Message::DetailOpenFavoriteHandOff => {
+                if let Some(detail) = &self.detail {
+                    match CollectionUnsupportedAction::favorite_url(&detail.wallpaper_id) {
+                        Ok(url) => self.open_wallhaven_url(&url),
+                        Err(err) => {
+                            self.session.set_notice(Some(SessionNotice::warning(err)));
+                        }
+                    }
+                }
+                Task::none()
+            }
+            Message::CollectionsSelectOwn(collection_id) => {
+                match self
+                    .collections
+                    .controller
+                    .select_own_collection(collection_id)
+                {
+                    Ok(req) => self.reload_collections_items(req),
+                    Err(_) => {
+                        self.collections.clear_items_work();
+                        Task::none()
+                    }
+                }
+            }
+            Message::CollectionsUsernameChanged(username) => {
+                self.collections_username_input = username;
+                self.collections_username_error = None;
+                Task::none()
+            }
+            Message::CollectionsLoadUser => {
+                let input = self.collections_username_input.clone();
+                match self.collections.controller.load_user_collections(&input) {
+                    Ok(req) => {
+                        self.collections_username_error = None;
+                        if self.collections.controller.selected_collection().is_none() {
+                            self.collections.clear_items_work();
+                        }
+                        self.spawn_collection_list_request(req)
+                    }
+                    Err(err) => {
+                        self.collections_username_error = Some(err.to_string());
+                        Task::none()
+                    }
+                }
+            }
+            Message::CollectionsRetryUserList => {
+                match self.collections.controller.retry_user_collections() {
+                    Some(req) => self.spawn_collection_list_request(req),
+                    None => Task::none(),
+                }
+            }
+            Message::CollectionsUserListLoaded(response) => {
+                let response = *response;
+                let resp_gen = response.generation;
+                let resp_scope = response.scope.clone();
+                let previous = self.session.scope();
+                match self
+                    .collections
+                    .controller
+                    .apply_list_response(&mut self.session, response)
+                {
+                    CollectionListOutcome::Stale => Task::none(),
+                    CollectionListOutcome::Revoked(_) => self
+                        .retire_changed_scope(&previous)
+                        .unwrap_or_else(Task::none),
+                    CollectionListOutcome::Applied { .. } | CollectionListOutcome::Failed(_) => {
+                        if self
+                            .collections
+                            .list_in_flight
+                            .as_ref()
+                            .is_some_and(|op| op.generation == resp_gen && op.scope == resp_scope)
+                        {
+                            self.collections.list_in_flight = None;
+                        }
+                        Task::none()
+                    }
+                }
+            }
+            Message::CollectionsSelectUserCollection(collection_id) => {
+                match self
+                    .collections
+                    .controller
+                    .select_user_collection(collection_id)
+                {
+                    Ok(req) => {
+                        self.collections_username_error = None;
+                        self.reload_collections_items(req)
+                    }
+                    Err(err) => {
+                        self.collections.clear_items_work();
+                        self.collections_username_error = Some(err.to_string());
+                        Task::none()
+                    }
+                }
+            }
+            Message::CollectionsTogglePurity(purity) => {
+                let mut next = self.collections.controller.purity();
+                match purity {
+                    Purity::Sfw => next.sfw = !next.sfw,
+                    Purity::Sketchy => next.sketchy = !next.sketchy,
+                    Purity::Nsfw => next.nsfw = !next.nsfw,
+                }
+                match self.collections.controller.set_purity(next) {
+                    Some(req) => self.reload_collections_items(req),
+                    None => Task::none(),
+                }
+            }
+            Message::CollectionsItemsPageLoaded(response) => {
+                let response = *response;
+                let resp_generation = response.generation;
+                let resp_scope = response.scope.clone();
+                let resp_page = response.page;
+                let previous = self.session.scope();
+                let outcome = self
+                    .collections
+                    .controller
+                    .apply_items_response(&mut self.session, response);
+                match outcome {
+                    ApplyOutcome::Stale => Task::none(),
+                    ApplyOutcome::Revoked(_) => self
+                        .retire_changed_scope(&previous)
+                        .unwrap_or_else(Task::none),
+                    ApplyOutcome::Applied { .. } => {
+                        if self.collections.page_in_flight.as_ref().is_some_and(|op| {
+                            op.generation == resp_generation
+                                && op.scope == resp_scope
+                                && op.page == resp_page
+                        }) {
+                            self.collections.page_in_flight = None;
+                        }
+                        if self.active_gallery_kind() == Some(GalleryKind::Collections) {
+                            self.sync_gallery_thumbnails(GalleryKind::Collections)
+                        } else {
+                            Task::none()
+                        }
+                    }
+                    ApplyOutcome::Failed(_) => {
+                        if self.collections.page_in_flight.as_ref().is_some_and(|op| {
+                            op.generation == resp_generation
+                                && op.scope == resp_scope
+                                && op.page == resp_page
+                        }) {
+                            self.collections.page_in_flight = None;
+                        }
+                        Task::none()
+                    }
+                }
+            }
+            Message::CollectionsOpenManageHandOff => {
+                let username = self
+                    .collections
+                    .controller
+                    .own_account()
+                    .map(|a| a.username.as_str());
+                let url = CollectionUnsupportedAction::manage_collections_url(username);
+                self.open_wallhaven_url(&url);
+                Task::none()
+            }
         }
     }
 
@@ -1773,6 +2278,7 @@ impl WalloraApp {
         match return_to {
             GalleryKind::Home => self.home.cancel_in_flight_thumbnails(),
             GalleryKind::Search => self.search.cancel_in_flight_thumbnails(),
+            GalleryKind::Collections => self.collections.cancel_in_flight_thumbnails(),
         }
         self.route = Route::Detail(id.clone());
         let op_id = self.allocate_op_id();
@@ -1802,12 +2308,13 @@ impl WalloraApp {
         self.route = match return_to {
             GalleryKind::Home => Route::Home,
             GalleryKind::Search => Route::Search,
+            GalleryKind::Collections => Route::Collections,
         };
 
-        let scroll_y = self.gallery(return_to).metrics.scroll_y;
+        let scroll_y = self.gallery_metrics(return_to).scroll_y;
         let scroll_task = if scroll_y > 0.0 {
             operation::scroll_to(
-                self.gallery(return_to).scrollable_id.clone(),
+                self.gallery_scrollable_id(return_to).clone(),
                 AbsoluteOffset {
                     x: Some(0.0),
                     y: Some(scroll_y),
@@ -2104,6 +2611,10 @@ impl WalloraApp {
     fn handle_window_resized(&mut self, size: Size) -> Task<Message> {
         self.home.metrics.set_window_size(size.width, size.height);
         self.search.metrics.set_window_size(size.width, size.height);
+        self.collections.metrics.set_window_size(
+            (size.width - COLLECTIONS_SIDEBAR_WIDTH - 16.0).max(320.0),
+            size.height,
+        );
         match self.active_gallery_kind() {
             Some(kind) => self.sync_gallery_thumbnails(kind),
             None => Task::none(),
@@ -2112,32 +2623,31 @@ impl WalloraApp {
 
     fn apply_gallery_key(&mut self, kind: GalleryKind, key: GridKey) -> Task<Message> {
         if key == GridKey::Activate {
-            if let Some(idx) = self.gallery(kind).selected
-                && let Some(wallpaper) = self.gallery(kind).controller.items().get(idx).cloned()
+            if let Some(idx) = self.gallery_selected(kind)
+                && let Some(wallpaper) = self.gallery_items(kind).get(idx).cloned()
             {
                 return self.open_detail(wallpaper.id.clone(), Some(wallpaper), kind);
             }
             return Task::none();
         }
-        let len = self.gallery(kind).controller.items().len();
+        let len = self.gallery_items(kind).len();
         let next = self
-            .gallery(kind)
-            .metrics
-            .move_selection(self.gallery(kind).selected, len, key);
+            .gallery_metrics(kind)
+            .move_selection(self.gallery_selected(kind), len, key);
         let Some(idx) = next else {
             return Task::none();
         };
-        let prev = self.gallery(kind).selected;
-        self.gallery_mut(kind).selected = Some(idx);
+        let prev = self.gallery_selected(kind);
+        self.set_gallery_selected(kind, Some(idx));
         if prev == Some(idx) {
             return Task::none();
         }
 
         let mut tasks = Vec::new();
-        if let Some(target_y) = self.gallery(kind).metrics.scroll_target_for(idx) {
-            self.gallery_mut(kind).metrics.scroll_y = target_y;
+        if let Some(target_y) = self.gallery_metrics(kind).scroll_target_for(idx) {
+            self.gallery_metrics_mut(kind).scroll_y = target_y;
             tasks.push(operation::scroll_to(
-                self.gallery(kind).scrollable_id.clone(),
+                self.gallery_scrollable_id(kind).clone(),
                 AbsoluteOffset {
                     x: Some(0.0),
                     y: Some(target_y),
@@ -2150,9 +2660,9 @@ impl WalloraApp {
             tasks.push(thumb_task);
         }
 
-        let near_bottom = self.gallery(kind).metrics.is_near_bottom(len, None);
-        if near_bottom && let Some(req) = self.gallery_mut(kind).controller.request_next_page() {
-            tasks.push(self.spawn_page_request(kind, req));
+        let near_bottom = self.gallery_metrics(kind).is_near_bottom(len, None);
+        if near_bottom && let Some(next_task) = self.spawn_next_gallery_page(kind) {
+            tasks.push(next_task);
         }
 
         Task::batch(tasks)
@@ -2419,44 +2929,50 @@ impl WalloraApp {
     }
 
     pub fn view(&self) -> Element<'_, Message> {
-        let nav_buttons = [Route::Home, Route::Search, Route::Account, Route::Settings]
-            .into_iter()
-            .fold(row![].spacing(8), |r, route| {
-                let active = self.route == route;
-                let btn = button(text(route.label()).size(14))
-                    .padding([8, 16])
-                    .on_press(Message::Navigate(route.clone()))
-                    .style(move |theme, status| {
-                        let base = if active {
-                            button::primary(theme, status)
+        let nav_buttons = [
+            Route::Home,
+            Route::Search,
+            Route::Collections,
+            Route::Account,
+            Route::Settings,
+        ]
+        .into_iter()
+        .fold(row![].spacing(8), |r, route| {
+            let active = self.route == route;
+            let btn = button(text(route.label()).size(14))
+                .padding([8, 16])
+                .on_press(Message::Navigate(route.clone()))
+                .style(move |theme, status| {
+                    let base = if active {
+                        button::primary(theme, status)
+                    } else {
+                        button::secondary(theme, status)
+                    };
+                    button::Style {
+                        background: Some(Background::Color(if active {
+                            palette::ACCENT
                         } else {
-                            button::secondary(theme, status)
-                        };
-                        button::Style {
-                            background: Some(Background::Color(if active {
+                            surface_color()
+                        })),
+                        text_color: if active {
+                            palette::CANVAS
+                        } else {
+                            palette::TEXT_PRIMARY
+                        },
+                        border: Border {
+                            radius: 6.0.into(),
+                            width: 1.0,
+                            color: if active {
                                 palette::ACCENT
                             } else {
-                                surface_color()
-                            })),
-                            text_color: if active {
-                                palette::CANVAS
-                            } else {
-                                palette::TEXT_PRIMARY
+                                palette::MUTED
                             },
-                            border: Border {
-                                radius: 6.0.into(),
-                                width: 1.0,
-                                color: if active {
-                                    palette::ACCENT
-                                } else {
-                                    palette::MUTED
-                                },
-                            },
-                            ..base
-                        }
-                    });
-                r.push(btn)
-            });
+                        },
+                        ..base
+                    }
+                });
+            r.push(btn)
+        });
 
         let session_badge = match self.session.active_account() {
             Some(account) => text(format!(
@@ -2518,6 +3034,21 @@ impl WalloraApp {
                 selected: self.search.selected,
                 thumbnail_state: |wallpaper| self.search.thumbnail_state(&wallpaper.id),
             }),
+            Route::Collections => {
+                views::collections::view(views::collections::CollectionsViewState {
+                    controller: &self.collections.controller,
+                    username_input: &self.collections_username_input,
+                    username_input_id: &self.collections_username_input_id,
+                    username_error: self.collections_username_error.as_deref(),
+                    selectable_purity: selectable,
+                    is_guest,
+                    refresh_busy: self.refresh_in_flight.is_some(),
+                    scrollable_id: &self.collections.scrollable_id,
+                    metrics: &self.collections.metrics,
+                    selected_tile: self.collections.selected,
+                    thumbnail_state: |wallpaper| self.collections.thumbnail_state(&wallpaper.id),
+                })
+            }
             Route::Detail(_) => views::detail::view(self.detail_view_state(is_guest)),
             Route::Account => views::account::view(views::account::AccountViewState {
                 session: &self.session,
@@ -2573,14 +3104,16 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use wallora_core::domain::{
-        AccountId, AspectRatio, CategoryMask, CollectionSummary, Dimensions,
+        AccountId, AspectRatio, CategoryMask, CollectionSummary, Dimensions, IdentityCheckOutcome,
         InMemoryCredentialStore, LocalPreferences, PurityMask, SearchMeta, SearchPage, SessionKind,
         SortOrder, Thumbs, UserSettings, UsernameVerification, Wallpaper,
     };
     use wallora_core::provider::{ImageClass, ProviderError};
     use wallora_core::services::cache::{CacheConnectivity, CacheKey, crc32_ieee};
     use wallora_core::services::{
-        AccountRefreshPayload, DetailUnsupportedAction, DownloadOutcome, PageResponse, SignInProbe,
+        AccountRefreshPayload, CollectionItemsResponse, CollectionListResponse,
+        CollectionListStatus, CollectionSource, CollectionUnsupportedAction,
+        DetailUnsupportedAction, DownloadOutcome, OwnItemsBlockedReason, PageResponse, SignInProbe,
         UnsupportedFeature,
     };
 
@@ -3232,7 +3765,7 @@ mod tests {
         id: &str,
         result: Result<LoadedThumbnail, ImagePipelineError>,
     ) -> Task<Message> {
-        let generation = app.gallery(kind).controller.generation();
+        let (generation, _) = app.gallery_generation_and_thumbnails_mut(kind);
         let scope = app.session.scope();
         app.update(Message::ThumbnailLoaded {
             kind,
@@ -4640,5 +5173,469 @@ mod tests {
             app.search.controller.query_for_page(1).q.as_deref(),
             Some("like:z9k2")
         );
+    }
+
+    fn sign_in_with_collections(
+        app: &mut WalloraApp,
+        username: &str,
+        verification: UsernameVerification,
+        collections: Vec<CollectionSummary>,
+    ) {
+        let (op_id, mut probe) = start_sign_in(app);
+        probe.username = username.into();
+        probe.verification = verification;
+        probe.own_collections = Some(collections);
+        let _ = app.update(Message::SignInProbeFinished {
+            op_id,
+            result: Ok(probe),
+        });
+    }
+
+    fn deliver_collection_list(
+        app: &mut WalloraApp,
+        username: &str,
+        result: Result<Vec<CollectionSummary>, ProviderError>,
+    ) -> Task<Message> {
+        let generation = app.collections.controller.list_generation();
+        let scope = app.session.scope();
+        app.update(Message::CollectionsUserListLoaded(Box::new(
+            CollectionListResponse {
+                generation,
+                scope,
+                username: username.to_string(),
+                result,
+            },
+        )))
+    }
+
+    fn deliver_collection_items(
+        app: &mut WalloraApp,
+        page: u32,
+        result: Result<SearchPage, ProviderError>,
+    ) -> Task<Message> {
+        let generation = app.collections.controller.items_generation();
+        let scope = app.session.scope();
+        app.update(Message::CollectionsItemsPageLoaded(Box::new(
+            CollectionItemsResponse {
+                generation,
+                scope,
+                page,
+                result,
+            },
+        )))
+    }
+
+    #[test]
+    fn collections_route_navigation_and_unverified_own_item_gating() {
+        let paths = TestPaths::new();
+        let mut app = test_app(&paths);
+
+        let _ = app.update(Message::Navigate(Route::Collections));
+        assert_eq!(app.route, Route::Collections);
+        assert_eq!(app.active_gallery_kind(), Some(GalleryKind::Collections));
+        let _ = app.view();
+
+        for verification in [
+            UsernameVerification::UnverifiablePrivate,
+            UsernameVerification::UnverifiableEmpty,
+            UsernameVerification::Inconclusive,
+        ] {
+            let own = if verification == UsernameVerification::UnverifiableEmpty {
+                Vec::new()
+            } else {
+                vec![CollectionSummary {
+                    id: 1,
+                    label: "Default".into(),
+                    views: 0,
+                    public: false,
+                    count: 2,
+                }]
+            };
+            sign_in_with_collections(&mut app, "alice", verification, own.clone());
+            assert_eq!(
+                app.collections.controller.own_collections(),
+                Some(own.as_slice())
+            );
+            assert_eq!(
+                app.update(Message::CollectionsSelectOwn(1)).units(),
+                0,
+                "unverified account must not spawn own collection item fetches"
+            );
+            assert!(app.collections.page_in_flight.is_none());
+            assert!(app.collections.controller.items().is_empty());
+            assert_eq!(
+                app.collections.controller.items_blocked(),
+                Some(OwnItemsBlockedReason::Unverified(verification))
+            );
+            let _ = app.view();
+        }
+
+        // Verified account shows "Default" (unresolved Favorites) and loads own items.
+        sign_in_with_collections(
+            &mut app,
+            "alice",
+            UsernameVerification::Verified,
+            vec![CollectionSummary {
+                id: 1,
+                label: "Default".into(),
+                views: 2,
+                public: true,
+                count: 2,
+            }],
+        );
+        let summary = &app.collections.controller.own_collections().unwrap()[0];
+        assert_eq!(
+            app.collections
+                .controller
+                .display_own_collection_label(summary),
+            "Default"
+        );
+        assert!(app.update(Message::CollectionsSelectOwn(1)).units() > 0);
+        assert_eq!(
+            app.collections.page_in_flight.as_ref().map(|p| p.page),
+            Some(1)
+        );
+        let _ =
+            deliver_collection_items(&mut app, 1, Ok(sample_page(&["own1", "own2"], 1, 1, None)));
+        assert_eq!(app.collections.controller.items().len(), 2);
+        assert!(matches!(
+            app.collections
+                .controller
+                .selected_collection()
+                .map(|s| &s.source),
+            Some(CollectionSource::Own { .. })
+        ));
+        let _ = app.view();
+    }
+
+    #[test]
+    fn collections_browse_user_pagination_detail_back_and_keyboard_focus() {
+        let paths = TestPaths::new();
+        let mut app = test_app(&paths);
+        let _ = app.update(Message::Navigate(Route::Collections));
+
+        // Invalid username validation blocks network calls.
+        let _ = app.update(Message::CollectionsUsernameChanged("../bad".into()));
+        assert_eq!(app.update(Message::CollectionsLoadUser).units(), 0);
+        assert!(app.collections_username_error.is_some());
+        let _ = app.view();
+
+        // Load public collections for another user, select one, toggle purity, and paginate.
+        let _ = app.update(Message::CollectionsUsernameChanged("curator".into()));
+        assert!(app.update(Message::CollectionsLoadUser).units() > 0);
+        assert_eq!(
+            app.collections.controller.user_collections_status(),
+            &CollectionListStatus::Loading
+        );
+        let _ = deliver_collection_list(
+            &mut app,
+            "curator",
+            Ok(vec![CollectionSummary {
+                id: 77,
+                label: "Landscapes".into(),
+                views: 15,
+                public: true,
+                count: 6,
+            }]),
+        );
+        assert_eq!(
+            app.collections.controller.user_collections_status(),
+            &CollectionListStatus::Ready
+        );
+        let _ = app.view();
+
+        assert!(
+            app.update(Message::CollectionsSelectUserCollection(77))
+                .units()
+                > 0
+        );
+        let _ = deliver_collection_items(
+            &mut app,
+            1,
+            Ok(sample_page(&["c1", "c2", "c3", "c4"], 1, 2, None)),
+        );
+        let _ = deliver_thumb(
+            &mut app,
+            GalleryKind::Collections,
+            "c1",
+            Ok(sample_loaded_thumb(false)),
+        );
+
+        // Toggle purity reloads page 1 with Sketchy enabled.
+        assert!(
+            app.update(Message::CollectionsTogglePurity(Purity::Sketchy))
+                .units()
+                > 0
+        );
+        assert!(app.collections.controller.purity().sketchy);
+        let _ = deliver_collection_items(
+            &mut app,
+            1,
+            Ok(sample_page(&["c1", "c2", "c3", "c4"], 1, 2, None)),
+        );
+
+        // Infinite scroll loads page 2 and stops at last_page = 2.
+        let content_h = app.collections.metrics.total_content_height(4);
+        assert!(
+            app.update(Message::GalleryScrolled {
+                kind: GalleryKind::Collections,
+                offset_y: 220.0,
+                viewport_width: 900.0,
+                viewport_height: 580.0,
+                content_height: content_h,
+            })
+            .units()
+                > 0
+        );
+        let _ = deliver_collection_items(&mut app, 2, Ok(sample_page(&["c5", "c6"], 2, 2, None)));
+        assert!(!app.collections.controller.can_load_more());
+        let _ = app.view();
+
+        // Keyboard focus suppression and Enter -> Detail -> Back to Collections.
+        assert!(
+            app.update(Message::RuntimeGalleryKey(GridKey::Down))
+                .units()
+                > 0
+        );
+        assert_eq!(
+            app.update(Message::CollectionsKeyFocusChecked {
+                key: GridKey::Down,
+                input_focused: true,
+            })
+            .units(),
+            0
+        );
+        assert_eq!(app.collections.selected, None);
+
+        let _ = app.update(Message::CollectionsKeyFocusChecked {
+            key: GridKey::Down,
+            input_focused: false,
+        });
+        assert_eq!(app.collections.selected, Some(0));
+
+        assert!(
+            app.update(Message::CollectionsKeyFocusChecked {
+                key: GridKey::Activate,
+                input_focused: false,
+            })
+            .units()
+                > 0
+        );
+        assert_eq!(app.route, Route::Detail(WallpaperId::new("c1")));
+        let _ = app.view();
+
+        let _ = app.update(Message::DetailBack);
+        assert_eq!(app.route, Route::Collections);
+        assert_eq!(app.collections.controller.items().len(), 6);
+        assert_eq!(app.collections.selected, Some(0));
+    }
+
+    #[test]
+    fn collections_and_detail_handoffs_open_validated_urls_and_report_errors() {
+        let paths = TestPaths::new();
+        let mut app = test_app(&paths);
+        static HANDOFF_URLS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        HANDOFF_URLS.lock().unwrap().clear();
+        app.launch_browser = |url| {
+            wallora_windows::validate_wallhaven_handoff_url(url)?;
+            HANDOFF_URLS.lock().unwrap().push(url.to_string());
+            Ok(())
+        };
+
+        assert_eq!(
+            CollectionUnsupportedAction::FavoriteToggle.label(),
+            "Open on wallhaven.cc"
+        );
+        assert_eq!(
+            CollectionUnsupportedAction::ManageCollections.label(),
+            "Open on wallhaven.cc"
+        );
+
+        // Guest manage handoff points to wallhaven.cc root; account points to /user/{name}/favorites.
+        let _ = app.update(Message::Navigate(Route::Collections));
+        let _ = app.update(Message::CollectionsOpenManageHandOff);
+        sign_in_with_collections(
+            &mut app,
+            "alice",
+            UsernameVerification::Verified,
+            Vec::new(),
+        );
+        let _ = app.update(Message::CollectionsOpenManageHandOff);
+
+        // Detail favorite handoff opens https://wallhaven.cc/w/{id}.
+        let _ = app.update(Message::Navigate(Route::Home));
+        let _ = deliver_page(
+            &mut app,
+            GalleryKind::Home,
+            1,
+            Ok(sample_page(&["fav9"], 1, 1, None)),
+        );
+        let _ = app.update(Message::GallerySelectTile {
+            kind: GalleryKind::Home,
+            index: 0,
+        });
+        let _ = app.update(Message::DetailOpenFavoriteHandOff);
+        assert_eq!(
+            *HANDOFF_URLS.lock().unwrap(),
+            vec![
+                "https://wallhaven.cc/".to_string(),
+                "https://wallhaven.cc/user/alice/favorites".to_string(),
+                "https://wallhaven.cc/w/fav9".to_string(),
+            ]
+        );
+
+        app.launch_browser = |_| Err("browser unavailable".into());
+        let _ = app.update(Message::DetailOpenFavoriteHandOff);
+        assert!(
+            app.session
+                .notice()
+                .unwrap()
+                .message
+                .contains("browser unavailable")
+        );
+    }
+
+    #[test]
+    fn collections_scope_transitions_and_refresh_downgrade_cancel_and_clear_state() {
+        let paths = TestPaths::new();
+        let mut app = test_app(&paths);
+        let _ = app.update(Message::Navigate(Route::Collections));
+
+        sign_in_with_collections(
+            &mut app,
+            "alice",
+            UsernameVerification::Verified,
+            vec![CollectionSummary {
+                id: 5,
+                label: "Secret".into(),
+                views: 0,
+                public: false,
+                count: 2,
+            }],
+        );
+        let alice_id = app.session.active_account().unwrap().id.clone();
+
+        // Populate loaded items, loaded thumb, in-flight thumb, in-flight page 2, and list lookup.
+        let _ = app.update(Message::CollectionsSelectOwn(5));
+        let _ = deliver_collection_items(&mut app, 1, Ok(sample_page(&["p1", "p2"], 1, 2, None)));
+        let _ = deliver_thumb(
+            &mut app,
+            GalleryKind::Collections,
+            "p1",
+            Ok(sample_loaded_thumb(false)),
+        );
+        let (p2_cancel, p2_handle) = match app
+            .collections
+            .thumbnails
+            .get(&WallpaperId::new("p2"))
+            .unwrap()
+        {
+            ThumbnailEntry::InFlight { cancel, handle, .. } => (cancel.clone(), handle.clone()),
+            _ => panic!("p2 should be in flight"),
+        };
+        let next_req = app.collections.controller.request_next_page().unwrap();
+        let _ = app.spawn_collection_items_request(next_req);
+        let items_handle = app
+            .collections
+            .page_in_flight
+            .as_ref()
+            .unwrap()
+            .handle
+            .clone();
+        let _ = app.update(Message::CollectionsUsernameChanged("bob".into()));
+        let _ = app.update(Message::CollectionsLoadUser);
+        let list_handle = app
+            .collections
+            .list_in_flight
+            .as_ref()
+            .unwrap()
+            .handle
+            .clone();
+
+        // SwitchToGuest cancels everything, clears private collection state, and keeps Alice saved.
+        let _ = app.update(Message::SwitchToGuest);
+        assert!(p2_cancel.is_cancelled());
+        assert!(p2_handle.is_aborted());
+        assert!(items_handle.is_aborted());
+        assert!(list_handle.is_aborted());
+        assert!(app.collections.thumbnails.is_empty());
+        assert!(app.collections.controller.items().is_empty());
+        assert!(app.collections.controller.selected_collection().is_none());
+        assert!(app.collections_username_input.is_empty());
+        assert_eq!(app.session.scope().kind, SessionKind::Guest);
+
+        // SwitchAccount to saved Alice -> verify -> load items -> downgrade verification clears items.
+        assert!(app.update(Message::SwitchAccount(alice_id)).units() > 0);
+        let refresh_op = app.refresh_in_flight.as_ref().unwrap().id;
+        let _ = app.update(Message::AccountRefreshFinished {
+            op_id: refresh_op,
+            payload: AccountRefreshPayload {
+                request_scope: app.session.scope(),
+                user_settings: Ok(sample_settings()),
+                own_collections: Ok(vec![CollectionSummary {
+                    id: 5,
+                    label: "Secret".into(),
+                    views: 0,
+                    public: false,
+                    count: 2,
+                }]),
+                identity_outcome: Some(IdentityCheckOutcome::Verified),
+            },
+        });
+        let _ = app.update(Message::CollectionsSelectOwn(5));
+        let _ = deliver_collection_items(&mut app, 1, Ok(sample_page(&["a1"], 1, 1, None)));
+        assert_eq!(app.collections.controller.items().len(), 1);
+
+        let _ = app.update(Message::RefreshAccount { reverify: true });
+        let downgrade_op = app.refresh_in_flight.as_ref().unwrap().id;
+        let _ = app.update(Message::AccountRefreshFinished {
+            op_id: downgrade_op,
+            payload: AccountRefreshPayload {
+                request_scope: app.session.scope(),
+                user_settings: Ok(sample_settings()),
+                own_collections: Ok(vec![CollectionSummary {
+                    id: 5,
+                    label: "Secret".into(),
+                    views: 0,
+                    public: false,
+                    count: 2,
+                }]),
+                identity_outcome: Some(IdentityCheckOutcome::UnverifiablePrivate),
+            },
+        });
+        assert!(app.collections.controller.items().is_empty());
+        assert!(app.collections.controller.selected_collection().is_none());
+        assert_eq!(
+            app.collections.controller.items_blocked(),
+            Some(OwnItemsBlockedReason::Unverified(
+                UsernameVerification::UnverifiablePrivate
+            ))
+        );
+
+        // SignOut clears active session and collection state; 401 revocation clears private items.
+        let _ = app.update(Message::SignOut);
+        assert_eq!(app.session.scope().kind, SessionKind::Guest);
+        assert!(app.collections.controller.own_collections().is_none());
+
+        sign_in_with_collections(
+            &mut app,
+            "bob",
+            UsernameVerification::Verified,
+            vec![CollectionSummary {
+                id: 9,
+                label: "BobPrivate".into(),
+                views: 0,
+                public: false,
+                count: 1,
+            }],
+        );
+        let _ = app.update(Message::CollectionsSelectOwn(9));
+        let _ = deliver_collection_items(&mut app, 1, Ok(sample_page(&["b1"], 1, 2, None)));
+        let req = app.collections.controller.request_next_page().unwrap();
+        let _ = app.spawn_collection_items_request(req);
+        let _ = deliver_collection_items(&mut app, 2, Err(ProviderError::Unauthorized));
+        assert_eq!(app.session.scope().kind, SessionKind::Guest);
+        assert!(app.collections.controller.items().is_empty());
+        assert!(app.collections.controller.selected_collection().is_none());
     }
 }

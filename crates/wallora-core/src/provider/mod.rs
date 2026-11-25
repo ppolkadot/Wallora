@@ -9,8 +9,8 @@ pub mod pacer;
 use std::future::Future;
 
 use crate::domain::{
-    CollectionSummary, SearchPage, SearchQuery, SecretString, SessionScope, UserSettings,
-    Wallpaper, WallpaperId,
+    CollectionSummary, PurityMask, SearchPage, SearchQuery, SecretString, SessionScope,
+    UserSettings, Wallpaper, WallpaperId,
 };
 
 pub use client::{
@@ -25,7 +25,8 @@ pub use pacer::ApiPacer;
 ///
 /// Task 2 exposes `search` and `wallpaper`; Task 3 adds `user_settings`, `own_collections`,
 /// unkeyed public collection lookup for username verification, and candidate-key sign-in probes
-/// routed through the same pacer and origin policy.
+/// routed through the same pacer and origin policy. Task 6a adds `collections` and
+/// `collection_items`.
 pub trait Provider: Send + Sync + 'static {
     fn search(
         &self,
@@ -71,4 +72,23 @@ pub trait Provider: Send + Sync + 'static {
         &self,
         api_key: SecretString,
     ) -> impl Future<Output = Result<Vec<CollectionSummary>, ProviderError>> + Send + 'static;
+
+    /// Lists a user's collections (`GET /api/v1/collections/{username}`), carrying the active
+    /// session scope so guest requests stay unkeyed and account requests authenticate.
+    fn collections(
+        &self,
+        username: String,
+        scope: SessionScope,
+    ) -> impl Future<Output = Result<Vec<CollectionSummary>, ProviderError>> + Send + 'static;
+
+    /// Fetches one page of a collection's wallpapers
+    /// (`GET /api/v1/collections/{username}/{id}`), with optional `purity` and `page` query params.
+    fn collection_items(
+        &self,
+        username: String,
+        collection_id: u64,
+        purity: Option<PurityMask>,
+        page: Option<u32>,
+        scope: SessionScope,
+    ) -> impl Future<Output = Result<SearchPage, ProviderError>> + Send + 'static;
 }

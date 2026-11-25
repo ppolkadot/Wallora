@@ -103,6 +103,22 @@ pub fn pill_button_style(active: bool) -> impl Fn(&Theme, button::Status) -> but
     }
 }
 
+pub fn disabled_button_style() -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |theme, status| {
+        let base = button::secondary(theme, status);
+        button::Style {
+            background: Some(Background::Color(palette::CANVAS)),
+            text_color: palette::TEXT_SECONDARY,
+            border: Border {
+                radius: 6.0.into(),
+                width: 1.0,
+                color: palette::MUTED,
+            },
+            ..base
+        }
+    }
+}
+
 pub fn card_style(border_color: Color, border_width: f32) -> impl Fn(&Theme) -> container::Style {
     move |_theme| container::Style {
         background: Some(Background::Color(surface_color())),
