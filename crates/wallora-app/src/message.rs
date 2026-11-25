@@ -1,6 +1,7 @@
 use std::fmt;
 
 use wallora_core::domain::AccountId;
+use wallora_core::services::cache::{CacheError, CacheStats};
 use wallora_core::services::{AccountRefreshPayload, SignInError, SignInProbe};
 
 /// Top-level navigation destinations in the shell.
@@ -67,6 +68,15 @@ pub enum Message {
     ProxyUrlChanged(String),
     ApplyProxy,
     OpenUpstreamSettings,
+    CacheCapInputChanged(String),
+    ApplyCacheCap,
+    CacheCapApplied {
+        op_id: u64,
+        cap_bytes: u64,
+        result: Result<(), CacheError>,
+    },
+    RefreshCacheStats,
+    CacheStatsLoaded(Result<CacheStats, CacheError>),
 }
 
 impl fmt::Debug for Message {
@@ -99,6 +109,24 @@ impl fmt::Debug for Message {
             Self::ProxyUrlChanged(url) => f.debug_tuple("ProxyUrlChanged").field(url).finish(),
             Self::ApplyProxy => f.write_str("ApplyProxy"),
             Self::OpenUpstreamSettings => f.write_str("OpenUpstreamSettings"),
+            Self::CacheCapInputChanged(input) => {
+                f.debug_tuple("CacheCapInputChanged").field(input).finish()
+            }
+            Self::ApplyCacheCap => f.write_str("ApplyCacheCap"),
+            Self::CacheCapApplied {
+                op_id,
+                cap_bytes,
+                result,
+            } => f
+                .debug_struct("CacheCapApplied")
+                .field("op_id", op_id)
+                .field("cap_bytes", cap_bytes)
+                .field("result", result)
+                .finish(),
+            Self::RefreshCacheStats => f.write_str("RefreshCacheStats"),
+            Self::CacheStatsLoaded(result) => {
+                f.debug_tuple("CacheStatsLoaded").field(result).finish()
+            }
         }
     }
 }

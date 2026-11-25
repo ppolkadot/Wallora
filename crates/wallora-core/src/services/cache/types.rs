@@ -9,10 +9,8 @@ use tokio::sync::{mpsc, watch};
 use crate::domain::{AccountId, SessionKind, SessionScope};
 use crate::provider::ImageClass;
 
-/// Default thumbnail/preview cache capacity: 2 GB.
-pub const DEFAULT_CACHE_CAP_BYTES: u64 = 2_000_000_000;
-/// Hard maximum thumbnail/preview cache capacity: 10,000,000,000 bytes (10 GB).
-pub const HARD_MAX_CACHE_CAP_BYTES: u64 = 10_000_000_000;
+pub use crate::domain::{DEFAULT_CACHE_CAP_BYTES, HARD_MAX_CACHE_CAP_BYTES};
+
 /// Watchdog threshold after which a still-live cancelled writer is marked overdue.
 pub const WATCHDOG_TIMEOUT: Duration = Duration::from_secs(10);
 

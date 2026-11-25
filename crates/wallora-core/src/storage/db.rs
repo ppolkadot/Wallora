@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::domain::{
-    AccountId, AccountRecord, CollectionSummary, LocalPreferences, ProxyConfig, UserSettings,
-    UsernameVerification,
+    AccountId, AccountRecord, CollectionSummary, DEFAULT_CACHE_CAP_BYTES, LocalPreferences,
+    ProxyConfig, UserSettings, UsernameVerification, validate_cache_cap_preference,
 };
 use crate::storage::migrations;
 
@@ -455,16 +455,16 @@ impl SessionStorage for SqliteStore {
 
     fn load_local_preferences(&self) -> Result<LocalPreferences, StorageError> {
         let conn = self.lock_conn()?;
-        let row: Option<(String, Option<String>)> = conn
+        let row: Option<(String, Option<String>, Option<i64>)> = conn
             .query_row(
-                "SELECT proxy_mode, proxy_url FROM local_preferences WHERE id = 1",
+                "SELECT proxy_mode, proxy_url, cache_cap_bytes FROM local_preferences WHERE id = 1",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()
             .map_err(|err| StorageError::Query(err.to_string()))?;
 
-        let Some((mode, url)) = row else {
+        let Some((mode, url, cap)) = row else {
             return Ok(LocalPreferences::default());
         };
 
@@ -479,7 +479,16 @@ impl SessionStorage for SqliteStore {
             },
             _ => ProxyConfig::System,
         };
-        Ok(LocalPreferences { proxy })
+        // A missing, non-positive, or out-of-range stored cap falls back to the default instead of
+        // failing startup or silently exceeding the 10 GB hard maximum.
+        let cache_cap_bytes = cap
+            .and_then(|raw| u64::try_from(raw).ok())
+            .and_then(|raw| validate_cache_cap_preference(raw).ok())
+            .unwrap_or(DEFAULT_CACHE_CAP_BYTES);
+        Ok(LocalPreferences {
+            proxy,
+            cache_cap_bytes,
+        })
     }
 
     fn save_local_preferences(&self, prefs: &LocalPreferences) -> Result<(), StorageError> {
@@ -487,6 +496,10 @@ impl SessionStorage for SqliteStore {
             .proxy
             .normalized()
             .map_err(|err| StorageError::Serialization(err.to_string()))?;
+        let cache_cap = validate_cache_cap_preference(prefs.cache_cap_bytes)
+            .map_err(|err| StorageError::Serialization(err.to_string()))?;
+        let cache_cap =
+            i64::try_from(cache_cap).map_err(|err| StorageError::Serialization(err.to_string()))?;
         let (mode, url) = match &normalized {
             ProxyConfig::System => ("system", None),
             ProxyConfig::Direct => ("direct", None),
@@ -494,12 +507,13 @@ impl SessionStorage for SqliteStore {
         };
         let conn = self.lock_conn()?;
         conn.execute(
-            "INSERT INTO local_preferences (id, proxy_mode, proxy_url)
-             VALUES (1, ?1, ?2)
+            "INSERT INTO local_preferences (id, proxy_mode, proxy_url, cache_cap_bytes)
+             VALUES (1, ?1, ?2, ?3)
              ON CONFLICT(id) DO UPDATE SET
                  proxy_mode = excluded.proxy_mode,
-                 proxy_url = excluded.proxy_url",
-            params![mode, url],
+                 proxy_url = excluded.proxy_url,
+                 cache_cap_bytes = excluded.cache_cap_bytes",
+            params![mode, url, cache_cap],
         )
         .map_err(|err| StorageError::Query(err.to_string()))?;
         Ok(())
@@ -580,6 +594,7 @@ mod tests {
 
         let prefs = LocalPreferences {
             proxy: ProxyConfig::Manual("http://127.0.0.1:8888/".to_string()),
+            cache_cap_bytes: 3_500_000_000,
         };
         store.save_local_preferences(&prefs).expect("save prefs");
         assert_eq!(store.load_local_preferences().unwrap(), prefs);
@@ -620,5 +635,116 @@ mod tests {
             .expect("remove acct2");
         assert!(store.active_account().unwrap().is_none());
         assert_eq!(store.load_local_preferences().unwrap(), prefs);
+    }
+
+    #[test]
+    fn cache_cap_round_trips_and_rejects_invalid_values_without_touching_stored_prefs() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        assert_eq!(
+            store.load_local_preferences().unwrap().cache_cap_bytes,
+            DEFAULT_CACHE_CAP_BYTES
+        );
+
+        let mut prefs = LocalPreferences {
+            proxy: ProxyConfig::Direct,
+            cache_cap_bytes: 10_000_000_000,
+        };
+        store.save_local_preferences(&prefs).unwrap();
+        assert_eq!(store.load_local_preferences().unwrap(), prefs);
+
+        for invalid in [0, 10_000_000_001, u64::MAX] {
+            let rejected = LocalPreferences {
+                cache_cap_bytes: invalid,
+                ..prefs.clone()
+            };
+            assert!(store.save_local_preferences(&rejected).is_err());
+            assert_eq!(store.load_local_preferences().unwrap(), prefs);
+        }
+
+        prefs.cache_cap_bytes = 1;
+        store.save_local_preferences(&prefs).unwrap();
+        assert_eq!(store.load_local_preferences().unwrap().cache_cap_bytes, 1);
+    }
+
+    #[test]
+    fn out_of_range_stored_cap_falls_back_to_the_default_and_keeps_proxy() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        for stored in [-5i64, 0, 10_000_000_001, i64::MAX] {
+            store
+                .lock_conn()
+                .unwrap()
+                .execute(
+                    "INSERT INTO local_preferences (id, proxy_mode, proxy_url, cache_cap_bytes)
+                     VALUES (1, 'direct', NULL, ?1)
+                     ON CONFLICT(id) DO UPDATE SET cache_cap_bytes = excluded.cache_cap_bytes",
+                    [stored],
+                )
+                .unwrap();
+            let loaded = store.load_local_preferences().unwrap();
+            assert_eq!(loaded.cache_cap_bytes, DEFAULT_CACHE_CAP_BYTES, "{stored}");
+            assert_eq!(loaded.proxy, ProxyConfig::Direct);
+        }
+    }
+
+    #[test]
+    fn file_backed_v2_database_upgrades_in_place_preserving_proxy_preference() {
+        let dir = std::env::temp_dir().join(format!("wallora-db-v2-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wallora.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE accounts (
+                     account_id TEXT PRIMARY KEY NOT NULL, username TEXT NOT NULL,
+                     verification_state TEXT NOT NULL,
+                     is_active INTEGER NOT NULL DEFAULT 0 CHECK (is_active IN (0, 1)),
+                     created_at_unix INTEGER NOT NULL, updated_at_unix INTEGER NOT NULL);
+                 CREATE TABLE account_cache (
+                     account_id TEXT PRIMARY KEY NOT NULL
+                         REFERENCES accounts(account_id) ON DELETE CASCADE,
+                     user_settings_json TEXT, own_collections_json TEXT,
+                     updated_at_unix INTEGER NOT NULL);
+                 CREATE TABLE local_preferences (
+                     id INTEGER PRIMARY KEY CHECK (id = 1), proxy_mode TEXT NOT NULL,
+                     proxy_url TEXT);
+                 CREATE TABLE pending_credential_cleanup (account_id TEXT PRIMARY KEY NOT NULL);
+                 INSERT INTO local_preferences VALUES (1, 'manual', 'http://127.0.0.1:9000/');
+                 PRAGMA user_version = 2;",
+            )
+            .unwrap();
+        }
+        {
+            let store = SqliteStore::open(&path).unwrap();
+            let loaded = store.load_local_preferences().unwrap();
+            assert_eq!(
+                loaded.proxy,
+                ProxyConfig::Manual("http://127.0.0.1:9000/".to_string())
+            );
+            assert_eq!(loaded.cache_cap_bytes, DEFAULT_CACHE_CAP_BYTES);
+            store
+                .save_local_preferences(&LocalPreferences {
+                    proxy: loaded.proxy.clone(),
+                    cache_cap_bytes: 1_000_000_000,
+                })
+                .unwrap();
+        }
+        {
+            let store = SqliteStore::open(&path).unwrap();
+            let loaded = store.load_local_preferences().unwrap();
+            assert_eq!(loaded.cache_cap_bytes, 1_000_000_000);
+            assert_eq!(
+                loaded.proxy,
+                ProxyConfig::Manual("http://127.0.0.1:9000/".to_string())
+            );
+        }
+        for name in [
+            "wallora.db",
+            "wallora.db-wal",
+            "wallora.db-shm",
+            "wallora.session.lock",
+        ] {
+            let _ = std::fs::remove_file(dir.join(name));
+        }
+        let _ = std::fs::remove_dir(&dir);
     }
 }

@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod cache_host;
 mod message;
 mod theme;
 mod views;
@@ -16,6 +17,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 use wallora_core::storage::AppPaths;
 
 use crate::app::WalloraApp;
+use crate::cache_host::CacheHost;
 
 fn init_tracing(logs_dir: &Path) -> WorkerGuard {
     let file_appender = tracing_appender::rolling::daily(logs_dir, "wallora.log");
@@ -97,13 +99,30 @@ fn main() -> iced::Result {
         "starting Wallora shell"
     );
 
-    iced::application(
-        move || WalloraApp::boot(paths.clone()),
+    // The image cache actor lives on its own runtime so it outlives individual Iced tasks. A
+    // failure to start it is not fatal: the app runs uncached with a warning notice.
+    let cache_host = match CacheHost::new() {
+        Ok(host) => Some(host),
+        Err(err) => {
+            tracing::error!(reason = %err, "could not start the image cache runtime");
+            None
+        }
+    };
+
+    let boot_host = cache_host.clone();
+    let result = iced::application(
+        move || WalloraApp::boot(paths.clone(), boot_host.clone()),
         WalloraApp::update,
         WalloraApp::view,
     )
     .title(WalloraApp::title)
     .theme(WalloraApp::theme)
     .window_size((1280.0, 800.0))
-    .run()
+    .run();
+
+    // Orderly cache shutdown: stop admissions, join writers, then release the root lock.
+    if let Some(host) = cache_host {
+        host.shutdown();
+    }
+    result
 }

@@ -763,6 +763,7 @@ async fn logout_and_account_switch_purge_caches_bump_generation_and_keep_local_p
     // Save a local proxy preference (must stay separate from upstream settings and survive logout/switch).
     let local_prefs = LocalPreferences {
         proxy: ProxyConfig::Direct,
+        ..LocalPreferences::default()
     };
     session
         .update_proxy(&client, local_prefs.proxy.clone())
@@ -1848,6 +1849,7 @@ async fn blocked_then_failed_proxy_write_never_exposes_rejected_transport() {
     inner
         .save_local_preferences(&LocalPreferences {
             proxy: ProxyConfig::Direct,
+            ..LocalPreferences::default()
         })
         .unwrap();
     db.sql()

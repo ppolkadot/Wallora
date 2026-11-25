@@ -1,6 +1,8 @@
 use iced::widget::{button, column, container, row, scrollable, text, text_input};
 use iced::{Alignment, Background, Border, Element, Length};
-use wallora_core::services::SessionManager;
+use wallora_core::domain::{CacheCapError, HARD_MAX_CACHE_CAP_BYTES};
+use wallora_core::services::cache::CacheStats;
+use wallora_core::services::{ImageGuard, SessionManager};
 use wallora_core::storage::AppPaths;
 
 use crate::message::{Message, ProxyModeChoice};
@@ -12,6 +14,92 @@ pub struct SettingsViewState<'a> {
     pub proxy_mode: ProxyModeChoice,
     pub proxy_url_input: &'a str,
     pub proxy_feedback: Option<&'a (bool, String)>,
+    pub cache_available: bool,
+    pub cache_cap_input: &'a str,
+    pub cache_cap_feedback: Option<&'a (bool, String)>,
+    pub cache_cap_busy: bool,
+    pub cache_stats: Option<&'a CacheStats>,
+    pub image_guard: &'a ImageGuard,
+}
+
+const BYTES_PER_GB: u64 = 1_000_000_000;
+const BYTES_PER_MB: u64 = 1_000_000;
+
+/// Parses a decimal gigabyte amount (for example `2`, `2.5`, `0.25 GB`) into bytes.
+///
+/// 1 GB is 1,000,000,000 bytes, so the 10 GB hard maximum is exactly `10`. Amounts too large for
+/// `u64` saturate so the caller reports them as exceeding the hard maximum.
+pub(crate) fn parse_cache_cap_gb(raw: &str) -> Result<u64, String> {
+    let trimmed = raw.trim();
+    let trimmed = trimmed
+        .strip_suffix("GB")
+        .or_else(|| trimmed.strip_suffix("gb"))
+        .or_else(|| trimmed.strip_suffix("Gb"))
+        .unwrap_or(trimmed)
+        .trim();
+    let invalid = || "Enter the cache size in GB, for example 2 or 2.5.".to_string();
+    if trimmed.is_empty() {
+        return Err(invalid());
+    }
+    let (whole, fraction) = match trimmed.split_once('.') {
+        Some((whole, fraction)) => (whole, fraction),
+        None => (trimmed, ""),
+    };
+    if (whole.is_empty() && fraction.is_empty())
+        || !whole.bytes().all(|b| b.is_ascii_digit())
+        || !fraction.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(invalid());
+    }
+    if fraction.len() > 9 {
+        return Err("Use at most 9 decimal places.".to_string());
+    }
+    let whole_gb = if whole.is_empty() {
+        0
+    } else {
+        whole.parse::<u64>().unwrap_or(u64::MAX)
+    };
+    let mut padded = fraction.to_string();
+    while padded.len() < 9 {
+        padded.push('0');
+    }
+    let fraction_bytes = padded.parse::<u64>().map_err(|_| invalid())?;
+    Ok(whole_gb
+        .saturating_mul(BYTES_PER_GB)
+        .saturating_add(fraction_bytes))
+}
+
+/// Formats a byte count as exact decimal GB for the cap input (`2000000000` -> `2`).
+pub(crate) fn format_cap_gb(bytes: u64) -> String {
+    let whole = bytes / BYTES_PER_GB;
+    let fraction = bytes % BYTES_PER_GB;
+    if fraction == 0 {
+        return whole.to_string();
+    }
+    let digits = format!("{fraction:09}");
+    format!("{whole}.{}", digits.trim_end_matches('0'))
+}
+
+/// Formats a byte count for status text (`1.50 GB`, `12.3 MB`, `512 B`).
+pub(crate) fn format_size(bytes: u64) -> String {
+    if bytes >= BYTES_PER_GB {
+        format!("{:.2} GB", bytes as f64 / BYTES_PER_GB as f64)
+    } else if bytes >= BYTES_PER_MB {
+        format!("{:.1} MB", bytes as f64 / BYTES_PER_MB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// User-facing text for a rejected cache cap request.
+pub(crate) fn describe_cache_cap_error(error: &CacheCapError) -> String {
+    match error {
+        CacheCapError::Zero => "The cache size must be greater than zero.".to_string(),
+        CacheCapError::ExceedsHardMax { .. } => format!(
+            "The cache size cannot exceed {} GB.",
+            format_cap_gb(HARD_MAX_CACHE_CAP_BYTES)
+        ),
+    }
 }
 
 pub fn view<'a>(state: SettingsViewState<'a>) -> Element<'a, Message> {
@@ -196,6 +284,91 @@ pub fn view<'a>(state: SettingsViewState<'a>) -> Element<'a, Message> {
         proxy_section = proxy_section.push(text(msg.clone()).size(13).color(color));
     }
 
+    let mut cache_section = column![
+        text("Image cache (thumbnails and previews)")
+            .size(18)
+            .color(palette::TEXT_PRIMARY),
+        text(format!(
+            "Lowering the size evicts the least recently used images. Hard maximum: {} GB. Applied wallpapers and saved downloads are never stored here.",
+            format_cap_gb(HARD_MAX_CACHE_CAP_BYTES)
+        ))
+        .size(13)
+        .color(palette::TEXT_SECONDARY),
+    ]
+    .spacing(8);
+
+    if state.cache_available {
+        match state.cache_stats {
+            Some(stats) => {
+                cache_section = cache_section.push(
+                    text(format!(
+                        "Using {} of {} ({} images, {} writing, {} awaiting deletion)",
+                        format_size(stats.total_charged_bytes),
+                        format_size(stats.cap_bytes),
+                        stats.entry_count,
+                        stats.live_reservations,
+                        stats.pending_deletes,
+                    ))
+                    .size(13)
+                    .color(palette::TEXT_SECONDARY),
+                );
+            }
+            None => {
+                cache_section = cache_section.push(
+                    text("Cache status is loading...")
+                        .size(13)
+                        .color(palette::MUTED),
+                );
+            }
+        }
+    } else {
+        cache_section = cache_section.push(
+            text("The image cache is unavailable in this window, so images are not cached. A saved size applies the next time the cache opens.")
+                .size(13)
+                .color(palette::WARNING),
+        );
+    }
+
+    let mut cap_input = text_input("2", state.cache_cap_input)
+        .on_input(Message::CacheCapInputChanged)
+        .padding(8)
+        .width(Length::Fixed(120.0));
+    let mut apply = button(text("Apply cache size").size(13)).padding([8, 14]);
+    if !state.cache_cap_busy {
+        cap_input = cap_input.on_submit(Message::ApplyCacheCap);
+        apply = apply.on_press(Message::ApplyCacheCap);
+    }
+    cache_section = cache_section.push(
+        row![
+            text("Cache size (GB)")
+                .size(13)
+                .color(palette::TEXT_PRIMARY),
+            cap_input,
+            apply,
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center),
+    );
+
+    if let Some((is_error, msg)) = state.cache_cap_feedback {
+        let color = if *is_error {
+            palette::DANGER
+        } else {
+            palette::SUCCESS
+        };
+        cache_section = cache_section.push(text(msg.clone()).size(13).color(color));
+    }
+
+    cache_section = cache_section.push(
+        text(format!(
+            "Decoder limits: {} concurrent decodes, {} MiB of decoded images in flight.",
+            state.image_guard.decode_concurrency(),
+            state.image_guard.decoded_bytes_budget() / (1024 * 1024)
+        ))
+        .size(12)
+        .color(palette::MUTED),
+    );
+
     let diagnostics_section = column![
         text("Application directories & diagnostics")
             .size(16)
@@ -238,6 +411,7 @@ pub fn view<'a>(state: SettingsViewState<'a>) -> Element<'a, Message> {
             text("Settings").size(28).color(palette::TEXT_PRIMARY),
             card(upstream_section),
             card(proxy_section),
+            card(cache_section),
             card(diagnostics_section),
         ]
         .spacing(14)
@@ -245,4 +419,53 @@ pub fn view<'a>(state: SettingsViewState<'a>) -> Element<'a, Message> {
     )
     .height(Length::Fill)
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_cap_parser_accepts_decimal_gigabytes() {
+        for (raw, bytes) in [
+            ("2", 2_000_000_000),
+            ("2.5", 2_500_000_000),
+            (" 0.25 GB ", 250_000_000),
+            (".5", 500_000_000),
+            ("10", 10_000_000_000),
+            ("10.000000000", 10_000_000_000),
+            ("0.000000001", 1),
+            ("3gb", 3_000_000_000),
+        ] {
+            assert_eq!(parse_cache_cap_gb(raw), Ok(bytes), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn cache_cap_parser_rejects_malformed_input_and_saturates_huge_values() {
+        for raw in [
+            "", "  ", "abc", "1.2.3", "-1", "+1", "1e3", ".", "2 GB GB", "1,5",
+        ] {
+            assert!(parse_cache_cap_gb(raw).is_err(), "{raw:?}");
+        }
+        assert!(parse_cache_cap_gb("1.0000000001").is_err());
+        assert_eq!(parse_cache_cap_gb("99999999999999999999999"), Ok(u64::MAX));
+        assert_eq!(
+            parse_cache_cap_gb("18446744073.709551616"),
+            Ok(u64::MAX),
+            "values just past u64 must saturate"
+        );
+    }
+
+    #[test]
+    fn cache_cap_formatting_round_trips_exactly() {
+        for bytes in [1, 1_500_000_000, 2_000_000_000, 10_000_000_000, 123_456_789] {
+            assert_eq!(parse_cache_cap_gb(&format_cap_gb(bytes)), Ok(bytes));
+        }
+        assert_eq!(format_cap_gb(2_000_000_000), "2");
+        assert_eq!(format_cap_gb(2_500_000_000), "2.5");
+        assert_eq!(format_size(512), "512 B");
+        assert_eq!(format_size(12_300_000), "12.3 MB");
+        assert_eq!(format_size(1_500_000_000), "1.50 GB");
+    }
 }

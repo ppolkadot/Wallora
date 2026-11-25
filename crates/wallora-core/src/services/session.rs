@@ -5,12 +5,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 use crate::domain::{
-    AccountId, AccountRecord, BrowseDefaults, CollectionSummary, CredentialStore,
+    AccountId, AccountRecord, BrowseDefaults, CacheCapError, CollectionSummary, CredentialStore,
     IdentityCheckOutcome, LocalPreferences, ProxyConfig, ProxyError, SecretString, SessionKind,
-    SessionScope, UserSettings, UsernameVerification, validate_username,
+    SessionScope, UserSettings, UsernameVerification, validate_cache_cap_preference,
+    validate_username,
 };
 use crate::provider::{Provider, ProviderError, WallhavenClient};
-use crate::services::cache::{CacheScopeTransition, NoopSessionCacheSink, SessionCacheSink};
+use crate::services::cache::{
+    CacheError, CacheScopeTransition, CacheStore, NoopSessionCacheSink, SessionCacheSink,
+};
 use crate::storage::{AccountCachedState, SessionStorage, StorageError};
 
 fn unix_now() -> i64 {
@@ -313,6 +316,18 @@ pub enum ProxyUpdateError {
     #[error("{0}")]
     Invalid(#[from] ProxyError),
     #[error("failed to save local proxy preference")]
+    Storage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum CacheCapUpdateError {
+    #[error("{0}")]
+    Invalid(#[from] CacheCapError),
+    /// The live cache actor refused the change (for example while reservations or undeleted
+    /// tombstones keep more bytes charged than the new cap allows).
+    #[error("{0}")]
+    Rejected(CacheError),
+    #[error("failed to save local cache preference")]
     Storage,
 }
 
@@ -947,6 +962,58 @@ impl SessionManager {
         Ok(self.scope.clone())
     }
 
+    /// Checks a requested image cache cap (nonzero, at most the 10 GB hard maximum) without
+    /// changing any state. The hard maximum is also enforced by the cache actor.
+    pub fn validate_cache_cap_request(cap_bytes: u64) -> Result<u64, CacheCapError> {
+        validate_cache_cap_preference(cap_bytes)
+    }
+
+    /// Validates and persists the image cache cap as a local preference, kept separate from
+    /// upstream account settings. Persistence failure leaves the in-memory preference unchanged.
+    ///
+    /// Callers that own a live [`CacheStore`] must apply the cap there first (the actor can
+    /// reject a lowered cap); see [`SessionManager::apply_cache_cap`].
+    pub fn commit_cache_cap(&mut self, cap_bytes: u64) -> Result<u64, CacheCapUpdateError> {
+        let cap_bytes = validate_cache_cap_preference(cap_bytes)?;
+        let updated_prefs = LocalPreferences {
+            cache_cap_bytes: cap_bytes,
+            ..self.local_preferences.clone()
+        };
+        self.storage
+            .save_local_preferences(&updated_prefs)
+            .map_err(|err| {
+                tracing::error!(reason = %err, "failed to persist cache cap preference");
+                CacheCapUpdateError::Storage
+            })?;
+        self.local_preferences = updated_prefs;
+        self.notice = Some(SessionNotice::info("Updated local image cache cap."));
+        Ok(cap_bytes)
+    }
+
+    /// Validates, applies the cap to the live cache actor, then persists it. If persistence
+    /// fails after the actor accepted the change, the previous cap is restored on the actor.
+    pub async fn apply_cache_cap(
+        &mut self,
+        cache: &CacheStore,
+        cap_bytes: u64,
+    ) -> Result<u64, CacheCapUpdateError> {
+        let cap_bytes = validate_cache_cap_preference(cap_bytes)?;
+        let previous = self.local_preferences.cache_cap_bytes;
+        cache
+            .set_cap(cap_bytes)
+            .await
+            .map_err(CacheCapUpdateError::Rejected)?;
+        match self.commit_cache_cap(cap_bytes) {
+            Ok(applied) => Ok(applied),
+            Err(err) => {
+                if let Err(rollback) = cache.set_cap(previous).await {
+                    tracing::warn!(%rollback, "could not restore the previous cache cap");
+                }
+                Err(err)
+            }
+        }
+    }
+
     /// Updates the local proxy preference on the single shared [`WallhavenClient`] and persists it
     /// separately from upstream account settings before publishing the transport.
     pub fn update_proxy(
@@ -958,6 +1025,7 @@ impl SessionManager {
         let applied = candidate.proxy().clone();
         let updated_prefs = LocalPreferences {
             proxy: applied.clone(),
+            ..self.local_preferences.clone()
         };
         self.storage
             .save_local_preferences(&updated_prefs)

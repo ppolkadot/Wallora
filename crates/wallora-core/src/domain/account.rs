@@ -16,6 +16,11 @@ use crate::domain::search::{
 /// External browser hand-off URL for editing upstream account settings (Option A gap).
 pub const WALLHAVEN_SETTINGS_URL: &str = "https://wallhaven.cc/settings";
 
+/// Default thumbnail/preview cache capacity: 2 GB.
+pub const DEFAULT_CACHE_CAP_BYTES: u64 = 2_000_000_000;
+/// Hard maximum thumbnail/preview cache capacity: 10,000,000,000 bytes (10 GB).
+pub const HARD_MAX_CACHE_CAP_BYTES: u64 = 10_000_000_000;
+
 /// Secret string wrapper that zeroizes its contents on drop and redacts Debug/Display.
 /// Does not implement `Serialize` so secrets cannot be accidentally serialized.
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
@@ -428,10 +433,49 @@ impl ProxyConfig {
     }
 }
 
+/// Rejection reasons for a user-requested image cache cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum CacheCapError {
+    #[error("the cache cap must be greater than zero")]
+    Zero,
+    #[error("cache cap {requested} bytes exceeds the {hard_max} byte hard maximum")]
+    ExceedsHardMax { requested: u64, hard_max: u64 },
+}
+
+/// Validates a user-requested image cache cap: nonzero and at most [`HARD_MAX_CACHE_CAP_BYTES`].
+pub fn validate_cache_cap_preference(cap_bytes: u64) -> Result<u64, CacheCapError> {
+    if cap_bytes == 0 {
+        return Err(CacheCapError::Zero);
+    }
+    if cap_bytes > HARD_MAX_CACHE_CAP_BYTES {
+        return Err(CacheCapError::ExceedsHardMax {
+            requested: cap_bytes,
+            hard_max: HARD_MAX_CACHE_CAP_BYTES,
+        });
+    }
+    Ok(cap_bytes)
+}
+
+fn default_cache_cap_bytes() -> u64 {
+    DEFAULT_CACHE_CAP_BYTES
+}
+
 /// Local-only application preferences persisted independently of accounts and upstream settings.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalPreferences {
     pub proxy: ProxyConfig,
+    /// Thumbnail/preview cache cap in bytes; defaults to 2 GB, at most 10 GB.
+    #[serde(default = "default_cache_cap_bytes")]
+    pub cache_cap_bytes: u64,
+}
+
+impl Default for LocalPreferences {
+    fn default() -> Self {
+        Self {
+            proxy: ProxyConfig::default(),
+            cache_cap_bytes: DEFAULT_CACHE_CAP_BYTES,
+        }
+    }
 }
 
 /// Whether a request or cache entry belongs to guest browsing or a signed-in account.
@@ -563,6 +607,34 @@ mod tests {
             ProxyConfig::validate_manual_url("http://127.0.0.1:8080/?a=1"),
             Err(ProxyError::DisallowedQueryOrFragment)
         );
+    }
+
+    #[test]
+    fn cache_cap_preference_validation_enforces_bounds() {
+        assert_eq!(validate_cache_cap_preference(1), Ok(1));
+        assert_eq!(
+            validate_cache_cap_preference(HARD_MAX_CACHE_CAP_BYTES),
+            Ok(HARD_MAX_CACHE_CAP_BYTES)
+        );
+        assert_eq!(validate_cache_cap_preference(0), Err(CacheCapError::Zero));
+        assert_eq!(
+            validate_cache_cap_preference(HARD_MAX_CACHE_CAP_BYTES + 1),
+            Err(CacheCapError::ExceedsHardMax {
+                requested: HARD_MAX_CACHE_CAP_BYTES + 1,
+                hard_max: HARD_MAX_CACHE_CAP_BYTES,
+            })
+        );
+        assert!(validate_cache_cap_preference(u64::MAX).is_err());
+    }
+
+    #[test]
+    fn local_preferences_default_and_serde_default_use_two_gb_cap() {
+        assert_eq!(
+            LocalPreferences::default().cache_cap_bytes,
+            DEFAULT_CACHE_CAP_BYTES
+        );
+        let decoded: LocalPreferences = serde_json::from_str(r#"{"proxy":"System"}"#).unwrap();
+        assert_eq!(decoded.cache_cap_bytes, DEFAULT_CACHE_CAP_BYTES);
     }
 
     #[test]

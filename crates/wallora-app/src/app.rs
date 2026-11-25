@@ -4,19 +4,27 @@ use iced::task::Handle;
 use iced::widget::{button, column, container, row, text};
 use iced::{Alignment, Background, Border, Element, Length, Task, Theme};
 use wallora_core::domain::{
-    CredentialStore, ProxyConfig, SecretString, SessionScope, WALLHAVEN_SETTINGS_URL,
+    CacheCapError, CredentialStore, DEFAULT_CACHE_CAP_BYTES, HARD_MAX_CACHE_CAP_BYTES, ProxyConfig,
+    SecretString, SessionScope, WALLHAVEN_SETTINGS_URL,
 };
 use wallora_core::provider::{WallhavenClient, WallhavenClientConfig};
+use wallora_core::services::cache::{
+    CacheConfig, CacheError, CacheStats, CacheStore, NoopSessionCacheSink, SessionCacheSink,
+};
 use wallora_core::services::{
-    NoticeLevel, SessionManager, SessionNotice, SignInCommitOutcome, SignInError,
+    ImageGuard, NoticeLevel, SessionManager, SessionNotice, SignInCommitOutcome, SignInError,
     fetch_account_refresh, probe_sign_in,
 };
 use wallora_core::storage::{AppPaths, SessionStorage, SqliteStore, StorageError};
 use wallora_windows::WindowsCredentialStore;
 
+use crate::cache_host::CacheHost;
 use crate::message::{Message, ProxyModeChoice, Route};
 use crate::theme::{palette, surface_color, wallora_theme};
 use crate::views;
+use crate::views::settings::{
+    describe_cache_cap_error, format_cap_gb, format_size, parse_cache_cap_gb,
+};
 
 struct InFlight {
     id: u64,
@@ -37,24 +45,39 @@ pub struct WalloraApp {
     proxy_mode: ProxyModeChoice,
     proxy_url_input: String,
     proxy_feedback: Option<(bool, String)>,
+    cache: Option<CacheStore>,
+    image_guard: ImageGuard,
+    cache_cap_input: String,
+    cache_cap_feedback: Option<(bool, String)>,
+    cache_cap_in_flight: Option<u64>,
+    cache_stats: Option<CacheStats>,
     launch_browser: fn(&str) -> Result<(), String>,
 }
 
+fn cache_open_warning(error: &CacheError) -> &'static str {
+    match error {
+        CacheError::Locked => {
+            "Another Wallora window is using the image cache, so images will not be cached in this window."
+        }
+        _ => "The image cache could not be opened, so images will not be cached in this window.",
+    }
+}
+
 impl WalloraApp {
-    pub fn boot(paths: AppPaths) -> (Self, Task<Message>) {
-        let mut startup_warning = None;
+    pub fn boot(paths: AppPaths, cache_host: Option<Arc<CacheHost>>) -> (Self, Task<Message>) {
+        let mut startup_warnings: Vec<&'static str> = Vec::new();
         let storage: Arc<dyn SessionStorage> = match SqliteStore::open(&paths.db_path()) {
             Ok(db) => Arc::new(db),
             Err(err) => {
                 tracing::error!(reason = %err, "failed to open SQLite database; falling back to in-memory storage");
-                startup_warning = Some(SessionNotice::warning(match err {
+                startup_warnings.push(match err {
                     StorageError::SessionOwned => {
                         "Another Wallora window owns local account storage. Close it and restart this window to sign in."
                     }
                     _ => {
                         "Could not open local SQLite storage. Sign-in is unavailable in this window."
                     }
-                }));
+                });
                 Arc::new(
                     SqliteStore::open_in_memory()
                         .expect("in-memory SQLite fallback must open cleanly"),
@@ -63,11 +86,46 @@ impl WalloraApp {
         };
 
         let credentials: Arc<dyn CredentialStore> = Arc::new(WindowsCredentialStore::new());
-        let mut session = SessionManager::restore(storage, Arc::clone(&credentials));
-        if session.notice().is_none()
-            && let Some(warning) = startup_warning
-        {
-            session.set_notice(Some(warning));
+
+        // Open the cache with the persisted cap before restoring the session so the restore can
+        // notify it. The cache starts at generation 0 because a restored session is generation 1
+        // and the cache actor ignores scope transitions that do not advance the generation.
+        let cache_cap = storage
+            .load_local_preferences()
+            .map(|prefs| prefs.cache_cap_bytes)
+            .unwrap_or_else(|err| {
+                tracing::warn!(reason = %err, "could not read the cache cap preference; using the default");
+                DEFAULT_CACHE_CAP_BYTES
+            });
+        let cache = match cache_host.as_deref() {
+            Some(host) => {
+                let opened = CacheConfig::new(paths.cache_dir.clone(), SessionScope::guest(0))
+                    .with_cap_bytes(cache_cap)
+                    .and_then(|config| host.open(config));
+                match opened {
+                    Ok(store) => Some(store),
+                    Err(err) => {
+                        tracing::warn!(reason = %err, "image cache unavailable; continuing without it");
+                        startup_warnings.push(cache_open_warning(&err));
+                        None
+                    }
+                }
+            }
+            None => {
+                startup_warnings.push(
+                    "The image cache could not be started, so images will not be cached in this window.",
+                );
+                None
+            }
+        };
+        let cache_sink: Arc<dyn SessionCacheSink> = match &cache {
+            Some(store) => Arc::new(store.clone()),
+            None => Arc::new(NoopSessionCacheSink),
+        };
+        let mut session =
+            SessionManager::restore_with_cache(storage, Arc::clone(&credentials), cache_sink);
+        if session.notice().is_none() && !startup_warnings.is_empty() {
+            session.set_notice(Some(SessionNotice::warning(startup_warnings.join(" "))));
         }
 
         let initial_proxy = session.local_preferences().proxy.clone();
@@ -83,14 +141,16 @@ impl WalloraApp {
             }
         };
 
-        Self::from_runtime(paths, session, client)
+        Self::from_runtime(paths, session, client, cache)
     }
 
-    /// Constructs the app with injected session/client components (used by boot and unit tests).
+    /// Constructs the app with injected session/client/cache components (used by boot and unit
+    /// tests). The `session` must already be wired to `cache` through `restore_with_cache`.
     pub fn from_runtime(
         paths: AppPaths,
         session: SessionManager,
         client: Arc<WallhavenClient>,
+        cache: Option<CacheStore>,
     ) -> (Self, Task<Message>) {
         let (proxy_mode, proxy_url_input) = match &session.local_preferences().proxy {
             ProxyConfig::System => (ProxyModeChoice::System, String::new()),
@@ -98,6 +158,7 @@ impl WalloraApp {
             ProxyConfig::Manual(url) => (ProxyModeChoice::Manual, url.clone()),
         };
 
+        let cache_cap_input = format_cap_gb(session.local_preferences().cache_cap_bytes);
         let mut app = Self {
             route: Route::Home,
             paths,
@@ -111,6 +172,12 @@ impl WalloraApp {
             proxy_mode,
             proxy_url_input,
             proxy_feedback: None,
+            cache,
+            image_guard: ImageGuard::new(),
+            cache_cap_input,
+            cache_cap_feedback: None,
+            cache_cap_in_flight: None,
+            cache_stats: None,
             launch_browser: wallora_windows::open_wallhaven_in_browser,
         };
 
@@ -127,6 +194,19 @@ impl WalloraApp {
 
     pub fn theme(&self) -> Theme {
         wallora_theme()
+    }
+
+    fn request_cache_stats(&self) -> Task<Message> {
+        match &self.cache {
+            Some(cache) => {
+                let cache = cache.clone();
+                Task::perform(
+                    async move { cache.stats().await },
+                    Message::CacheStatsLoaded,
+                )
+            }
+            None => Task::none(),
+        }
     }
 
     fn allocate_op_id(&mut self) -> u64 {
@@ -187,6 +267,9 @@ impl WalloraApp {
                 if self.route != route {
                     tracing::info!(?route, "navigated view");
                     self.route = route;
+                    if route == Route::Settings {
+                        return self.request_cache_stats();
+                    }
                 }
                 Task::none()
             }
@@ -344,12 +427,144 @@ impl WalloraApp {
                 }
                 Task::none()
             }
+            Message::CacheCapInputChanged(input) => {
+                self.cache_cap_input = input;
+                self.cache_cap_feedback = None;
+                Task::none()
+            }
+            Message::ApplyCacheCap => self.apply_cache_cap(),
+            Message::CacheCapApplied {
+                op_id,
+                cap_bytes,
+                result,
+            } => self.finish_cache_cap(op_id, cap_bytes, result),
+            Message::RefreshCacheStats => self.request_cache_stats(),
+            Message::CacheStatsLoaded(result) => {
+                match result {
+                    Ok(stats) => self.cache_stats = Some(stats),
+                    Err(err) => tracing::warn!(reason = %err, "could not read cache statistics"),
+                }
+                Task::none()
+            }
             Message::OpenUpstreamSettings => {
                 if let Err(err) = (self.launch_browser)(WALLHAVEN_SETTINGS_URL) {
                     self.session.set_notice(Some(SessionNotice::warning(format!(
                         "Could not open wallhaven.cc in browser: {err}"
                     ))));
                 }
+                Task::none()
+            }
+        }
+    }
+
+    fn cache_cap_feedback_error(&mut self, message: impl Into<String>) {
+        self.cache_cap_feedback = Some((true, message.into()));
+    }
+
+    fn apply_cache_cap(&mut self) -> Task<Message> {
+        if self.cache_cap_in_flight.is_some() {
+            return Task::none();
+        }
+        let cap_bytes = match parse_cache_cap_gb(&self.cache_cap_input) {
+            Ok(bytes) => bytes,
+            Err(message) => {
+                self.cache_cap_feedback_error(message);
+                return Task::none();
+            }
+        };
+        if let Err(err) = SessionManager::validate_cache_cap_request(cap_bytes) {
+            self.cache_cap_feedback_error(describe_cache_cap_error(&err));
+            return Task::none();
+        }
+        let Some(cache) = self.cache.clone() else {
+            // No live cache: keep the preference for the next time the cache opens.
+            match self.session.commit_cache_cap(cap_bytes) {
+                Ok(applied) => {
+                    self.cache_cap_input = format_cap_gb(applied);
+                    self.cache_cap_feedback = Some((
+                        false,
+                        format!(
+                            "Saved {} GB. It applies the next time the image cache opens.",
+                            format_cap_gb(applied)
+                        ),
+                    ));
+                }
+                Err(err) => self.cache_cap_feedback_error(err.to_string()),
+            }
+            return Task::none();
+        };
+        let op_id = self.allocate_op_id();
+        self.cache_cap_in_flight = Some(op_id);
+        self.cache_cap_feedback = None;
+        Task::perform(
+            async move { cache.set_cap(cap_bytes).await },
+            move |result| Message::CacheCapApplied {
+                op_id,
+                cap_bytes,
+                result,
+            },
+        )
+    }
+
+    fn finish_cache_cap(
+        &mut self,
+        op_id: u64,
+        cap_bytes: u64,
+        result: Result<(), CacheError>,
+    ) -> Task<Message> {
+        if self.cache_cap_in_flight != Some(op_id) {
+            return Task::none();
+        }
+        self.cache_cap_in_flight = None;
+        match result {
+            Ok(()) => {
+                let previous = self.session.local_preferences().cache_cap_bytes;
+                match self.session.commit_cache_cap(cap_bytes) {
+                    Ok(applied) => {
+                        self.cache_cap_input = format_cap_gb(applied);
+                        self.cache_cap_feedback = Some((
+                            false,
+                            format!("Image cache size set to {} GB.", format_cap_gb(applied)),
+                        ));
+                        self.request_cache_stats()
+                    }
+                    Err(err) => {
+                        self.cache_cap_feedback_error(format!(
+                            "{err}. The previous size ({} GB) stays in effect.",
+                            format_cap_gb(previous)
+                        ));
+                        // The actor already accepted the new cap; put the old one back.
+                        match self.cache.clone() {
+                            Some(cache) => Task::perform(
+                                async move {
+                                    let _ = cache.set_cap(previous).await;
+                                },
+                                |()| Message::RefreshCacheStats,
+                            ),
+                            None => Task::none(),
+                        }
+                    }
+                }
+            }
+            Err(CacheError::CapReductionRejected { requested, charged }) => {
+                self.cache_cap_feedback_error(format!(
+                    "Cannot lower the cache to {} yet: {} is still in use by active writes or pending deletions. Try again shortly.",
+                    format_size(requested),
+                    format_size(charged)
+                ));
+                self.request_cache_stats()
+            }
+            Err(CacheError::CapExceedsHardMax { .. }) => {
+                self.cache_cap_feedback_error(describe_cache_cap_error(
+                    &CacheCapError::ExceedsHardMax {
+                        requested: cap_bytes,
+                        hard_max: HARD_MAX_CACHE_CAP_BYTES,
+                    },
+                ));
+                Task::none()
+            }
+            Err(err) => {
+                self.cache_cap_feedback_error(format!("Could not change the cache size: {err}"));
                 Task::none()
             }
         }
@@ -443,6 +658,12 @@ impl WalloraApp {
                 proxy_mode: self.proxy_mode,
                 proxy_url_input: &self.proxy_url_input,
                 proxy_feedback: self.proxy_feedback.as_ref(),
+                cache_available: self.cache.is_some(),
+                cache_cap_input: &self.cache_cap_input,
+                cache_cap_feedback: self.cache_cap_feedback.as_ref(),
+                cache_cap_busy: self.cache_cap_in_flight.is_some(),
+                cache_stats: self.cache_stats.as_ref(),
+                image_guard: &self.image_guard,
             }),
         };
 
@@ -475,9 +696,11 @@ impl WalloraApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
+
     use wallora_core::domain::{
-        AccountId, CollectionSummary, InMemoryCredentialStore, SessionKind, UserSettings,
-        UsernameVerification,
+        AccountId, CollectionSummary, InMemoryCredentialStore, LocalPreferences, SessionKind,
+        UserSettings, UsernameVerification,
     };
     use wallora_core::provider::ProviderError;
     use wallora_core::services::{AccountRefreshPayload, SignInProbe};
@@ -494,16 +717,7 @@ mod tests {
 
     impl Drop for TestPaths {
         fn drop(&mut self) {
-            for filename in [
-                "wallora.db",
-                "wallora.db-wal",
-                "wallora.db-shm",
-                "wallora.session.lock",
-            ] {
-                let _ = std::fs::remove_file(self.0.data_dir.join(filename));
-            }
-            let _ = std::fs::remove_dir(&self.0.data_dir);
-            let _ = std::fs::remove_dir(&self.0.local_dir);
+            let _ = std::fs::remove_dir_all(&self.0.local_dir);
         }
     }
 
@@ -512,8 +726,43 @@ mod tests {
         let creds = Arc::new(InMemoryCredentialStore::new());
         let session = SessionManager::restore(storage, creds.clone());
         let client = Arc::new(WallhavenClient::new(creds).expect("client"));
-        let (app, _) = WalloraApp::from_runtime(paths.0.clone(), session, client);
+        let (app, _) = WalloraApp::from_runtime(paths.0.clone(), session, client, None);
         app
+    }
+
+    fn cache_config(paths: &TestPaths) -> CacheConfig {
+        CacheConfig::new(paths.0.cache_dir.clone(), SessionScope::guest(0))
+    }
+
+    /// Builds an app whose session is wired to a real cache actor, the same way `boot` does.
+    fn test_app_with_cache(paths: &TestPaths, host: &Arc<CacheHost>) -> WalloraApp {
+        let storage = Arc::new(SqliteStore::open(&paths.0.db_path()).expect("file-backed sqlite"));
+        let creds = Arc::new(InMemoryCredentialStore::new());
+        let cache = host.open(cache_config(paths)).expect("open cache");
+        let session =
+            SessionManager::restore_with_cache(storage, creds.clone(), Arc::new(cache.clone()));
+        let client = Arc::new(WallhavenClient::new(creds).expect("client"));
+        let (app, _) = WalloraApp::from_runtime(paths.0.clone(), session, client, Some(cache));
+        app
+    }
+
+    fn cache_stats(host: &CacheHost, app: &WalloraApp) -> CacheStats {
+        let cache = app.cache.clone().expect("app has a cache");
+        host.block_on(async move { cache.stats().await })
+            .expect("stats task")
+            .expect("cache stats")
+    }
+
+    /// Cache scope updates travel over a channel, so wait briefly for the actor to apply them.
+    fn wait_for_cache_scope(host: &CacheHost, app: &WalloraApp) -> CacheStats {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let stats = cache_stats(host, app);
+            if stats.current_scope == app.session.scope() || Instant::now() > deadline {
+                return stats;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn sample_settings() -> UserSettings {
@@ -536,7 +785,8 @@ mod tests {
         let paths = TestPaths::new();
         let db_path = paths.0.db_path();
         std::fs::create_dir_all(&db_path).unwrap();
-        let (mut app, startup) = WalloraApp::boot(paths.0.clone());
+        let host = CacheHost::new().expect("cache runtime");
+        let (mut app, startup) = WalloraApp::boot(paths.0.clone(), Some(host.clone()));
         assert_eq!(startup.units(), 0);
         assert_eq!(app.session.scope().kind, SessionKind::Guest);
         assert!(
@@ -549,6 +799,7 @@ mod tests {
         assert_eq!(app.update(Message::SubmitSignIn).units(), 0);
         assert!(app.sign_in_in_flight.is_none());
         drop(app);
+        host.shutdown();
         std::fs::remove_dir(db_path).unwrap();
     }
 
@@ -742,5 +993,278 @@ mod tests {
             app.client.proxy(),
             ProxyConfig::Manual("http://127.0.0.1:8888/".into())
         );
+    }
+
+    #[test]
+    fn boot_opens_the_cache_at_cache_dir_with_the_persisted_cap() {
+        let paths = TestPaths::new();
+        let host = CacheHost::new().expect("cache runtime");
+        {
+            let storage = SqliteStore::open(&paths.0.db_path()).expect("sqlite");
+            storage
+                .save_local_preferences(&LocalPreferences {
+                    cache_cap_bytes: 3_000_000_000,
+                    ..LocalPreferences::default()
+                })
+                .expect("save preferences");
+        }
+
+        let (app, startup) = WalloraApp::boot(paths.0.clone(), Some(host.clone()));
+        assert_eq!(startup.units(), 0);
+        assert!(app.cache.is_some());
+        assert!(paths.0.cache_dir.join("cache.lock").exists());
+        assert_eq!(app.cache_cap_input, "3");
+        let stats = wait_for_cache_scope(&host, &app);
+        assert_eq!(stats.cap_bytes, 3_000_000_000);
+        assert_eq!(stats.current_scope, app.session.scope());
+        assert!(app.session.notice().is_none());
+        assert_eq!(
+            app.image_guard.decoded_bytes_budget(),
+            wallora_core::services::DEFAULT_DECODED_BYTES_BUDGET
+        );
+
+        drop(app);
+        host.shutdown();
+    }
+
+    #[test]
+    fn session_scope_changes_reach_the_cache_through_the_wired_sink() {
+        let paths = TestPaths::new();
+        let host = CacheHost::new().expect("cache runtime");
+        let mut app = test_app_with_cache(&paths, &host);
+        assert_eq!(
+            wait_for_cache_scope(&host, &app).current_scope,
+            app.session.scope()
+        );
+
+        sign_in(&mut app, "alice");
+        let signed_in = app.session.scope();
+        assert!(matches!(signed_in.kind, SessionKind::Account(_)));
+        assert_eq!(wait_for_cache_scope(&host, &app).current_scope, signed_in);
+
+        let _ = app.update(Message::SignOut);
+        assert_eq!(app.session.scope().kind, SessionKind::Guest);
+        assert_eq!(
+            wait_for_cache_scope(&host, &app).current_scope,
+            app.session.scope()
+        );
+
+        drop(app);
+        host.shutdown();
+    }
+
+    fn finish_with(app: &mut WalloraApp, host: &CacheHost, cap_bytes: u64) {
+        let op_id = app.cache_cap_in_flight.expect("cap change in flight");
+        let cache = app.cache.clone().expect("cache");
+        let result = host
+            .block_on(async move { cache.set_cap(cap_bytes).await })
+            .expect("set_cap task");
+        let _ = app.update(Message::CacheCapApplied {
+            op_id,
+            cap_bytes,
+            result,
+        });
+    }
+
+    #[test]
+    fn cache_cap_changes_validate_persist_apply_and_reject_over_ten_gb() {
+        let paths = TestPaths::new();
+        let host = CacheHost::new().expect("cache runtime");
+        let mut app = test_app_with_cache(&paths, &host);
+        assert_eq!(app.cache_cap_input, "2");
+
+        let _ = app.update(Message::CacheCapInputChanged("1.5".into()));
+        assert!(app.update(Message::ApplyCacheCap).units() > 0);
+        assert!(app.cache_cap_in_flight.is_some());
+        // A second apply while one is in flight does nothing.
+        assert_eq!(app.update(Message::ApplyCacheCap).units(), 0);
+        finish_with(&mut app, &host, 1_500_000_000);
+        assert!(app.cache_cap_in_flight.is_none());
+        assert_eq!(
+            app.session.local_preferences().cache_cap_bytes,
+            1_500_000_000
+        );
+        assert_eq!(cache_stats(&host, &app).cap_bytes, 1_500_000_000);
+        assert_eq!(app.cache_cap_input, "1.5");
+        assert_eq!(
+            app.cache_cap_feedback.as_ref().map(|(err, _)| *err),
+            Some(false)
+        );
+
+        for (input, expected) in [
+            ("10.000000001", "cannot exceed 10 GB"),
+            ("999999999999", "cannot exceed 10 GB"),
+            ("0", "greater than zero"),
+            ("abc", "Enter the cache size"),
+            ("", "Enter the cache size"),
+        ] {
+            let _ = app.update(Message::CacheCapInputChanged(input.into()));
+            assert_eq!(app.update(Message::ApplyCacheCap).units(), 0, "{input:?}");
+            assert!(app.cache_cap_in_flight.is_none());
+            let (is_error, message) = app.cache_cap_feedback.clone().expect("feedback");
+            assert!(
+                is_error && message.contains(expected),
+                "{input:?}: {message}"
+            );
+            assert_eq!(
+                app.session.local_preferences().cache_cap_bytes,
+                1_500_000_000
+            );
+            assert_eq!(cache_stats(&host, &app).cap_bytes, 1_500_000_000);
+        }
+
+        // Exactly 10 GB is the hard maximum and is accepted.
+        let _ = app.update(Message::CacheCapInputChanged("10".into()));
+        assert!(app.update(Message::ApplyCacheCap).units() > 0);
+        finish_with(&mut app, &host, 10_000_000_000);
+        assert_eq!(
+            app.session.local_preferences().cache_cap_bytes,
+            10_000_000_000
+        );
+        assert_eq!(cache_stats(&host, &app).cap_bytes, 10_000_000_000);
+        let _ = app.view();
+
+        drop(app);
+        host.shutdown();
+    }
+
+    #[test]
+    fn live_cap_rejection_and_stale_completions_leave_the_preference_alone() {
+        let paths = TestPaths::new();
+        let host = CacheHost::new().expect("cache runtime");
+        let mut app = test_app_with_cache(&paths, &host);
+
+        let _ = app.update(Message::CacheCapInputChanged("0.0000005".into()));
+        assert!(app.update(Message::ApplyCacheCap).units() > 0);
+        let op_id = app.cache_cap_in_flight.unwrap();
+
+        // A completion for another operation is ignored.
+        let _ = app.update(Message::CacheCapApplied {
+            op_id: op_id + 100,
+            cap_bytes: 500,
+            result: Ok(()),
+        });
+        assert_eq!(app.cache_cap_in_flight, Some(op_id));
+        assert_eq!(
+            app.session.local_preferences().cache_cap_bytes,
+            2_000_000_000
+        );
+
+        let _ = app.update(Message::CacheCapApplied {
+            op_id,
+            cap_bytes: 500,
+            result: Err(CacheError::CapReductionRejected {
+                requested: 500,
+                charged: 700,
+            }),
+        });
+        assert!(app.cache_cap_in_flight.is_none());
+        let (is_error, message) = app.cache_cap_feedback.clone().expect("feedback");
+        assert!(is_error && message.contains("still in use"), "{message}");
+        assert_eq!(
+            app.session.local_preferences().cache_cap_bytes,
+            2_000_000_000
+        );
+        assert_eq!(cache_stats(&host, &app).cap_bytes, 2_000_000_000);
+
+        drop(app);
+        host.shutdown();
+    }
+
+    #[test]
+    fn cache_open_failure_is_a_non_fatal_warning_and_the_cap_still_saves() {
+        let paths = TestPaths::new();
+        let host = CacheHost::new().expect("cache runtime");
+        // Another cache (for example a second window) already owns the root lock.
+        let _owner = host.open(cache_config(&paths)).expect("first cache owner");
+
+        let (mut app, startup) = WalloraApp::boot(paths.0.clone(), Some(host.clone()));
+        assert_eq!(startup.units(), 0);
+        assert!(app.cache.is_none());
+        assert_eq!(app.session.scope().kind, SessionKind::Guest);
+        assert!(
+            app.session
+                .notice()
+                .unwrap()
+                .message
+                .contains("Another Wallora window is using the image cache")
+        );
+        assert_eq!(app.session.notice().unwrap().level, NoticeLevel::Warning);
+        assert_eq!(app.update(Message::Navigate(Route::Settings)).units(), 0);
+        let _ = app.view();
+
+        let _ = app.update(Message::CacheCapInputChanged("2.5".into()));
+        assert_eq!(app.update(Message::ApplyCacheCap).units(), 0);
+        assert_eq!(
+            app.session.local_preferences().cache_cap_bytes,
+            2_500_000_000
+        );
+        let (is_error, message) = app.cache_cap_feedback.clone().expect("feedback");
+        assert!(!is_error && message.contains("next time"), "{message}");
+        let _ = app.update(Message::CacheCapInputChanged("11".into()));
+        let _ = app.update(Message::ApplyCacheCap);
+        assert_eq!(
+            app.session.local_preferences().cache_cap_bytes,
+            2_500_000_000
+        );
+
+        drop(app);
+        host.shutdown();
+    }
+
+    #[test]
+    fn missing_cache_runtime_is_also_only_a_warning() {
+        let paths = TestPaths::new();
+        let (app, startup) = WalloraApp::boot(paths.0.clone(), None);
+        assert_eq!(startup.units(), 0);
+        assert!(app.cache.is_none());
+        assert!(
+            app.session
+                .notice()
+                .unwrap()
+                .message
+                .contains("could not be started")
+        );
+    }
+
+    #[test]
+    fn host_shutdown_stops_the_cache_and_releases_the_root_lock() {
+        let paths = TestPaths::new();
+        let host = CacheHost::new().expect("cache runtime");
+        let app = test_app_with_cache(&paths, &host);
+        let cache = app.cache.clone().expect("cache");
+
+        host.shutdown();
+        host.shutdown();
+        let probe = cache.clone();
+        let after = host
+            .block_on(async move { probe.stats().await })
+            .expect("stats task");
+        assert_eq!(after, Err(CacheError::ShuttingDown));
+
+        // The orderly shutdown released the lock, so a fresh start can take it again.
+        let second = CacheHost::new().expect("second runtime");
+        let reopened = second.open(cache_config(&paths)).expect("lock released");
+        drop(reopened);
+        second.shutdown();
+    }
+
+    #[test]
+    fn settings_view_shows_cache_status_and_tolerates_stat_failures() {
+        let paths = TestPaths::new();
+        let host = CacheHost::new().expect("cache runtime");
+        let mut app = test_app_with_cache(&paths, &host);
+        let _ = app.update(Message::Navigate(Route::Settings));
+        let _ = app.view();
+
+        let stats = cache_stats(&host, &app);
+        let _ = app.update(Message::CacheStatsLoaded(Ok(stats.clone())));
+        assert_eq!(app.cache_stats, Some(stats.clone()));
+        let _ = app.update(Message::CacheStatsLoaded(Err(CacheError::ShuttingDown)));
+        assert_eq!(app.cache_stats, Some(stats));
+        let _ = app.view();
+
+        drop(app);
+        host.shutdown();
     }
 }
