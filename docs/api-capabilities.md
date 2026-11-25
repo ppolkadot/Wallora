@@ -38,3 +38,17 @@ Read-only requests used at least 2.1 s API spacing and aborted on a 429. The loc
 | Favorites mapping | Signed-in website label, empty state, and ID stability across a test mutation remain unverified. |
 | Guest SFW detail and similar | `GET /w/e8r2y8` returned 200. Website similar search found 8 results and the corresponding documented API query returned 403. |
 | Original CDN | Direct unauthenticated fetch returned an HTTP error for `e8r2y8`. The independent reviewer matched the detail API path to the website original for `3l5xev` and retrieved a 1,176,033-byte JPEG. Native byte equivalence remains a Task 6 check. |
+
+## Favorites mapping follow-up (2026-11-23)
+
+Probe: read-only `curl` requests (not the committed probe example) with at least 2.5 s spacing and 6 requests in total. The local key and username were loaded from `.env` without printing; no identifiers or collection ids are recorded here.
+
+| Check | Result |
+|---|---|
+| Keyed `GET /collections`, two passes | 200 both times, byte-identical bodies. One collection: label `Default`, `public = 0`, `count = 2`, `views = 0`. The id was identical across the passes. |
+| Keyed `GET /collections/{username}` | 404 `{"error":"Nothing here"}`. |
+| Keyed `GET /collections/{username}/{id}?purity=111` | 404 `Nothing here`. |
+| Unkeyed `GET /collections/{username}/{id}?purity=100` | Not valid evidence: the request was sent with an empty id because of a local scripting error, and returned 404. It was not repeated. |
+| Website label, empty state, id stability after a favorite add/remove | **Not obtained.** The browser session was not signed in, a Cloudflare check blocked automation, and the handoff to sign in timed out. |
+
+**Disposition:** the Favorites mapping stays `unresolved`. The API shows one private `Default` collection holding the account's 2 items, which is consistent with it being the site's Favorites, but that is a candidate, not evidence. Because the supplied username 404s even with the key (so the username may differ from the account's real one), account collection *items* remain unreachable under Task 3's verification rules. Next evidence needed: the real username and the Favorites page label from a signed-in browser. The add/remove stability test mutates the account and needs explicit owner action.
