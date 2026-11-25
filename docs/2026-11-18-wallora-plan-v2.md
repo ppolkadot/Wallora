@@ -135,7 +135,7 @@ Order matters: 1a → 1b → 1c → 1d → 1e.
 - [x] Save response *shapes* (values scrubbed/synthesized; no usernames, no keys) to `tests/fixtures/`. Each upstream-facts row becomes **confirmed / differs / missing / unresolved** in `docs/api-capabilities.md` with the date, probe command, status codes and scrubbed evidence. If no key or test account is available, account rows are **unresolved**, not assumed.
 
 **1c. Website inventory** (manual, guest + test account, respecting site ToS; no automated crawling)
-- [ ] Cover explicitly: homepage sections and order, Latest/Toplist/Hot/Random, search syntax, every filter and sort (incl. any AI-art filter), wallpaper detail (tags, uploader, source, purity, dims, related/similar, crop/scale), downloads, collections/favorites, profile, settings, upload, tag/moderation actions, comments, forums, anything else found.
+- [ ] Cover explicitly: homepage sections and order, Latest/Toplist/Hot/Random, search syntax, every filter and sort (incl. any AI-art filter), wallpaper detail (tags, uploader, source, purity, dims, related/similar, crop/scale), downloads, collections/favorites, profile, settings, upload, tag/moderation actions, comments, forums, anything else found. *(Guest inventory recorded 2026-11-19. Selected guest routes were rechecked on 2026-11-25. The signed-in half is blocked on an owner-provided session; see [release-gate-evidence.md](release-gate-evidence.md).)*
 - [x] `docs/parity-matrix.md`, one row per user-visible action: *action · roles · expected behavior · source URL · route class (official API / supported web endpoint / unsupported / unresolved) · authorization evidence · behavior evidence · required-for-parity (y/n) · native status · test · equivalence verified*.
 - [x] **Authorization evidence** is only upstream documentation (link + date) or explicit written permission from Wallhaven (stored reference). A probe result never authorizes a route; it goes in **behavior evidence**. A web endpoint without authorization evidence is `unsupported`, however well it works.
 
@@ -236,9 +236,9 @@ Status: landed in `main` as `2802703` (`feat: discovery and search`), with the q
 
 ### Task 7: v1.0 release gate
 
-- [ ] Full CI green; MSI install, upgrade-over-previous, and uninstall tested on Windows 10 and 11.
-- [ ] Manual parity walk-through, guest and account, row by row; DPI 100/150/200%; keyboard-only run; connectivity loss and rate-limit recovery.
-- [ ] `THIRD_PARTY.md` (crate licenses via `cargo about` or `cargo deny list`; font licenses). Sign if a certificate exists; else README states "unsigned" and SmartScreen behavior.
+- [ ] Full CI green; MSI install, upgrade-over-previous, and uninstall tested on Windows 10 and 11. *(Status 2026-11-25: local formatting, lint, test, dependency policy, release build and MSI checks passed at `a6a3301`. Hosted artifact upload and interactive MSI install, upgrade and uninstall were outside that local run. Windows 10 is unverified. See [release-gate-evidence.md](release-gate-evidence.md).)*
+- [ ] Manual parity walk-through, guest and account, row by row; DPI 100/150/200%; keyboard-only run; connectivity loss and rate-limit recovery. *(Not done. Only a partial byte-equivalence sample passed on 2026-11-25. The reference machine and an owner session are required.)*
+- [ ] `THIRD_PARTY.md` (crate licenses via `cargo about` or `cargo deny list`; font licenses). Sign if a certificate exists; else README states "unsigned" and SmartScreen behavior. *(Reviewed 2026-11-25: the inventory matches `cargo deny list` for the Windows target; the MSI is unsigned and the README documents SmartScreen behavior. Bundling dependency notices into the installer remains open.)*
 - [ ] Label: `1.0 — complete for supported routes` when all required supported rows pass and each gap is documented with its applicable `Open on wallhaven.cc` hand-off. Resolve outstanding evidence into explicit dispositions. Otherwise label beta/partial. Tag only after owner authorization.
 
 ## Phase B — desktop-only features

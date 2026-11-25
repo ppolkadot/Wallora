@@ -4,7 +4,7 @@
 
 Wallora is an independent, open-source desktop client written in Rust. It is **not affiliated with, endorsed by, or sponsored by Wallhaven**. "Wallhaven" and `wallhaven.cc` belong to their respective owners. Wallora uses only the public, documented Wallhaven API and follows its published rate limit.
 
-## Status: pre-release (v0.9)
+## Status: pre-release (0.1.0 beta)
 
 Wallora is under active development and is **pre-release**. The native shell, the Wallhaven API client, account sign-in, the guarded image pipeline and scoped cache, the discovery/search gallery, wallpaper details and original downloads, read-only collections, and profiles/tags are built. The v1.0 release gate (manual parity walkthrough, installer checks, signing) and Windows 10 verification are still open.
 
@@ -22,7 +22,7 @@ Wallora 1.0 means *complete for supported routes*: Wallhaven's public API is rea
 
 ## Requirements
 
-- Windows 10 or 11 (64-bit). Only Windows 11 on one reference machine has been tested so far.
+- Windows 10 or 11 (64-bit) are the target platforms. The current app has been smoke-tested on a Windows 11 development PC. Windows 10 and the reference-PC release checks are pending.
 - To build: Rust `1.99.0` (pinned by `rust-toolchain.toml`) with the MSVC toolchain.
 
 ## Build and test
@@ -38,7 +38,7 @@ CI runs the same checks on `windows-latest` and builds an MSI with `cargo-wix` (
 
 ## Downloads and signing
 
-Builds and installers are **unsigned**. Windows SmartScreen may warn when you run an unsigned installer; that is expected for now. There are no published releases yet and no automatic updates.
+Windows pre-release installers are distributed through [GitHub Releases](https://github.com/ppolkadot/Wallora/releases). The installers are **unsigned** and may trigger a Windows SmartScreen warning. Wallora has no automatic updates.
 
 ## Privacy
 
@@ -48,7 +48,7 @@ No telemetry. Your API key lives only in Windows Credential Manager. The full li
 
 - [Architecture](docs/architecture.md)
 - [Implementation plan (v2)](docs/2026-11-18-wallora-plan-v2.md) · [original requirements](docs/2026-11-17-wallhaven-desktop.md)
-- [Implementation status](docs/implementation-status.md)
+- [Implementation status](docs/implementation-status.md) · [Release gate evidence](docs/release-gate-evidence.md) · [v1.0 readiness plan](docs/superpowers/plans/2026-11-25-wallora-v1-release-readiness.md)
 - [Scope decisions](docs/decisions.md) · [API capabilities](docs/api-capabilities.md) · [Parity matrix](docs/parity-matrix.md)
 - [Privacy](docs/privacy.md) · [Third-party licences](THIRD_PARTY.md) · [Archive](docs/archive/README.md)
 
