@@ -9,7 +9,7 @@ pub mod pacer;
 use std::future::Future;
 
 use crate::domain::{
-    CollectionSummary, PurityMask, SearchPage, SearchQuery, SecretString, SessionScope,
+    CollectionSummary, PurityMask, SearchPage, SearchQuery, SecretString, SessionScope, Tag,
     UserSettings, Wallpaper, WallpaperId,
 };
 
@@ -26,7 +26,7 @@ pub use pacer::ApiPacer;
 /// Task 2 exposes `search` and `wallpaper`; Task 3 adds `user_settings`, `own_collections`,
 /// unkeyed public collection lookup for username verification, and candidate-key sign-in probes
 /// routed through the same pacer and origin policy. Task 6a adds `collections` and
-/// `collection_items`.
+/// `collection_items`. Task 6b adds `tag`.
 pub trait Provider: Send + Sync + 'static {
     fn search(
         &self,
@@ -91,4 +91,11 @@ pub trait Provider: Send + Sync + 'static {
         page: Option<u32>,
         scope: SessionScope,
     ) -> impl Future<Output = Result<SearchPage, ProviderError>> + Send + 'static;
+
+    /// Fetches tag metadata (`GET /api/v1/tag/{id}`).
+    fn tag(
+        &self,
+        id: u64,
+        scope: SessionScope,
+    ) -> impl Future<Output = Result<Tag, ProviderError>> + Send + 'static;
 }

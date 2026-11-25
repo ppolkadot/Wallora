@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use wallora_core::domain::{
     AccountId, Category, CollectionSummary, CredentialStore, IdentityCheckOutcome,
     InMemoryCredentialStore, Purity, PurityMask, SearchMeta, SearchPage, SearchQuery, SecretString,
-    SessionScope, Thumbs, UserSettings, UsernameVerification, Wallpaper, WallpaperId,
+    SessionScope, Tag, Thumbs, UserSettings, UsernameVerification, Wallpaper, WallpaperId,
 };
 use wallora_core::provider::{Provider, ProviderError};
 use wallora_core::services::{
@@ -170,6 +170,14 @@ impl Provider for FakeProvider {
         });
         let result = (self.items_handler)(&username, collection_id, purity, page, &scope);
         async move { result }
+    }
+
+    fn tag(
+        &self,
+        _id: u64,
+        _scope: SessionScope,
+    ) -> impl std::future::Future<Output = Result<Tag, ProviderError>> + Send + 'static {
+        std::future::ready(Err(ProviderError::NotFound))
     }
 }
 

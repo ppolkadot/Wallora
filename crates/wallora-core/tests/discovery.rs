@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 use wallora_core::domain::{
     Category, CategoryMask, CollectionSummary, CredentialStore, Dimensions,
     InMemoryCredentialStore, Purity, PurityMask, QueryBuilder, SearchMeta, SearchPage, SearchQuery,
-    SearchTerms, SecretString, SessionKind, SessionScope, SortOrder, Sorting, Thumbs, TopRange,
-    UserSettings, UsernameVerification, Wallpaper, WallpaperId,
+    SearchTerms, SecretString, SessionKind, SessionScope, SortOrder, Sorting, Tag, Thumbs,
+    TopRange, UserSettings, UsernameVerification, Wallpaper, WallpaperId,
 };
 use wallora_core::provider::{Provider, ProviderError};
 use wallora_core::services::{
@@ -121,6 +121,14 @@ impl Provider for FakeProvider {
         _page: Option<u32>,
         _scope: SessionScope,
     ) -> impl std::future::Future<Output = Result<SearchPage, ProviderError>> + Send + 'static {
+        std::future::ready(Err(ProviderError::NotFound))
+    }
+
+    fn tag(
+        &self,
+        _id: u64,
+        _scope: SessionScope,
+    ) -> impl std::future::Future<Output = Result<Tag, ProviderError>> + Send + 'static {
         std::future::ready(Err(ProviderError::NotFound))
     }
 }

@@ -9,9 +9,9 @@ use iced::widget::{Id, button, column, container, image as iced_image, row, text
 use iced::{Alignment, Background, Border, Element, Length, Size, Subscription, Task, Theme};
 use wallora_core::domain::{
     BrowseDefaults, CacheCapError, Category, CredentialStore, DEFAULT_CACHE_CAP_BYTES,
-    HARD_MAX_CACHE_CAP_BYTES, ProxyConfig, Purity, QueryToken, SearchTerms, SecretString,
-    SessionKind, SessionScope, Sorting, Thumbs, TopRange, WALLHAVEN_SETTINGS_URL, Wallpaper,
-    WallpaperId,
+    HARD_MAX_CACHE_CAP_BYTES, ProxyConfig, Purity, PurityMask, QueryToken, SearchTerms,
+    SecretString, SessionKind, SessionScope, Sorting, Thumbs, TopRange, WALLHAVEN_SETTINGS_URL,
+    Wallpaper, WallpaperId, validate_username,
 };
 use wallora_core::provider::client::PREVIEW_BYTE_LIMIT;
 use wallora_core::provider::{Provider, ProviderError, WallhavenClient, WallhavenClientConfig};
@@ -24,10 +24,12 @@ use wallora_core::services::{
     CollectionUnsupportedAction, CollectionsController, DiscoveryController, DiscoveryFilters,
     DiscoveryStatus, DiscoveryView, DownloadError, DownloadRequest, FilePublisher, ImageGuard,
     ImageGuardError, ImagePipeline, ImagePipelineError, ImageRequest, NoticeLevel,
-    OriginalDownloader, PREVIEW_MAX_PIXELS, PREVIEW_MAX_SIDE, PageRequest, ScopedResponse,
-    SessionManager, SessionNotice, SignInCommitOutcome, SignInError, fetch_account_refresh,
-    fetch_collection_items, fetch_page, fetch_user_collections, load_uncached, probe_sign_in,
-    selectable_purity,
+    OriginalDownloader, PREVIEW_MAX_PIXELS, PREVIEW_MAX_SIDE, PageRequest,
+    ProfileTagUnsupportedAction, ScopedResponse, SessionManager, SessionNotice,
+    SignInCommitOutcome, SignInError, TagLoadRequests, TagMetadataOutcome, TagMetadataRequest,
+    TagMetadataStatus, TagPageController, UploaderController, fetch_account_refresh,
+    fetch_collection_items, fetch_page, fetch_tag_metadata, fetch_user_collections, load_uncached,
+    probe_sign_in, selectable_purity,
 };
 use wallora_core::storage::{AppPaths, SessionStorage, SqliteStore, StorageError};
 use wallora_core::util::default_download_filename;
@@ -50,6 +52,7 @@ use crate::widgets::gallery_grid::{GridKey, GridMetrics};
 use crate::widgets::thumbnail::{LoadedThumbnail, ThumbnailViewState, select_thumbnail_url};
 
 const MAX_RESIDENT_THUMBNAILS: usize = 256;
+const MAX_NAV_STACK: usize = 32;
 
 struct InFlight {
     id: u64,
@@ -127,6 +130,38 @@ struct InFlightCollectionList {
     generation: u64,
     scope: SessionScope,
     handle: Handle,
+}
+
+struct InFlightTagMetadata {
+    generation: u64,
+    scope: SessionScope,
+    tag_id: u64,
+    handle: Handle,
+}
+
+fn reset_scroll_task(scrollable_id: &Id, metrics: &mut GridMetrics) -> Task<Message> {
+    let was_scrolled = metrics.scroll_y > 0.0;
+    metrics.scroll_y = 0.0;
+    if was_scrolled {
+        operation::scroll_to(
+            scrollable_id.clone(),
+            AbsoluteOffset {
+                x: Some(0.0),
+                y: Some(0.0),
+            },
+        )
+    } else {
+        Task::none()
+    }
+}
+
+fn toggle_purity_mask(mut mask: PurityMask, purity: Purity) -> PurityMask {
+    match purity {
+        Purity::Sfw => mask.sfw = !mask.sfw,
+        Purity::Sketchy => mask.sketchy = !mask.sketchy,
+        Purity::Nsfw => mask.nsfw = !mask.nsfw,
+    }
+    mask
 }
 
 fn entry_thumbnail_state<'a>(
@@ -526,6 +561,152 @@ impl CollectionsState {
     }
 }
 
+struct TagState {
+    controller: TagPageController,
+    scrollable_id: Id,
+    metrics: GridMetrics,
+    selected: Option<usize>,
+    metadata_in_flight: Option<InFlightTagMetadata>,
+    page_in_flight: Option<InFlightPage>,
+    thumbnails: HashMap<WallpaperId, ThumbnailEntry>,
+}
+
+impl TagState {
+    fn new(controller: TagPageController) -> Self {
+        Self {
+            controller,
+            scrollable_id: Id::unique(),
+            metrics: GridMetrics::default(),
+            selected: None,
+            metadata_in_flight: None,
+            page_in_flight: None,
+            thumbnails: HashMap::new(),
+        }
+    }
+
+    fn thumbnail_state(&self, id: &WallpaperId) -> ThumbnailViewState<'_> {
+        entry_thumbnail_state(&self.thumbnails, id)
+    }
+
+    fn cancel_in_flight_thumbnails(&mut self) {
+        abort_in_flight_thumbnails(&mut self.thumbnails);
+    }
+
+    fn clear_items_work(&mut self) {
+        if let Some(op) = self.page_in_flight.take() {
+            op.handle.abort();
+        }
+        self.cancel_in_flight_thumbnails();
+        self.thumbnails.clear();
+        self.selected = None;
+    }
+
+    fn clear_items_for_reload(&mut self) -> Task<Message> {
+        self.clear_items_work();
+        reset_scroll_task(&self.scrollable_id, &mut self.metrics)
+    }
+
+    fn clear_all_work(&mut self) {
+        if let Some(op) = self.metadata_in_flight.take() {
+            op.handle.abort();
+        }
+        self.clear_items_work();
+        self.metrics.scroll_y = 0.0;
+    }
+
+    fn sync_visible_thumbnails(
+        &mut self,
+        loader: &ThumbnailLoader,
+        thumb_size: &str,
+    ) -> Task<Message> {
+        let generation = self.controller.items_generation();
+        let scope = self.controller.scope().clone();
+        sync_gallery_visible_thumbnails(
+            ThumbnailSyncTarget {
+                kind: GalleryKind::Tag,
+                items: self.controller.items(),
+                generation,
+                scope,
+                metrics: &self.metrics,
+                thumbnails: &mut self.thumbnails,
+            },
+            loader,
+            thumb_size,
+        )
+    }
+}
+
+struct UploaderState {
+    controller: UploaderController,
+    scrollable_id: Id,
+    metrics: GridMetrics,
+    selected: Option<usize>,
+    page_in_flight: Option<InFlightPage>,
+    thumbnails: HashMap<WallpaperId, ThumbnailEntry>,
+}
+
+impl UploaderState {
+    fn new(controller: UploaderController) -> Self {
+        Self {
+            controller,
+            scrollable_id: Id::unique(),
+            metrics: GridMetrics::default(),
+            selected: None,
+            page_in_flight: None,
+            thumbnails: HashMap::new(),
+        }
+    }
+
+    fn thumbnail_state(&self, id: &WallpaperId) -> ThumbnailViewState<'_> {
+        entry_thumbnail_state(&self.thumbnails, id)
+    }
+
+    fn cancel_in_flight_thumbnails(&mut self) {
+        abort_in_flight_thumbnails(&mut self.thumbnails);
+    }
+
+    fn clear_all_work(&mut self) {
+        if let Some(op) = self.page_in_flight.take() {
+            op.handle.abort();
+        }
+        self.cancel_in_flight_thumbnails();
+        self.thumbnails.clear();
+        self.selected = None;
+        self.metrics.scroll_y = 0.0;
+    }
+
+    fn clear_for_reload(&mut self) -> Task<Message> {
+        if let Some(op) = self.page_in_flight.take() {
+            op.handle.abort();
+        }
+        self.cancel_in_flight_thumbnails();
+        self.thumbnails.clear();
+        self.selected = None;
+        reset_scroll_task(&self.scrollable_id, &mut self.metrics)
+    }
+
+    fn sync_visible_thumbnails(
+        &mut self,
+        loader: &ThumbnailLoader,
+        thumb_size: &str,
+    ) -> Task<Message> {
+        let generation = self.controller.generation();
+        let scope = self.controller.scope().clone();
+        sync_gallery_visible_thumbnails(
+            ThumbnailSyncTarget {
+                kind: GalleryKind::Uploader,
+                items: self.controller.items(),
+                generation,
+                scope,
+                metrics: &self.metrics,
+                thumbnails: &mut self.thumbnails,
+            },
+            loader,
+            thumb_size,
+        )
+    }
+}
+
 fn thumbnail_error_message(error: &ImagePipelineError) -> String {
     match error {
         ImagePipelineError::Provider(err) => err.user_message(),
@@ -725,6 +906,7 @@ async fn pick_download_destination(default_name: String) -> Option<PathBuf> {
 
 pub struct WalloraApp {
     route: Route,
+    nav_stack: Vec<Route>,
     paths: AppPaths,
     client: Arc<WallhavenClient>,
     session: SessionManager,
@@ -760,6 +942,8 @@ pub struct WalloraApp {
     collections_username_input: String,
     collections_username_input_id: Id,
     collections_username_error: Option<String>,
+    tag: TagState,
+    uploader: UploaderState,
     detail: Option<DetailState>,
 }
 
@@ -890,11 +1074,14 @@ impl WalloraApp {
             ),
         );
         let collections = CollectionsState::new(CollectionsController::from_session(&session));
+        let tag = TagState::new(TagPageController::from_session(&session));
+        let uploader = UploaderState::new(UploaderController::from_session(&session));
         let search_resolutions_input = format_resolutions(&defaults.resolutions);
         let search_ratios_input = format_ratios(&defaults.aspect_ratios);
 
         let mut app = Self {
             route: Route::Home,
+            nav_stack: Vec::new(),
             paths,
             client,
             session,
@@ -930,6 +1117,8 @@ impl WalloraApp {
             collections_username_input: String::new(),
             collections_username_input_id: Id::unique(),
             collections_username_error: None,
+            tag,
+            uploader,
             detail: None,
         };
 
@@ -961,7 +1150,11 @@ impl WalloraApp {
     pub fn subscription(&self) -> Subscription<Message> {
         let resize = iced::window::resize_events().map(|(_id, size)| Message::WindowResized(size));
         match self.route {
-            Route::Home | Route::Search | Route::Collections => {
+            Route::Home
+            | Route::Search
+            | Route::Collections
+            | Route::Tag(_)
+            | Route::Uploader(_) => {
                 Subscription::batch([resize, iced::event::listen_with(gallery_keyboard_event)])
             }
             Route::Detail(_) => {
@@ -975,7 +1168,9 @@ impl WalloraApp {
         match kind {
             GalleryKind::Home => &self.home,
             GalleryKind::Search => &self.search,
-            GalleryKind::Collections => unreachable!("Collections uses CollectionsState"),
+            GalleryKind::Collections | GalleryKind::Tag | GalleryKind::Uploader => {
+                unreachable!("non-discovery gallery uses its own state")
+            }
         }
     }
 
@@ -983,7 +1178,9 @@ impl WalloraApp {
         match kind {
             GalleryKind::Home => &mut self.home,
             GalleryKind::Search => &mut self.search,
-            GalleryKind::Collections => unreachable!("Collections uses CollectionsState"),
+            GalleryKind::Collections | GalleryKind::Tag | GalleryKind::Uploader => {
+                unreachable!("non-discovery gallery uses its own state")
+            }
         }
     }
 
@@ -992,6 +1189,8 @@ impl WalloraApp {
             Route::Home => Some(GalleryKind::Home),
             Route::Search => Some(GalleryKind::Search),
             Route::Collections => Some(GalleryKind::Collections),
+            Route::Tag(_) => Some(GalleryKind::Tag),
+            Route::Uploader(_) => Some(GalleryKind::Uploader),
             Route::Detail(_) | Route::Account | Route::Settings => None,
         }
     }
@@ -1001,6 +1200,8 @@ impl WalloraApp {
             GalleryKind::Home => self.home.controller.items(),
             GalleryKind::Search => self.search.controller.items(),
             GalleryKind::Collections => self.collections.controller.items(),
+            GalleryKind::Tag => self.tag.controller.items(),
+            GalleryKind::Uploader => self.uploader.controller.items(),
         }
     }
 
@@ -1009,6 +1210,8 @@ impl WalloraApp {
             GalleryKind::Home => self.home.selected,
             GalleryKind::Search => self.search.selected,
             GalleryKind::Collections => self.collections.selected,
+            GalleryKind::Tag => self.tag.selected,
+            GalleryKind::Uploader => self.uploader.selected,
         }
     }
 
@@ -1017,6 +1220,8 @@ impl WalloraApp {
             GalleryKind::Home => self.home.selected = selected,
             GalleryKind::Search => self.search.selected = selected,
             GalleryKind::Collections => self.collections.selected = selected,
+            GalleryKind::Tag => self.tag.selected = selected,
+            GalleryKind::Uploader => self.uploader.selected = selected,
         }
     }
 
@@ -1025,6 +1230,8 @@ impl WalloraApp {
             GalleryKind::Home => &self.home.metrics,
             GalleryKind::Search => &self.search.metrics,
             GalleryKind::Collections => &self.collections.metrics,
+            GalleryKind::Tag => &self.tag.metrics,
+            GalleryKind::Uploader => &self.uploader.metrics,
         }
     }
 
@@ -1033,6 +1240,8 @@ impl WalloraApp {
             GalleryKind::Home => &mut self.home.metrics,
             GalleryKind::Search => &mut self.search.metrics,
             GalleryKind::Collections => &mut self.collections.metrics,
+            GalleryKind::Tag => &mut self.tag.metrics,
+            GalleryKind::Uploader => &mut self.uploader.metrics,
         }
     }
 
@@ -1041,6 +1250,8 @@ impl WalloraApp {
             GalleryKind::Home => &self.home.scrollable_id,
             GalleryKind::Search => &self.search.scrollable_id,
             GalleryKind::Collections => &self.collections.scrollable_id,
+            GalleryKind::Tag => &self.tag.scrollable_id,
+            GalleryKind::Uploader => &self.uploader.scrollable_id,
         }
     }
 
@@ -1058,6 +1269,14 @@ impl WalloraApp {
                 self.collections.controller.items_generation(),
                 &mut self.collections.thumbnails,
             ),
+            GalleryKind::Tag => (
+                self.tag.controller.items_generation(),
+                &mut self.tag.thumbnails,
+            ),
+            GalleryKind::Uploader => (
+                self.uploader.controller.generation(),
+                &mut self.uploader.thumbnails,
+            ),
         }
     }
 
@@ -1070,6 +1289,14 @@ impl WalloraApp {
             GalleryKind::Collections => {
                 let req = self.collections.controller.request_next_page()?;
                 Some(self.spawn_collection_items_request(req))
+            }
+            GalleryKind::Tag => {
+                let req = self.tag.controller.request_next_page()?;
+                Some(self.spawn_tag_page_request(req))
+            }
+            GalleryKind::Uploader => {
+                let req = self.uploader.controller.request_next_page()?;
+                Some(self.spawn_uploader_page_request(req))
             }
         }
     }
@@ -1131,6 +1358,150 @@ impl WalloraApp {
             GalleryKind::Collections => self
                 .collections
                 .sync_visible_thumbnails(&loader, &thumb_size),
+            GalleryKind::Tag => self.tag.sync_visible_thumbnails(&loader, &thumb_size),
+            GalleryKind::Uploader => self.uploader.sync_visible_thumbnails(&loader, &thumb_size),
+        }
+    }
+
+    fn spawn_tag_metadata_request(&mut self, request: TagMetadataRequest) -> Task<Message> {
+        let client = Arc::clone(&self.client);
+        let generation = request.generation;
+        let scope = request.scope.clone();
+        let tag_id = request.tag_id;
+
+        if let Some(prev) = self.tag.metadata_in_flight.take() {
+            prev.handle.abort();
+        }
+
+        let (task, handle) = Task::perform(
+            async move { fetch_tag_metadata(client.as_ref(), request).await },
+            |response| Message::TagMetadataLoaded(Box::new(response)),
+        )
+        .abortable();
+
+        self.tag.metadata_in_flight = Some(InFlightTagMetadata {
+            generation,
+            scope,
+            tag_id,
+            handle: handle.abort_on_drop(),
+        });
+        task
+    }
+
+    fn spawn_tag_page_request(&mut self, request: PageRequest) -> Task<Message> {
+        let client = Arc::clone(&self.client);
+        let generation = request.generation;
+        let scope = request.scope.clone();
+        let page = request.page;
+
+        if let Some(prev) = self.tag.page_in_flight.take() {
+            prev.handle.abort();
+        }
+
+        let (task, handle) = Task::perform(
+            async move { fetch_page(client.as_ref(), request).await },
+            |response| Message::TagPageLoaded(Box::new(response)),
+        )
+        .abortable();
+
+        self.tag.page_in_flight = Some(InFlightPage {
+            generation,
+            scope,
+            page,
+            handle: handle.abort_on_drop(),
+        });
+        task
+    }
+
+    fn reload_tag_items(&mut self, request: PageRequest) -> Task<Message> {
+        let scroll_task = self.tag.clear_items_for_reload();
+        let fetch_task = self.spawn_tag_page_request(request);
+        if scroll_task.units() == 0 {
+            fetch_task
+        } else {
+            Task::batch([scroll_task, fetch_task])
+        }
+    }
+
+    fn reload_tag_all(&mut self, reqs: TagLoadRequests) -> Task<Message> {
+        let scroll_task = self.tag.clear_items_for_reload();
+        let meta_task = self.spawn_tag_metadata_request(reqs.metadata);
+        let page_task = self.spawn_tag_page_request(reqs.page);
+        if scroll_task.units() == 0 {
+            Task::batch([meta_task, page_task])
+        } else {
+            Task::batch([scroll_task, meta_task, page_task])
+        }
+    }
+
+    fn spawn_uploader_page_request(&mut self, request: PageRequest) -> Task<Message> {
+        let client = Arc::clone(&self.client);
+        let generation = request.generation;
+        let scope = request.scope.clone();
+        let page = request.page;
+
+        if let Some(prev) = self.uploader.page_in_flight.take() {
+            prev.handle.abort();
+        }
+
+        let (task, handle) = Task::perform(
+            async move { fetch_page(client.as_ref(), request).await },
+            |response| Message::UploaderPageLoaded(Box::new(response)),
+        )
+        .abortable();
+
+        self.uploader.page_in_flight = Some(InFlightPage {
+            generation,
+            scope,
+            page,
+            handle: handle.abort_on_drop(),
+        });
+        task
+    }
+
+    fn reload_uploader_items(&mut self, request: PageRequest) -> Task<Message> {
+        let scroll_task = self.uploader.clear_for_reload();
+        let fetch_task = self.spawn_uploader_page_request(request);
+        if scroll_task.units() == 0 {
+            fetch_task
+        } else {
+            Task::batch([scroll_task, fetch_task])
+        }
+    }
+
+    fn push_nav_stack(&mut self, route: Route) {
+        if self.nav_stack.last() == Some(&route) {
+            return;
+        }
+        if self.nav_stack.len() >= MAX_NAV_STACK {
+            self.nav_stack.remove(0);
+        }
+        self.nav_stack.push(route);
+    }
+
+    fn back_label_for_stack(&self) -> &'static str {
+        match self.nav_stack.last() {
+            Some(Route::Home) => "Back to Home",
+            Some(Route::Search) => "Back to Search",
+            Some(Route::Collections) => "Back to Collections",
+            Some(Route::Tag(_)) => "Back to Tag",
+            Some(Route::Uploader(_)) => "Back to Uploader",
+            Some(Route::Detail(_)) => "Back to Wallpaper",
+            Some(Route::Account) => "Back to Account",
+            Some(Route::Settings) => "Back to Settings",
+            None => "Back to Home",
+        }
+    }
+
+    fn cancel_active_route_view_work(&mut self, route: &Route) {
+        match route {
+            Route::Home => self.home.cancel_in_flight_thumbnails(),
+            Route::Search => self.search.cancel_in_flight_thumbnails(),
+            Route::Collections => self.collections.cancel_in_flight_thumbnails(),
+            Route::Tag(_) => self.tag.cancel_in_flight_thumbnails(),
+            Route::Uploader(_) => self.uploader.cancel_in_flight_thumbnails(),
+            Route::Detail(_) => self.clear_detail(),
+            Route::Account | Route::Settings => {}
         }
     }
 
@@ -1199,6 +1570,32 @@ impl WalloraApp {
             Route::Collections => {
                 return self.sync_gallery_thumbnails(GalleryKind::Collections);
             }
+            Route::Tag(id) => {
+                let needs_load = self.tag.controller.tag_id() != Some(id)
+                    || (*self.tag.controller.items_status() == DiscoveryStatus::Idle
+                        && !self.tag.controller.is_loading_items()
+                        && *self.tag.controller.metadata_status() == TagMetadataStatus::Idle
+                        && !self.tag.controller.is_loading_metadata());
+                if needs_load {
+                    return match self.tag.controller.open_tag(id, None) {
+                        Ok(reqs) => self.reload_tag_all(reqs),
+                        Err(_) => Task::none(),
+                    };
+                }
+                return self.sync_gallery_thumbnails(GalleryKind::Tag);
+            }
+            Route::Uploader(username) => {
+                let needs_load = self.uploader.controller.username() != Some(username.as_str())
+                    || (*self.uploader.controller.status() == DiscoveryStatus::Idle
+                        && !self.uploader.controller.is_loading());
+                if needs_load {
+                    return match self.uploader.controller.open_uploader(&username) {
+                        Ok(req) => self.reload_uploader_items(req),
+                        Err(_) => Task::none(),
+                    };
+                }
+                return self.sync_gallery_thumbnails(GalleryKind::Uploader);
+            }
             Route::Detail(_) | Route::Account | Route::Settings => return Task::none(),
         };
         let gallery = self.gallery_mut(kind);
@@ -1225,6 +1622,12 @@ impl WalloraApp {
                 GalleryKind::Home => Route::Home,
                 GalleryKind::Search => Route::Search,
                 GalleryKind::Collections => Route::Collections,
+                GalleryKind::Tag => self.tag.controller.tag_id().map_or(Route::Home, Route::Tag),
+                GalleryKind::Uploader => self
+                    .uploader
+                    .controller
+                    .username()
+                    .map_or(Route::Home, |u| Route::Uploader(u.to_string())),
             };
         }
     }
@@ -1263,6 +1666,7 @@ impl WalloraApp {
             op.handle.abort();
         }
         self.cancel_sign_in();
+        self.nav_stack.clear();
         self.clear_detail_and_return_to_gallery();
 
         let scope = self.session.scope();
@@ -1294,12 +1698,20 @@ impl WalloraApp {
         self.collections_username_input.clear();
         self.collections_username_error = None;
 
+        self.tag.clear_all_work();
+        self.tag.controller.sync_session(&self.session);
+
+        self.uploader.clear_all_work();
+        self.uploader.controller.sync_session(&self.session);
+
         Some(self.ensure_route_loaded(self.route.clone()))
     }
 
     fn apply_updated_browse_defaults(&mut self, defaults: &BrowseDefaults) -> Task<Message> {
         let scope = self.session.scope();
         self.home_toplist_range = defaults.toplist_range;
+        self.tag.controller.sync_session(&self.session);
+        self.uploader.controller.sync_session(&self.session);
         let next_filters = DiscoveryFilters::from_defaults(defaults);
         let next_home_view = match self.home.controller.view() {
             DiscoveryView::Toplist { .. } => DiscoveryView::Toplist {
@@ -1381,18 +1793,15 @@ impl WalloraApp {
             Message::Navigate(route) => {
                 if self.route != route {
                     tracing::info!(?route, "navigated view");
+                    self.nav_stack.clear();
                     let previous_route = std::mem::replace(&mut self.route, route.clone());
-                    match previous_route {
-                        Route::Home => self.home.cancel_in_flight_thumbnails(),
-                        Route::Search => self.search.cancel_in_flight_thumbnails(),
-                        Route::Collections => self.collections.cancel_in_flight_thumbnails(),
-                        Route::Detail(_) => self.clear_detail(),
-                        Route::Account | Route::Settings => {}
-                    }
+                    self.cancel_active_route_view_work(&previous_route);
                     return match route {
-                        Route::Home | Route::Search | Route::Collections => {
-                            self.ensure_route_loaded(route)
-                        }
+                        Route::Home
+                        | Route::Search
+                        | Route::Collections
+                        | Route::Tag(_)
+                        | Route::Uploader(_) => self.ensure_route_loaded(route),
                         Route::Settings => self.request_cache_stats(),
                         Route::Detail(_) | Route::Account => Task::none(),
                     };
@@ -1646,11 +2055,7 @@ impl WalloraApp {
             }
             Message::SearchTogglePurity(purity) => {
                 let mut filters = self.search.controller.filters().clone();
-                match purity {
-                    Purity::Sfw => filters.purity.sfw = !filters.purity.sfw,
-                    Purity::Sketchy => filters.purity.sketchy = !filters.purity.sketchy,
-                    Purity::Nsfw => filters.purity.nsfw = !filters.purity.nsfw,
-                }
+                filters.purity = toggle_purity_mask(filters.purity, purity);
                 self.apply_search_filters(filters)
             }
             Message::SearchSelectSorting(sorting) => {
@@ -1706,6 +2111,20 @@ impl WalloraApp {
                         Task::none()
                     }
                 }
+                GalleryKind::Tag => {
+                    if let Some(reqs) = self.tag.controller.refresh() {
+                        self.reload_tag_all(reqs)
+                    } else {
+                        Task::none()
+                    }
+                }
+                GalleryKind::Uploader => {
+                    if let Some(req) = self.uploader.controller.refresh() {
+                        self.reload_uploader_items(req)
+                    } else {
+                        Task::none()
+                    }
+                }
             },
             Message::GalleryRetry(kind) => match kind {
                 GalleryKind::Home | GalleryKind::Search => {
@@ -1720,10 +2139,24 @@ impl WalloraApp {
                     };
                     self.spawn_collection_items_request(req)
                 }
+                GalleryKind::Tag => {
+                    let Some(req) = self.tag.controller.retry_items() else {
+                        return Task::none();
+                    };
+                    self.spawn_tag_page_request(req)
+                }
+                GalleryKind::Uploader => {
+                    let Some(req) = self.uploader.controller.retry() else {
+                        return Task::none();
+                    };
+                    self.spawn_uploader_page_request(req)
+                }
             },
             Message::GallerySelectTile { kind, index } => {
                 if let Some(wallpaper) = self.gallery_items(kind).get(index).cloned() {
                     self.set_gallery_selected(kind, Some(index));
+                    let current = self.route.clone();
+                    self.push_nav_stack(current);
                     return self.open_detail(wallpaper.id.clone(), Some(wallpaper), kind);
                 }
                 Task::none()
@@ -1768,7 +2201,9 @@ impl WalloraApp {
                         .search
                         .controller
                         .apply_response(&mut self.session, response),
-                    GalleryKind::Collections => return Task::none(),
+                    GalleryKind::Collections | GalleryKind::Tag | GalleryKind::Uploader => {
+                        return Task::none();
+                    }
                 };
                 match outcome {
                     ApplyOutcome::Stale => Task::none(),
@@ -1870,6 +2305,8 @@ impl WalloraApp {
                     key,
                     input_focused,
                 }),
+                Route::Tag(_) => self.apply_gallery_key(GalleryKind::Tag, key),
+                Route::Uploader(_) => self.apply_gallery_key(GalleryKind::Uploader, key),
                 Route::Detail(_) | Route::Account | Route::Settings => Task::none(),
             },
             Message::SearchKeyFocusChecked {
@@ -1984,9 +2421,8 @@ impl WalloraApp {
                 }
             }
             Message::DetailRetryPreview => self.spawn_detail_preview(false),
-            Message::DetailSelectTag { id, .. } => {
-                self.open_search_with_query(QueryToken::tag_id(id).render())
-            }
+            Message::DetailSelectTag { id, name } => self.open_tag_route(id, Some(name)),
+            Message::DetailSelectUploader(username) => self.open_uploader_route(&username),
             Message::DetailMoreLikeThis(id) => {
                 let query = QueryToken::like(id.as_str())
                     .map(|token| token.render())
@@ -2002,6 +2438,17 @@ impl WalloraApp {
             Message::DetailOpenHandOff(action) => {
                 if let Some(detail) = &self.detail {
                     match action.wallpaper_url(&detail.wallpaper_id) {
+                        Ok(url) => self.open_wallhaven_url(&url),
+                        Err(err) => {
+                            self.session.set_notice(Some(SessionNotice::warning(err)));
+                        }
+                    }
+                }
+                Task::none()
+            }
+            Message::DetailOpenTagModerationHandOff => {
+                if let Some(detail) = &self.detail {
+                    match ProfileTagUnsupportedAction::tag_moderation_url(&detail.wallpaper_id) {
                         Ok(url) => self.open_wallhaven_url(&url),
                         Err(err) => {
                             self.session.set_notice(Some(SessionNotice::warning(err)));
@@ -2181,12 +2628,7 @@ impl WalloraApp {
                 }
             }
             Message::CollectionsTogglePurity(purity) => {
-                let mut next = self.collections.controller.purity();
-                match purity {
-                    Purity::Sfw => next.sfw = !next.sfw,
-                    Purity::Sketchy => next.sketchy = !next.sketchy,
-                    Purity::Nsfw => next.nsfw = !next.nsfw,
-                }
+                let next = toggle_purity_mask(self.collections.controller.purity(), purity);
                 match self.collections.controller.set_purity(next) {
                     Some(req) => self.reload_collections_items(req),
                     None => Task::none(),
@@ -2243,6 +2685,222 @@ impl WalloraApp {
                 self.open_wallhaven_url(&url);
                 Task::none()
             }
+            Message::TagBack => {
+                let target = self.nav_stack.pop().unwrap_or(Route::Home);
+                self.restore_route(target)
+            }
+            Message::TagRetryMetadata => match self.tag.controller.retry_metadata() {
+                Some(req) => self.spawn_tag_metadata_request(req),
+                None => Task::none(),
+            },
+            Message::TagMetadataLoaded(response) => {
+                let response = *response;
+                let resp_gen = response.generation;
+                let resp_scope = response.scope.clone();
+                let resp_tag_id = response.tag_id;
+                let previous = self.session.scope();
+                match self
+                    .tag
+                    .controller
+                    .apply_metadata_response(&mut self.session, response)
+                {
+                    TagMetadataOutcome::Stale => Task::none(),
+                    TagMetadataOutcome::Revoked(_) => self
+                        .retire_changed_scope(&previous)
+                        .unwrap_or_else(Task::none),
+                    TagMetadataOutcome::Applied | TagMetadataOutcome::Failed(_) => {
+                        if self.tag.metadata_in_flight.as_ref().is_some_and(|op| {
+                            op.generation == resp_gen
+                                && op.scope == resp_scope
+                                && op.tag_id == resp_tag_id
+                        }) {
+                            self.tag.metadata_in_flight = None;
+                        }
+                        Task::none()
+                    }
+                }
+            }
+            Message::TagPageLoaded(response) => {
+                let response = *response;
+                let resp_gen = response.generation;
+                let resp_scope = response.scope.clone();
+                let resp_page = response.page;
+                let previous = self.session.scope();
+                let outcome = self
+                    .tag
+                    .controller
+                    .apply_page_response(&mut self.session, response);
+                match outcome {
+                    ApplyOutcome::Stale => Task::none(),
+                    ApplyOutcome::Revoked(_) => self
+                        .retire_changed_scope(&previous)
+                        .unwrap_or_else(Task::none),
+                    ApplyOutcome::Applied { .. } => {
+                        if self.tag.page_in_flight.as_ref().is_some_and(|op| {
+                            op.generation == resp_gen
+                                && op.scope == resp_scope
+                                && op.page == resp_page
+                        }) {
+                            self.tag.page_in_flight = None;
+                        }
+                        if self.active_gallery_kind() == Some(GalleryKind::Tag) {
+                            self.sync_gallery_thumbnails(GalleryKind::Tag)
+                        } else {
+                            Task::none()
+                        }
+                    }
+                    ApplyOutcome::Failed(_) => {
+                        if self.tag.page_in_flight.as_ref().is_some_and(|op| {
+                            op.generation == resp_gen
+                                && op.scope == resp_scope
+                                && op.page == resp_page
+                        }) {
+                            self.tag.page_in_flight = None;
+                        }
+                        Task::none()
+                    }
+                }
+            }
+            Message::TagTogglePurity(purity) => {
+                let next = toggle_purity_mask(self.tag.controller.purity(), purity);
+                match self.tag.controller.set_purity(next) {
+                    Some(req) => self.reload_tag_items(req),
+                    None => Task::none(),
+                }
+            }
+            Message::TagSelectSorting(sorting) => match self.tag.controller.set_sorting(sorting) {
+                Some(req) => self.reload_tag_items(req),
+                None => Task::none(),
+            },
+            Message::TagSelectOrder(order) => match self.tag.controller.set_order(Some(order)) {
+                Some(req) => self.reload_tag_items(req),
+                None => Task::none(),
+            },
+            Message::TagSelectTopRange(range) => match self.tag.controller.set_top_range(range) {
+                Some(req) => self.reload_tag_items(req),
+                None => Task::none(),
+            },
+            Message::TagSearchThisTag => {
+                let Some(query) = self.tag.controller.search_query_string() else {
+                    return Task::none();
+                };
+                self.tag.cancel_in_flight_thumbnails();
+                self.open_search_with_query(query)
+            }
+            Message::TagOpenDirectoryHandOff => {
+                self.open_wallhaven_url(ProfileTagUnsupportedAction::tag_directory_url());
+                Task::none()
+            }
+            Message::UploaderBack => {
+                let target = self.nav_stack.pop().unwrap_or(Route::Home);
+                self.restore_route(target)
+            }
+            Message::UploaderPageLoaded(response) => {
+                let response = *response;
+                let resp_gen = response.generation;
+                let resp_scope = response.scope.clone();
+                let resp_page = response.page;
+                let previous = self.session.scope();
+                let outcome = self
+                    .uploader
+                    .controller
+                    .apply_response(&mut self.session, response);
+                match outcome {
+                    ApplyOutcome::Stale => Task::none(),
+                    ApplyOutcome::Revoked(_) => self
+                        .retire_changed_scope(&previous)
+                        .unwrap_or_else(Task::none),
+                    ApplyOutcome::Applied { .. } => {
+                        if self.uploader.page_in_flight.as_ref().is_some_and(|op| {
+                            op.generation == resp_gen
+                                && op.scope == resp_scope
+                                && op.page == resp_page
+                        }) {
+                            self.uploader.page_in_flight = None;
+                        }
+                        if self.active_gallery_kind() == Some(GalleryKind::Uploader) {
+                            self.sync_gallery_thumbnails(GalleryKind::Uploader)
+                        } else {
+                            Task::none()
+                        }
+                    }
+                    ApplyOutcome::Failed(_) => {
+                        if self.uploader.page_in_flight.as_ref().is_some_and(|op| {
+                            op.generation == resp_gen
+                                && op.scope == resp_scope
+                                && op.page == resp_page
+                        }) {
+                            self.uploader.page_in_flight = None;
+                        }
+                        Task::none()
+                    }
+                }
+            }
+            Message::UploaderTogglePurity(purity) => {
+                let next = toggle_purity_mask(self.uploader.controller.purity(), purity);
+                match self.uploader.controller.set_purity(next) {
+                    Some(req) => self.reload_uploader_items(req),
+                    None => Task::none(),
+                }
+            }
+            Message::UploaderSelectSorting(sorting) => {
+                match self.uploader.controller.set_sorting(sorting) {
+                    Some(req) => self.reload_uploader_items(req),
+                    None => Task::none(),
+                }
+            }
+            Message::UploaderSelectOrder(order) => {
+                match self.uploader.controller.set_order(Some(order)) {
+                    Some(req) => self.reload_uploader_items(req),
+                    None => Task::none(),
+                }
+            }
+            Message::UploaderSelectTopRange(range) => {
+                match self.uploader.controller.set_top_range(range) {
+                    Some(req) => self.reload_uploader_items(req),
+                    None => Task::none(),
+                }
+            }
+            Message::UploaderViewPublicCollections => {
+                let Some(username) = self.uploader.controller.username().map(str::to_string) else {
+                    return Task::none();
+                };
+                self.uploader.cancel_in_flight_thumbnails();
+                self.nav_stack.clear();
+                self.route = Route::Collections;
+                self.collections_username_input = username.clone();
+                self.collections_username_error = None;
+                match self.collections.controller.load_user_collections(&username) {
+                    Ok(req) => {
+                        if self.collections.controller.selected_collection().is_none() {
+                            self.collections.clear_items_work();
+                        }
+                        self.spawn_collection_list_request(req)
+                    }
+                    Err(err) => {
+                        self.collections_username_error = Some(err.to_string());
+                        Task::none()
+                    }
+                }
+            }
+            Message::UploaderSearchUploads => {
+                let Some(query) = self.uploader.controller.search_query_string() else {
+                    return Task::none();
+                };
+                self.uploader.cancel_in_flight_thumbnails();
+                self.open_search_with_query(query)
+            }
+            Message::UploaderOpenProfileHandOff => {
+                if let Some(username) = self.uploader.controller.username() {
+                    match ProfileTagUnsupportedAction::user_profile_url(username) {
+                        Ok(url) => self.open_wallhaven_url(&url),
+                        Err(err) => {
+                            self.session.set_notice(Some(SessionNotice::warning(err)));
+                        }
+                    }
+                }
+                Task::none()
+            }
         }
     }
 
@@ -2279,6 +2937,8 @@ impl WalloraApp {
             GalleryKind::Home => self.home.cancel_in_flight_thumbnails(),
             GalleryKind::Search => self.search.cancel_in_flight_thumbnails(),
             GalleryKind::Collections => self.collections.cancel_in_flight_thumbnails(),
+            GalleryKind::Tag => self.tag.cancel_in_flight_thumbnails(),
+            GalleryKind::Uploader => self.uploader.cancel_in_flight_thumbnails(),
         }
         self.route = Route::Detail(id.clone());
         let op_id = self.allocate_op_id();
@@ -2299,22 +2959,48 @@ impl WalloraApp {
         task
     }
 
-    fn detail_back(&mut self) -> Task<Message> {
-        let return_to = self
-            .detail
-            .as_ref()
-            .map_or(GalleryKind::Home, |d| d.return_to);
-        self.clear_detail();
-        self.route = match return_to {
-            GalleryKind::Home => Route::Home,
-            GalleryKind::Search => Route::Search,
-            GalleryKind::Collections => Route::Collections,
+    fn open_tag_route(&mut self, tag_id: u64, hint_name: Option<String>) -> Task<Message> {
+        let reqs = match self.tag.controller.open_tag(tag_id, hint_name) {
+            Ok(reqs) => reqs,
+            Err(err) => {
+                self.session.set_notice(Some(SessionNotice::warning(err)));
+                return Task::none();
+            }
         };
+        let previous = self.route.clone();
+        self.push_nav_stack(previous.clone());
+        self.cancel_active_route_view_work(&previous);
+        self.route = Route::Tag(tag_id);
+        self.reload_tag_all(reqs)
+    }
 
-        let scroll_y = self.gallery_metrics(return_to).scroll_y;
+    fn open_uploader_route(&mut self, raw_username: &str) -> Task<Message> {
+        let clean = match validate_username(raw_username) {
+            Ok(clean) => clean,
+            Err(err) => {
+                self.session.set_notice(Some(SessionNotice::warning(err)));
+                return Task::none();
+            }
+        };
+        let req = match self.uploader.controller.open_uploader(&clean) {
+            Ok(req) => req,
+            Err(err) => {
+                self.session.set_notice(Some(SessionNotice::warning(err)));
+                return Task::none();
+            }
+        };
+        let previous = self.route.clone();
+        self.push_nav_stack(previous.clone());
+        self.cancel_active_route_view_work(&previous);
+        self.route = Route::Uploader(clean);
+        self.reload_uploader_items(req)
+    }
+
+    fn restore_gallery_view(&mut self, kind: GalleryKind) -> Task<Message> {
+        let scroll_y = self.gallery_metrics(kind).scroll_y;
         let scroll_task = if scroll_y > 0.0 {
             operation::scroll_to(
-                self.gallery_scrollable_id(return_to).clone(),
+                self.gallery_scrollable_id(kind).clone(),
                 AbsoluteOffset {
                     x: Some(0.0),
                     y: Some(scroll_y),
@@ -2323,7 +3009,7 @@ impl WalloraApp {
         } else {
             Task::none()
         };
-        let thumb_task = self.sync_gallery_thumbnails(return_to);
+        let thumb_task = self.sync_gallery_thumbnails(kind);
         if scroll_task.units() == 0 {
             thumb_task
         } else if thumb_task.units() == 0 {
@@ -2331,6 +3017,92 @@ impl WalloraApp {
         } else {
             Task::batch([scroll_task, thumb_task])
         }
+    }
+
+    fn restore_route(&mut self, target: Route) -> Task<Message> {
+        let previous = self.route.clone();
+        self.cancel_active_route_view_work(&previous);
+        match target {
+            Route::Home => {
+                self.route = Route::Home;
+                self.restore_gallery_view(GalleryKind::Home)
+            }
+            Route::Search => {
+                self.route = Route::Search;
+                self.restore_gallery_view(GalleryKind::Search)
+            }
+            Route::Collections => {
+                self.route = Route::Collections;
+                self.restore_gallery_view(GalleryKind::Collections)
+            }
+            Route::Tag(id) => {
+                self.route = Route::Tag(id);
+                let already_loaded = self.tag.controller.tag_id() == Some(id)
+                    && (*self.tag.controller.items_status() != DiscoveryStatus::Idle
+                        || self.tag.controller.is_loading_items()
+                        || *self.tag.controller.metadata_status() != TagMetadataStatus::Idle
+                        || self.tag.controller.is_loading_metadata());
+                if already_loaded {
+                    self.restore_gallery_view(GalleryKind::Tag)
+                } else {
+                    self.ensure_route_loaded(Route::Tag(id))
+                }
+            }
+            Route::Uploader(username) => {
+                self.route = Route::Uploader(username.clone());
+                let already_loaded = self.uploader.controller.username() == Some(username.as_str())
+                    && (*self.uploader.controller.status() != DiscoveryStatus::Idle
+                        || self.uploader.controller.is_loading());
+                if already_loaded {
+                    self.restore_gallery_view(GalleryKind::Uploader)
+                } else {
+                    self.ensure_route_loaded(Route::Uploader(username))
+                }
+            }
+            Route::Detail(id) => {
+                let return_to = match self.nav_stack.last() {
+                    Some(Route::Search) => GalleryKind::Search,
+                    Some(Route::Collections) => GalleryKind::Collections,
+                    Some(Route::Tag(_)) => GalleryKind::Tag,
+                    Some(Route::Uploader(_)) => GalleryKind::Uploader,
+                    _ => GalleryKind::Home,
+                };
+                let summary = self
+                    .gallery_items(return_to)
+                    .iter()
+                    .find(|w| w.id == id)
+                    .cloned();
+                self.open_detail(id, summary, return_to)
+            }
+            Route::Account => {
+                self.route = Route::Account;
+                Task::none()
+            }
+            Route::Settings => {
+                self.route = Route::Settings;
+                self.request_cache_stats()
+            }
+        }
+    }
+
+    fn detail_back(&mut self) -> Task<Message> {
+        let fallback = match self
+            .detail
+            .as_ref()
+            .map_or(GalleryKind::Home, |d| d.return_to)
+        {
+            GalleryKind::Home => Route::Home,
+            GalleryKind::Search => Route::Search,
+            GalleryKind::Collections => Route::Collections,
+            GalleryKind::Tag => self.tag.controller.tag_id().map_or(Route::Home, Route::Tag),
+            GalleryKind::Uploader => self
+                .uploader
+                .controller
+                .username()
+                .map_or(Route::Home, |u| Route::Uploader(u.to_string())),
+        };
+        let target = self.nav_stack.pop().unwrap_or(fallback);
+        self.restore_route(target)
     }
 
     fn retry_detail_metadata(&mut self) -> Task<Message> {
@@ -2417,6 +3189,7 @@ impl WalloraApp {
     }
 
     fn open_search_with_query(&mut self, query: String) -> Task<Message> {
+        self.nav_stack.clear();
         self.clear_detail();
         self.route = Route::Search;
         let defaults = self.session.browse_defaults();
@@ -2615,6 +3388,10 @@ impl WalloraApp {
             (size.width - COLLECTIONS_SIDEBAR_WIDTH - 16.0).max(320.0),
             size.height,
         );
+        self.tag.metrics.set_window_size(size.width, size.height);
+        self.uploader
+            .metrics
+            .set_window_size(size.width, size.height);
         match self.active_gallery_kind() {
             Some(kind) => self.sync_gallery_thumbnails(kind),
             None => Task::none(),
@@ -2626,6 +3403,8 @@ impl WalloraApp {
             if let Some(idx) = self.gallery_selected(kind)
                 && let Some(wallpaper) = self.gallery_items(kind).get(idx).cloned()
             {
+                let current = self.route.clone();
+                self.push_nav_stack(current);
                 return self.open_detail(wallpaper.id.clone(), Some(wallpaper), kind);
             }
             return Task::none();
@@ -3049,6 +3828,26 @@ impl WalloraApp {
                     thumbnail_state: |wallpaper| self.collections.thumbnail_state(&wallpaper.id),
                 })
             }
+            Route::Tag(_) => views::tag::view(views::tag::TagViewState {
+                controller: &self.tag.controller,
+                back_label: self.back_label_for_stack(),
+                selectable_purity: selectable,
+                is_guest,
+                scrollable_id: &self.tag.scrollable_id,
+                metrics: &self.tag.metrics,
+                selected: self.tag.selected,
+                thumbnail_state: |wallpaper| self.tag.thumbnail_state(&wallpaper.id),
+            }),
+            Route::Uploader(_) => views::uploader::view(views::uploader::UploaderViewState {
+                controller: &self.uploader.controller,
+                back_label: self.back_label_for_stack(),
+                selectable_purity: selectable,
+                is_guest,
+                scrollable_id: &self.uploader.scrollable_id,
+                metrics: &self.uploader.metrics,
+                selected: self.uploader.selected,
+                thumbnail_state: |wallpaper| self.uploader.thumbnail_state(&wallpaper.id),
+            }),
             Route::Detail(_) => views::detail::view(self.detail_view_state(is_guest)),
             Route::Account => views::account::view(views::account::AccountViewState {
                 session: &self.session,
@@ -3106,7 +3905,7 @@ mod tests {
     use wallora_core::domain::{
         AccountId, AspectRatio, CategoryMask, CollectionSummary, Dimensions, IdentityCheckOutcome,
         InMemoryCredentialStore, LocalPreferences, PurityMask, SearchMeta, SearchPage, SessionKind,
-        SortOrder, Thumbs, UserSettings, UsernameVerification, Wallpaper,
+        SortOrder, Tag, Thumbs, UserSettings, UsernameVerification, Wallpaper,
     };
     use wallora_core::provider::{ImageClass, ProviderError};
     use wallora_core::services::cache::{CacheConnectivity, CacheKey, crc32_ieee};
@@ -3114,7 +3913,7 @@ mod tests {
         AccountRefreshPayload, CollectionItemsResponse, CollectionListResponse,
         CollectionListStatus, CollectionSource, CollectionUnsupportedAction,
         DetailUnsupportedAction, DownloadOutcome, OwnItemsBlockedReason, PageResponse, SignInProbe,
-        UnsupportedFeature,
+        TagMetadataResponse, UnsupportedFeature,
     };
 
     use crate::message::DetailCopyTarget;
@@ -5132,7 +5931,7 @@ mod tests {
         ));
         let _ = app.view();
 
-        // Tag click navigates to Search with id:{tag.id}.
+        // Tag click opens Route::Tag(42), and "Search this tag" navigates to Search with id:42.
         assert!(
             app.update(Message::DetailSelectTag {
                 id: 42,
@@ -5141,8 +5940,11 @@ mod tests {
             .units()
                 > 0
         );
-        assert_eq!(app.route, Route::Search);
+        assert_eq!(app.route, Route::Tag(42));
         assert!(app.detail.is_none());
+        assert_eq!(app.tag.controller.tag_id(), Some(42));
+        assert!(app.update(Message::TagSearchThisTag).units() > 0);
+        assert_eq!(app.route, Route::Search);
         assert_eq!(app.search_query_input, "id:42");
         assert_eq!(
             app.search.controller.query_for_page(1).q.as_deref(),
@@ -5637,5 +6439,502 @@ mod tests {
         assert_eq!(app.session.scope().kind, SessionKind::Guest);
         assert!(app.collections.controller.items().is_empty());
         assert!(app.collections.controller.selected_collection().is_none());
+    }
+
+    fn deliver_tag_metadata(
+        app: &mut WalloraApp,
+        tag_id: u64,
+        result: Result<Tag, ProviderError>,
+    ) -> Task<Message> {
+        let generation = app.tag.controller.metadata_generation();
+        let scope = app.session.scope();
+        app.update(Message::TagMetadataLoaded(Box::new(TagMetadataResponse {
+            generation,
+            scope,
+            tag_id,
+            result,
+        })))
+    }
+
+    fn deliver_tag_page(
+        app: &mut WalloraApp,
+        page: u32,
+        result: Result<SearchPage, ProviderError>,
+    ) -> Task<Message> {
+        let generation = app.tag.controller.items_generation();
+        let scope = app.session.scope();
+        app.update(Message::TagPageLoaded(Box::new(PageResponse {
+            generation,
+            scope,
+            page,
+            result,
+        })))
+    }
+
+    fn deliver_uploader_page(
+        app: &mut WalloraApp,
+        page: u32,
+        result: Result<SearchPage, ProviderError>,
+    ) -> Task<Message> {
+        let generation = app.uploader.controller.generation();
+        let scope = app.session.scope();
+        app.update(Message::UploaderPageLoaded(Box::new(PageResponse {
+            generation,
+            scope,
+            page,
+            result,
+        })))
+    }
+
+    #[test]
+    fn detail_to_tag_page_round_trip_filters_handoff_and_search_work() {
+        let paths = TestPaths::new();
+        let mut app = test_app(&paths);
+        static TAG_LAUNCHES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        TAG_LAUNCHES.lock().unwrap().clear();
+        app.launch_browser = |url| {
+            wallora_windows::validate_wallhaven_handoff_url(url)?;
+            TAG_LAUNCHES.lock().unwrap().push(url.to_string());
+            Ok(())
+        };
+
+        assert!(app.ensure_route_loaded(Route::Home).units() > 0);
+        let _ = deliver_page(
+            &mut app,
+            GalleryKind::Home,
+            1,
+            Ok(sample_page(&["h1"], 1, 1, None)),
+        );
+        let _ = app.update(Message::GallerySelectTile {
+            kind: GalleryKind::Home,
+            index: 0,
+        });
+        assert_eq!(app.route, Route::Detail(WallpaperId::new("h1")));
+        let _ = app.view();
+
+        // Clicking tag 42 opens Route::Tag(42), starts metadata + id:42 page 1 fetch.
+        assert!(
+            app.update(Message::DetailSelectTag {
+                id: 42,
+                name: "landscape".to_string(),
+            })
+            .units()
+                > 0
+        );
+        assert_eq!(app.route, Route::Tag(42));
+        assert_eq!(app.active_gallery_kind(), Some(GalleryKind::Tag));
+        assert_eq!(
+            app.tag.controller.query_for_page(1).unwrap().q.as_deref(),
+            Some("id:42")
+        );
+        let _ = app.view();
+
+        // Metadata failure + retry, then successful load.
+        let _ = deliver_tag_metadata(&mut app, 42, Err(ProviderError::Timeout));
+        assert!(matches!(
+            app.tag.controller.metadata_status(),
+            TagMetadataStatus::Failed(ProviderError::Timeout)
+        ));
+        let _ = app.view();
+        assert!(app.update(Message::TagRetryMetadata).units() > 0);
+        let _ = deliver_tag_metadata(
+            &mut app,
+            42,
+            Ok(Tag {
+                id: 42,
+                name: "landscape".to_string(),
+                alias: "scenery".to_string(),
+                category_id: 2,
+                category: "Nature".to_string(),
+                purity: Purity::Sfw,
+                created_at: "2020-01-01 00:00:00".to_string(),
+            }),
+        );
+        assert_eq!(
+            app.tag.controller.tag().map(|t| t.alias.as_str()),
+            Some("scenery")
+        );
+
+        // Deliver page 1, load thumbnail, scroll & infinite-scroll page 2.
+        let _ = deliver_tag_page(
+            &mut app,
+            1,
+            Ok(sample_page(&["t1", "t2", "t3", "t4"], 1, 2, None)),
+        );
+        let _ = deliver_thumb(
+            &mut app,
+            GalleryKind::Tag,
+            "t1",
+            Ok(sample_loaded_thumb(false)),
+        );
+        let _ = app.view();
+
+        let content_h = app.tag.metrics.total_content_height(4);
+        assert!(
+            app.update(Message::GalleryScrolled {
+                kind: GalleryKind::Tag,
+                offset_y: 240.0,
+                viewport_width: 1200.0,
+                viewport_height: 580.0,
+                content_height: content_h,
+            })
+            .units()
+                > 0
+        );
+        let _ = deliver_tag_page(&mut app, 2, Ok(sample_page(&["t5"], 2, 2, None)));
+        assert!(!app.tag.controller.can_load_more());
+        assert_eq!(app.tag.controller.items().len(), 5);
+
+        // Keyboard select & Enter opens Detail(t1); Back returns to Tag(42) preserving scroll & items.
+        let _ = app.update(Message::RuntimeGalleryKey(GridKey::Home));
+        app.tag.metrics.scroll_y = 240.0;
+        assert_eq!(app.tag.selected, Some(0));
+        assert!(
+            app.update(Message::RuntimeGalleryKey(GridKey::Activate))
+                .units()
+                > 0
+        );
+        assert_eq!(app.route, Route::Detail(WallpaperId::new("t1")));
+        let _ = app.view();
+
+        let back_to_tag = app.update(Message::DetailBack);
+        assert!(back_to_tag.units() > 0);
+        assert_eq!(app.route, Route::Tag(42));
+        assert_eq!(app.tag.controller.items().len(), 5);
+        assert_eq!(app.tag.metrics.scroll_y, 240.0);
+        assert_eq!(app.tag.selected, Some(0));
+        assert!(matches!(
+            app.tag.thumbnails.get(&WallpaperId::new("t1")),
+            Some(ThumbnailEntry::Loaded { .. })
+        ));
+
+        // Purity/sorting/order/toplist controls keep metadata intact and reload items.
+        assert!(
+            app.update(Message::TagTogglePurity(Purity::Sketchy))
+                .units()
+                > 0
+        );
+        assert!(app.tag.controller.purity().sketchy);
+        assert!(app.update(Message::TagSelectOrder(SortOrder::Asc)).units() > 0);
+        assert_eq!(app.tag.controller.order(), Some(SortOrder::Asc));
+        assert!(
+            app.update(Message::TagSelectTopRange(TopRange::OneWeek))
+                .units()
+                > 0
+        );
+        assert_eq!(app.tag.controller.sorting(), Sorting::Toplist);
+        assert_eq!(app.tag.controller.top_range(), TopRange::OneWeek);
+        assert!(app.tag.controller.tag().is_some());
+
+        // Empty state renders cleanly.
+        let _ = deliver_tag_page(&mut app, 1, Ok(sample_page(&[], 1, 1, None)));
+        assert_eq!(*app.tag.controller.items_status(), DiscoveryStatus::Empty);
+        let _ = app.view();
+
+        // Tag Directory hand-off opens https://wallhaven.cc/tags.
+        let _ = app.update(Message::TagOpenDirectoryHandOff);
+        assert_eq!(
+            *TAG_LAUNCHES.lock().unwrap(),
+            vec!["https://wallhaven.cc/tags".to_string()]
+        );
+
+        // TagBack returns to Detail(h1), and DetailBack returns to Home.
+        assert!(app.update(Message::TagBack).units() > 0);
+        assert_eq!(app.route, Route::Detail(WallpaperId::new("h1")));
+        let _ = app.update(Message::DetailBack);
+        assert_eq!(app.route, Route::Home);
+    }
+
+    #[test]
+    fn detail_to_uploader_page_round_trip_collections_handoff_and_search_work() {
+        let paths = TestPaths::new();
+        let mut app = test_app(&paths);
+        static UP_LAUNCHES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        UP_LAUNCHES.lock().unwrap().clear();
+        app.launch_browser = |url| {
+            wallora_windows::validate_wallhaven_handoff_url(url)?;
+            UP_LAUNCHES.lock().unwrap().push(url.to_string());
+            Ok(())
+        };
+
+        assert!(app.ensure_route_loaded(Route::Home).units() > 0);
+        let _ = deliver_page(
+            &mut app,
+            GalleryKind::Home,
+            1,
+            Ok(sample_page(&["h2"], 1, 1, None)),
+        );
+        let _ = app.update(Message::GallerySelectTile {
+            kind: GalleryKind::Home,
+            index: 0,
+        });
+        let op_id = match &app.detail.as_ref().unwrap().metadata {
+            DetailMetadataState::Loading { op_id, .. } => *op_id,
+            _ => panic!("expected detail metadata loading"),
+        };
+        let scope = app.session.scope();
+        let _ = app.update(Message::DetailMetadataLoaded {
+            op_id,
+            scope,
+            id: WallpaperId::new("h2"),
+            result: Box::new(Ok(sample_detail_wallpaper("h2", Purity::Sfw))),
+        });
+        let _ = app.view();
+
+        // Detail tagging/moderation hand-off opens https://wallhaven.cc/w/h2.
+        let _ = app.update(Message::DetailOpenTagModerationHandOff);
+
+        // Invalid uploader username warns without leaving Detail.
+        assert_eq!(
+            app.update(Message::DetailSelectUploader("../bad".to_string()))
+                .units(),
+            0
+        );
+        assert_eq!(app.route, Route::Detail(WallpaperId::new("h2")));
+        assert!(app.session.notice().is_some());
+
+        // Clicking valid uploader opens Route::Uploader("artist_one") with q=@artist_one.
+        assert!(
+            app.update(Message::DetailSelectUploader("artist_one".to_string()))
+                .units()
+                > 0
+        );
+        assert_eq!(app.route, Route::Uploader("artist_one".to_string()));
+        assert_eq!(app.active_gallery_kind(), Some(GalleryKind::Uploader));
+        assert_eq!(
+            app.uploader
+                .controller
+                .query_for_page(1)
+                .unwrap()
+                .q
+                .as_deref(),
+            Some("@artist_one")
+        );
+
+        let _ = deliver_uploader_page(
+            &mut app,
+            1,
+            Ok(sample_page(&["u1", "u2", "u3", "u4"], 1, 2, None)),
+        );
+        let _ = deliver_thumb(
+            &mut app,
+            GalleryKind::Uploader,
+            "u1",
+            Ok(sample_loaded_thumb(false)),
+        );
+        let _ = app.view();
+
+        let content_h = app.uploader.metrics.total_content_height(4);
+        assert!(
+            app.update(Message::GalleryScrolled {
+                kind: GalleryKind::Uploader,
+                offset_y: 260.0,
+                viewport_width: 1200.0,
+                viewport_height: 580.0,
+                content_height: content_h,
+            })
+            .units()
+                > 0
+        );
+        let _ = deliver_uploader_page(&mut app, 2, Ok(sample_page(&["u5"], 2, 2, None)));
+        assert_eq!(app.uploader.controller.items().len(), 5);
+
+        // Click tile on Uploader -> Detail -> Back returns to Uploader preserving scroll & items.
+        app.uploader.metrics.scroll_y = 260.0;
+        assert!(
+            app.update(Message::GallerySelectTile {
+                kind: GalleryKind::Uploader,
+                index: 1,
+            })
+            .units()
+                > 0
+        );
+        assert_eq!(app.route, Route::Detail(WallpaperId::new("u2")));
+        let _ = app.view();
+
+        assert!(app.update(Message::DetailBack).units() > 0);
+        assert_eq!(app.route, Route::Uploader("artist_one".to_string()));
+        assert_eq!(app.uploader.controller.items().len(), 5);
+        assert_eq!(app.uploader.metrics.scroll_y, 260.0);
+        assert_eq!(app.uploader.selected, Some(1));
+
+        // Purity/sorting/order controls + Profile hand-off.
+        assert!(
+            app.update(Message::UploaderTogglePurity(Purity::Sketchy))
+                .units()
+                > 0
+        );
+        assert!(app.uploader.controller.purity().sketchy);
+        assert!(
+            app.update(Message::UploaderSelectSorting(Sorting::Favorites))
+                .units()
+                > 0
+        );
+        assert_eq!(app.uploader.controller.sorting(), Sorting::Favorites);
+        let _ = app.update(Message::UploaderOpenProfileHandOff);
+
+        assert_eq!(
+            *UP_LAUNCHES.lock().unwrap(),
+            vec![
+                "https://wallhaven.cc/w/h2".to_string(),
+                "https://wallhaven.cc/user/artist_one".to_string(),
+            ]
+        );
+
+        // UploaderBack returns to Detail(h2), then re-enter Uploader and jump to public collections & search.
+        assert!(app.update(Message::UploaderBack).units() > 0);
+        assert_eq!(app.route, Route::Detail(WallpaperId::new("h2")));
+        assert!(
+            app.update(Message::DetailSelectUploader("artist_one".to_string()))
+                .units()
+                > 0
+        );
+        assert!(app.update(Message::UploaderViewPublicCollections).units() > 0);
+        assert_eq!(app.route, Route::Collections);
+        assert_eq!(app.collections_username_input, "artist_one");
+        assert_eq!(
+            app.collections.controller.user_collections_status(),
+            &CollectionListStatus::Loading
+        );
+        assert!(app.collections.list_in_flight.is_some());
+
+        // Jump from Uploader -> Search @artist_one.
+        assert!(
+            app.update(Message::DetailSelectUploader("artist_one".to_string()))
+                .units()
+                > 0
+        );
+        assert!(app.update(Message::UploaderSearchUploads).units() > 0);
+        assert_eq!(app.route, Route::Search);
+        assert_eq!(app.search_query_input, "@artist_one");
+        assert_eq!(
+            app.search.controller.query_for_page(1).q.as_deref(),
+            Some("@artist_one")
+        );
+    }
+
+    #[test]
+    fn tag_and_uploader_scope_transitions_cancel_tasks_and_clear_textures() {
+        let paths = TestPaths::new();
+        let mut app = test_app(&paths);
+        sign_in(&mut app, "alice");
+        let alice_id = app.session.active_account().unwrap().id.clone();
+        sign_in(&mut app, "bob");
+
+        // Open Tag(10), populate metadata + loaded texture + in-flight thumb + in-flight page 2 + metadata retry.
+        assert!(
+            app.update(Message::DetailSelectTag {
+                id: 10,
+                name: "scenery".to_string(),
+            })
+            .units()
+                > 0
+        );
+        let _ = deliver_tag_metadata(&mut app, 10, Err(ProviderError::Network));
+        assert!(app.update(Message::TagRetryMetadata).units() > 0);
+        let tag_meta_handle = app.tag.metadata_in_flight.as_ref().unwrap().handle.clone();
+
+        let _ = deliver_tag_page(&mut app, 1, Ok(sample_page(&["tg1", "tg2"], 1, 2, None)));
+        let _ = deliver_thumb(
+            &mut app,
+            GalleryKind::Tag,
+            "tg1",
+            Ok(sample_loaded_thumb(false)),
+        );
+        let (tg2_cancel, tg2_handle) = match app.tag.thumbnails.get(&WallpaperId::new("tg2")) {
+            Some(ThumbnailEntry::InFlight { cancel, handle, .. }) => {
+                (cancel.clone(), handle.clone())
+            }
+            _ => panic!("tg2 should be in flight"),
+        };
+        let next_tag_req = app.tag.controller.request_next_page().unwrap();
+        let _ = app.spawn_tag_page_request(next_tag_req);
+        let tag_page_handle = app.tag.page_in_flight.as_ref().unwrap().handle.clone();
+
+        // Also populate Uploader("curator") in-flight work & texture before returning to Tag(10).
+        assert!(
+            app.update(Message::DetailSelectUploader("curator".to_string()))
+                .units()
+                > 0
+        );
+        let _ = deliver_uploader_page(&mut app, 1, Ok(sample_page(&["up1", "up2"], 1, 2, None)));
+        let _ = deliver_thumb(
+            &mut app,
+            GalleryKind::Uploader,
+            "up1",
+            Ok(sample_loaded_thumb(false)),
+        );
+        let (up2_cancel, up2_handle) = match app.uploader.thumbnails.get(&WallpaperId::new("up2")) {
+            Some(ThumbnailEntry::InFlight { cancel, handle, .. }) => {
+                (cancel.clone(), handle.clone())
+            }
+            _ => panic!("up2 should be in flight"),
+        };
+        let next_up_req = app.uploader.controller.request_next_page().unwrap();
+        let _ = app.spawn_uploader_page_request(next_up_req);
+        let up_page_handle = app.uploader.page_in_flight.as_ref().unwrap().handle.clone();
+
+        // SwitchAccount while on Uploader cancels both Tag and Uploader tasks, clears textures, and reloads Uploader.
+        assert!(app.update(Message::SwitchAccount(alice_id)).units() > 0);
+        assert!(tag_meta_handle.is_aborted());
+        assert!(tag_page_handle.is_aborted());
+        assert!(tg2_cancel.is_cancelled());
+        assert!(tg2_handle.is_aborted());
+        assert!(app.tag.thumbnails.is_empty());
+        assert!(app.tag.controller.items().is_empty());
+        assert_eq!(
+            app.tag.controller.metadata_status(),
+            &TagMetadataStatus::Idle
+        );
+
+        assert!(up_page_handle.is_aborted());
+        assert!(up2_cancel.is_cancelled());
+        assert!(up2_handle.is_aborted());
+        assert!(app.uploader.thumbnails.is_empty());
+        assert_eq!(
+            app.uploader.page_in_flight.as_ref().map(|p| &p.scope),
+            Some(&app.session.scope())
+        );
+
+        // 401 revocation on UploaderPageLoaded transitions to Guest and reloads under Guest.
+        let _ = deliver_uploader_page(&mut app, 1, Err(ProviderError::Unauthorized));
+        assert_eq!(app.session.scope().kind, SessionKind::Guest);
+        assert_eq!(
+            app.uploader.page_in_flight.as_ref().map(|p| &p.scope.kind),
+            Some(&SessionKind::Guest)
+        );
+
+        // Switch to Tag, SignIn, 401 revocation on TagMetadataLoaded, SignOut.
+        assert!(
+            app.update(Message::DetailSelectTag {
+                id: 10,
+                name: "scenery".to_string(),
+            })
+            .units()
+                > 0
+        );
+        sign_in(&mut app, "carol");
+        assert_eq!(app.route, Route::Tag(10));
+        assert!(app.tag.metadata_in_flight.is_some());
+        assert!(app.tag.page_in_flight.is_some());
+        let _ = deliver_tag_metadata(&mut app, 10, Err(ProviderError::Unauthorized));
+        assert_eq!(app.session.scope().kind, SessionKind::Guest);
+        assert_eq!(
+            app.tag.metadata_in_flight.as_ref().map(|p| &p.scope.kind),
+            Some(&SessionKind::Guest)
+        );
+        assert_eq!(
+            app.tag.page_in_flight.as_ref().map(|p| &p.scope.kind),
+            Some(&SessionKind::Guest)
+        );
+
+        // SwitchToGuest after SignIn aborts tag requests and reloads as Guest.
+        sign_in(&mut app, "dave");
+        let dave_meta = app.tag.metadata_in_flight.as_ref().unwrap().handle.clone();
+        let dave_page = app.tag.page_in_flight.as_ref().unwrap().handle.clone();
+        let _ = app.update(Message::SwitchToGuest);
+        assert!(dave_meta.is_aborted());
+        assert!(dave_page.is_aborted());
+        assert_eq!(app.session.scope().kind, SessionKind::Guest);
     }
 }

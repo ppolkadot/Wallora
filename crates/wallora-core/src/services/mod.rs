@@ -6,6 +6,7 @@ pub mod discovery;
 pub mod download;
 pub mod image_guard;
 pub mod image_pipeline;
+pub mod profiles_tags;
 pub mod session;
 
 pub use cache::{
@@ -43,6 +44,11 @@ pub use image_guard::{
 pub use image_pipeline::{
     ImageFetcher, ImagePipeline, ImagePipelineError, ImageRequest, ImageSource, LoadedImage,
     load_uncached,
+};
+pub use profiles_tags::{
+    ProfileTagUnsupportedAction, TagLoadRequests, TagMetadataOutcome, TagMetadataRequest,
+    TagMetadataResponse, TagMetadataStatus, TagPageController, UploaderController,
+    WALLHAVEN_TAGS_URL, fetch_tag_metadata,
 };
 pub use session::{
     AccountRefreshPayload, CacheCapUpdateError, LogoutOutcome, NoticeLevel, ProxyUpdateError,

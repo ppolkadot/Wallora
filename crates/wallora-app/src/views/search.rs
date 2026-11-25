@@ -136,7 +136,7 @@ pub fn format_ratios(ratios: &[AspectRatio]) -> String {
         .join(", ")
 }
 
-fn sorting_label(sorting: Sorting) -> &'static str {
+pub(crate) fn sorting_label(sorting: Sorting) -> &'static str {
     match sorting {
         Sorting::DateAdded => "Date added",
         Sorting::Relevance => "Relevance",

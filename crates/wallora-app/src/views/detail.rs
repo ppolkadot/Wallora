@@ -6,7 +6,9 @@ use iced::widget::{
 use iced::{Alignment, Background, Border, Color, ContentFit, Element, Length};
 use wallora_core::domain::{Category, Purity, Wallpaper, WallpaperId};
 use wallora_core::provider::ProviderError;
-use wallora_core::services::{CollectionUnsupportedAction, DetailUnsupportedAction};
+use wallora_core::services::{
+    CollectionUnsupportedAction, DetailUnsupportedAction, ProfileTagUnsupportedAction,
+};
 
 use crate::message::{DetailCopyTarget, GalleryKind, Message, Route};
 use crate::theme::{card_style, disabled_button_style, palette, pill_button_style};
@@ -108,6 +110,8 @@ pub fn view<'a>(state: DetailViewState<'a>) -> Element<'a, Message> {
         GalleryKind::Home => "Back to Home",
         GalleryKind::Search => "Back to Search",
         GalleryKind::Collections => "Back to Collections",
+        GalleryKind::Tag => "Back to Tag",
+        GalleryKind::Uploader => "Back to Uploader",
     };
 
     let mut refresh_btn = button(
@@ -546,12 +550,30 @@ fn build_actions_card<'a>(
 
 fn build_metadata_card<'a>(wallpaper: &'a Wallpaper) -> Element<'a, Message> {
     let (purity_text, purity_color) = purity_label(wallpaper.purity);
-    let uploader_line = match &wallpaper.uploader {
-        Some(uploader) if !uploader.group.is_empty() => {
-            format!("{} ({})", uploader.username, uploader.group)
+    let uploader_row: Element<'a, Message> = match &wallpaper.uploader {
+        Some(uploader) => {
+            let mut r = row![
+                text("Uploader:").size(13).color(palette::TEXT_SECONDARY),
+                button(text(format!("@{}", uploader.username)).size(12))
+                    .padding([3, 8])
+                    .on_press(Message::DetailSelectUploader(uploader.username.clone()))
+                    .style(pill_button_style(false)),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center);
+            if !uploader.group.is_empty() {
+                r = r.push(
+                    text(format!("({})", uploader.group))
+                        .size(12)
+                        .color(palette::TEXT_SECONDARY),
+                );
+            }
+            r.wrap().vertical_spacing(4).into()
         }
-        Some(uploader) => uploader.username.clone(),
-        None => "Unknown".to_string(),
+        None => text("Uploader: Unknown")
+            .size(13)
+            .color(palette::TEXT_SECONDARY)
+            .into(),
     };
     let source_line = if wallpaper.source.trim().is_empty() {
         "None".to_string()
@@ -602,9 +624,7 @@ fn build_metadata_card<'a>(wallpaper: &'a Wallpaper) -> Element<'a, Message> {
             text(format!("Created: {}", wallpaper.created_at))
                 .size(13)
                 .color(palette::TEXT_SECONDARY),
-            text(format!("Uploader: {uploader_line}"))
-                .size(13)
-                .color(palette::TEXT_SECONDARY),
+            uploader_row,
             text(format!("Source: {source_line}"))
                 .size(13)
                 .color(palette::TEXT_SECONDARY),
@@ -649,6 +669,27 @@ fn build_tags_card<'a>(
             .vertical_spacing(6);
         col = col.push(tags_row);
     }
+
+    col = col.push(
+        column![
+            row![
+                button(text("Edit / moderate tags (API read-only)").size(12))
+                    .padding([6, 12])
+                    .style(disabled_button_style()),
+                button(text(ProfileTagUnsupportedAction::TagModeration.label()).size(12))
+                    .padding([6, 12])
+                    .on_press(Message::DetailOpenTagModerationHandOff)
+                    .style(pill_button_style(false)),
+            ]
+            .spacing(8)
+            .wrap()
+            .vertical_spacing(6),
+            text(ProfileTagUnsupportedAction::TagModeration.explanation())
+                .size(11)
+                .color(palette::TEXT_SECONDARY),
+        ]
+        .spacing(6),
+    );
 
     container(col)
         .padding(14)

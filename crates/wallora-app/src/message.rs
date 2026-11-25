@@ -10,7 +10,7 @@ use wallora_core::services::cache::{CacheError, CacheStats};
 use wallora_core::services::{
     AccountRefreshPayload, CollectionItemsResponse, CollectionListResponse,
     DetailUnsupportedAction, DownloadError, DownloadOutcome, ImagePipelineError, PageResponse,
-    SignInError, SignInProbe, UnsupportedFeature,
+    SignInError, SignInProbe, TagMetadataResponse, UnsupportedFeature,
 };
 
 use crate::widgets::gallery_grid::GridKey;
@@ -23,6 +23,8 @@ pub enum Route {
     Home,
     Search,
     Collections,
+    Tag(u64),
+    Uploader(String),
     Detail(WallpaperId),
     Account,
     Settings,
@@ -34,6 +36,8 @@ impl Route {
             Self::Home => "Home",
             Self::Search => "Search",
             Self::Collections => "Collections",
+            Self::Tag(_) => "Tag",
+            Self::Uploader(_) => "Uploader",
             Self::Detail(_) => "Wallpaper Detail",
             Self::Account => "Account",
             Self::Settings => "Settings",
@@ -47,6 +51,8 @@ pub enum GalleryKind {
     Home,
     Search,
     Collections,
+    Tag,
+    Uploader,
 }
 
 /// Identifies which detail URL was copied to the clipboard.
@@ -199,12 +205,14 @@ pub enum Message {
         id: u64,
         name: String,
     },
+    DetailSelectUploader(String),
     DetailMoreLikeThis(WallpaperId),
     DetailCopyLink {
         target: DetailCopyTarget,
         url: String,
     },
     DetailOpenHandOff(DetailUnsupportedAction),
+    DetailOpenTagModerationHandOff,
     DetailDownloadOriginal,
     DetailSavePathPicked {
         op_id: u64,
@@ -242,6 +250,29 @@ pub enum Message {
         input_focused: bool,
     },
     CollectionsOpenManageHandOff,
+
+    // Tag detail & listing
+    TagBack,
+    TagRetryMetadata,
+    TagMetadataLoaded(Box<TagMetadataResponse>),
+    TagPageLoaded(Box<PageResponse>),
+    TagTogglePurity(Purity),
+    TagSelectSorting(Sorting),
+    TagSelectOrder(SortOrder),
+    TagSelectTopRange(TopRange),
+    TagSearchThisTag,
+    TagOpenDirectoryHandOff,
+
+    // Uploader uploads & profile hand-offs
+    UploaderBack,
+    UploaderPageLoaded(Box<PageResponse>),
+    UploaderTogglePurity(Purity),
+    UploaderSelectSorting(Sorting),
+    UploaderSelectOrder(SortOrder),
+    UploaderSelectTopRange(TopRange),
+    UploaderViewPublicCollections,
+    UploaderSearchUploads,
+    UploaderOpenProfileHandOff,
 }
 
 impl fmt::Debug for Message {
@@ -420,6 +451,10 @@ impl fmt::Debug for Message {
                 .field("id", id)
                 .field("name", name)
                 .finish(),
+            Self::DetailSelectUploader(username) => f
+                .debug_tuple("DetailSelectUploader")
+                .field(username)
+                .finish(),
             Self::DetailMoreLikeThis(id) => f.debug_tuple("DetailMoreLikeThis").field(id).finish(),
             Self::DetailCopyLink { target, url } => f
                 .debug_struct("DetailCopyLink")
@@ -429,6 +464,7 @@ impl fmt::Debug for Message {
             Self::DetailOpenHandOff(action) => {
                 f.debug_tuple("DetailOpenHandOff").field(action).finish()
             }
+            Self::DetailOpenTagModerationHandOff => f.write_str("DetailOpenTagModerationHandOff"),
             Self::DetailDownloadOriginal => f.write_str("DetailDownloadOriginal"),
             Self::DetailSavePathPicked {
                 op_id,
@@ -505,6 +541,56 @@ impl fmt::Debug for Message {
                 .field("input_focused", input_focused)
                 .finish(),
             Self::CollectionsOpenManageHandOff => f.write_str("CollectionsOpenManageHandOff"),
+            Self::TagBack => f.write_str("TagBack"),
+            Self::TagRetryMetadata => f.write_str("TagRetryMetadata"),
+            Self::TagMetadataLoaded(response) => f
+                .debug_struct("TagMetadataLoaded")
+                .field("generation", &response.generation)
+                .field("tag_id", &response.tag_id)
+                .field("ok", &response.result.is_ok())
+                .finish(),
+            Self::TagPageLoaded(response) => f
+                .debug_struct("TagPageLoaded")
+                .field("generation", &response.generation)
+                .field("page", &response.page)
+                .field("ok", &response.result.is_ok())
+                .finish(),
+            Self::TagTogglePurity(purity) => {
+                f.debug_tuple("TagTogglePurity").field(purity).finish()
+            }
+            Self::TagSelectSorting(sorting) => {
+                f.debug_tuple("TagSelectSorting").field(sorting).finish()
+            }
+            Self::TagSelectOrder(order) => f.debug_tuple("TagSelectOrder").field(order).finish(),
+            Self::TagSelectTopRange(range) => {
+                f.debug_tuple("TagSelectTopRange").field(range).finish()
+            }
+            Self::TagSearchThisTag => f.write_str("TagSearchThisTag"),
+            Self::TagOpenDirectoryHandOff => f.write_str("TagOpenDirectoryHandOff"),
+            Self::UploaderBack => f.write_str("UploaderBack"),
+            Self::UploaderPageLoaded(response) => f
+                .debug_struct("UploaderPageLoaded")
+                .field("generation", &response.generation)
+                .field("page", &response.page)
+                .field("ok", &response.result.is_ok())
+                .finish(),
+            Self::UploaderTogglePurity(purity) => {
+                f.debug_tuple("UploaderTogglePurity").field(purity).finish()
+            }
+            Self::UploaderSelectSorting(sorting) => f
+                .debug_tuple("UploaderSelectSorting")
+                .field(sorting)
+                .finish(),
+            Self::UploaderSelectOrder(order) => {
+                f.debug_tuple("UploaderSelectOrder").field(order).finish()
+            }
+            Self::UploaderSelectTopRange(range) => f
+                .debug_tuple("UploaderSelectTopRange")
+                .field(range)
+                .finish(),
+            Self::UploaderViewPublicCollections => f.write_str("UploaderViewPublicCollections"),
+            Self::UploaderSearchUploads => f.write_str("UploaderSearchUploads"),
+            Self::UploaderOpenProfileHandOff => f.write_str("UploaderOpenProfileHandOff"),
         }
     }
 }

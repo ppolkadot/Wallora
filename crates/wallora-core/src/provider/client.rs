@@ -11,13 +11,13 @@ use url::Url;
 
 use crate::domain::{
     CollectionSummary, CredentialStore, ProxyConfig, ProxyError, PurityMask, RequestPriority,
-    SearchPage, SearchQuery, SecretString, SessionKind, SessionScope, UserSettings, Wallpaper,
+    SearchPage, SearchQuery, SecretString, SessionKind, SessionScope, Tag, UserSettings, Wallpaper,
     WallpaperId, validate_username,
 };
 use crate::provider::Provider;
 use crate::provider::api::{
-    decode_collections_response, decode_search_response, decode_user_settings_response,
-    decode_wallpaper_response, parse_retry_after,
+    decode_collections_response, decode_search_response, decode_tag_response,
+    decode_user_settings_response, decode_wallpaper_response, parse_retry_after,
 };
 use crate::provider::error::ProviderError;
 use crate::provider::origin::{
@@ -867,6 +867,30 @@ impl Provider for WallhavenClient {
             )
             .await?;
             decode_search_response(&bytes)
+        }
+    }
+
+    fn tag(
+        &self,
+        id: u64,
+        scope: SessionScope,
+    ) -> impl Future<Output = Result<Tag, ProviderError>> + Send + 'static {
+        let inner = Arc::clone(&self.inner);
+        async move {
+            if id == 0 {
+                return Err(ProviderError::NotFound);
+            }
+            let id_segment = id.to_string();
+            let url = inner.build_api_url(&["tag", &id_segment])?;
+            let bytes = WallhavenClientInner::execute_paced_get(
+                inner,
+                url,
+                RequestAuth::Scope(scope),
+                RequestPriority::Interactive,
+                ApiResponse::Json,
+            )
+            .await?;
+            decode_tag_response(&bytes)
         }
     }
 }

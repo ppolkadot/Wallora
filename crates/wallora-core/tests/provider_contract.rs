@@ -7,7 +7,8 @@ use std::time::Duration;
 use url::Url;
 use wallora_core::domain::{
     AccountId, Category, CollectionSummary, CredentialStore, InMemoryCredentialStore, Purity,
-    PurityMask, QueryEcho, RequestPriority, SearchQuery, SecretString, SessionScope, WallpaperId,
+    PurityMask, QueryEcho, RequestPriority, SearchQuery, SecretString, SessionScope, Tag,
+    WallpaperId,
 };
 use wallora_core::provider::{
     Provider, ProviderError, WALLORA_USER_AGENT, WallhavenClient, WallhavenClientConfig,
@@ -21,6 +22,7 @@ const FIXTURE_SEARCH_PAGE: &str = include_str!("fixtures/search_page.json");
 const FIXTURE_SEARCH_TAG_META: &str = include_str!("fixtures/search_tag_meta.json");
 const FIXTURE_SEARCH_RANDOM_META: &str = include_str!("fixtures/search_random_meta.json");
 const FIXTURE_COLLECTIONS: &str = include_str!("fixtures/collections.json");
+const FIXTURE_TAG: &str = include_str!("fixtures/tag.json");
 const FIXTURE_ERROR_UNAUTHORIZED: &str = include_str!("fixtures/error_unauthorized.json");
 const COALESCE_KEY: &str = "wh_coalesce_scope_key_12345";
 
@@ -963,5 +965,116 @@ async fn collection_items_endpoint_serializes_query_and_maps_denials() {
     assert_eq!(
         server.received_requests().await.unwrap().len(),
         before_invalid
+    );
+}
+
+#[tokio::test]
+async fn tag_endpoint_decodes_fixture_null_alias_and_maps_errors() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tag/1"))
+        .and(header("user-agent", WALLORA_USER_AGENT))
+        .and(|req: &Request| !req.headers.contains_key("x-api-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(FIXTURE_TAG))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tag/7"))
+        .and(header("x-api-key", COALESCE_KEY))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(
+                serde_json::json!({
+                    "data": {
+                        "id": 7,
+                        "name": "landscape",
+                        "alias": null,
+                        "category_id": 2,
+                        "category": "Nature",
+                        "purity": "sfw",
+                        "created_at": "2020-01-01 00:00:00",
+                        "extra_field": "ignored"
+                    }
+                })
+                .to_string(),
+            ),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tag/404"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tag/401"))
+        .respond_with(ResponseTemplate::new(401).set_body_string(FIXTURE_ERROR_UNAUTHORIZED))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/tag/999"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{not valid json"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let (client, account) = keyed_client(&server, "acct-tag");
+    assert_static_send(client.tag(1, SessionScope::guest(1)));
+
+    let tag = client
+        .tag(1, SessionScope::guest(1))
+        .await
+        .expect("tag fixture should decode");
+    assert_eq!(
+        tag,
+        Tag {
+            id: 1,
+            name: "anime".to_string(),
+            alias: "Chinese cartoons".to_string(),
+            category_id: 1,
+            category: "Anime & Manga".to_string(),
+            purity: Purity::Sfw,
+            created_at: "2015-01-16 02:06:45".to_string(),
+        }
+    );
+
+    let null_alias = client
+        .tag(7, SessionScope::account(account, 1))
+        .await
+        .expect("tag with null alias and extra field should decode");
+    assert_eq!(null_alias.id, 7);
+    assert_eq!(null_alias.name, "landscape");
+    assert_eq!(null_alias.alias, "");
+
+    assert_eq!(
+        client.tag(404, SessionScope::guest(1)).await,
+        Err(ProviderError::NotFound)
+    );
+    assert_eq!(
+        client.tag(401, SessionScope::guest(1)).await,
+        Err(ProviderError::Unauthorized)
+    );
+    assert!(matches!(
+        client.tag(999, SessionScope::guest(1)).await,
+        Err(ProviderError::Decode { .. })
+    ));
+
+    let before_zero = server.received_requests().await.unwrap().len();
+    assert_eq!(
+        client.tag(0, SessionScope::guest(1)).await,
+        Err(ProviderError::NotFound)
+    );
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        before_zero,
+        "tag id 0 must not hit the network"
     );
 }
